@@ -1,0 +1,9 @@
+torch
+transformers
+lightning
+peft
+wandb
+hydra-core
+tqdm
+numpy
+ipykernel

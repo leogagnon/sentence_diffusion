@@ -1,0 +1,13 @@
+defaults:
+  - submitit_slurm
+
+mem_gb: 32
+gres: gpu:1
+tasks_per_node: 1
+array_parallelism: 32
+cpus_per_task: 1
+timeout_min: 2880 # 1 days
+partition: long-grace
+
+setup:
+  - "source ~/latent_control/venv/bin/activate"
