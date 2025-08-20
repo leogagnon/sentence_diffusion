@@ -1,0 +1,39 @@
+defaults:
+  - train_config
+  - _self_
+  - model_checkpoint: null
+  - hydra/sweeper/params : null
+  - override hydra/launcher: base
+
+task:
+  batch_size: 128
+  lr: 0.0001
+  lm_name: gpt2
+  semb_name: sentence-transformers/sentence-t5-base
+  lora_config: 
+    r: 64
+    lora_alpha: 16
+    target_modules: ["c_attn", "c_proj"]
+    lora_dropout: 0.1
+    bias: "none"
+  dataset:
+    path: data/stories/
+    start_index: 100
+    end_index: 1000
+  prompt_generator:
+    depth: 4
+    heads: 8
+seed: 42
+log_dir: /network/scratch/l/leo.gagnon/sentence_diffusion/logs
+max_epochs: 10
+accumulate_grad_batches: 1
+val_check_interval: 1000
+
+logger:
+  _target_: lightning.pytorch.loggers.WandbLogger
+  entity: guillaume-lajoie
+  project: sentence_diffusion
+  save_dir: ${log_dir}
+  offline: False
+  tags: null
+  resume: allow  

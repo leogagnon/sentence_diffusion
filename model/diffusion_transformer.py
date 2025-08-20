@@ -48,7 +48,6 @@ class DiTConfig:
     n_embd: Optional[int] = None
     seq_conditional: Optional[bool] = False
     seq_conditional_dim: Optional[int] = None
-    class_conditional: Optional[bool] = False
     num_classes: Optional[int] = 0
     cond_modulation: Optional[bool] = False
 

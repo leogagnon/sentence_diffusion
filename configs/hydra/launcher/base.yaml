@@ -10,4 +10,4 @@ timeout_min: 2880 # 1 days
 partition: long-grace
 
 setup:
-  - "source ~/latent_control/venv/bin/activate"
+  - "source ~/sentence_diffusion/venv/bin/activate"

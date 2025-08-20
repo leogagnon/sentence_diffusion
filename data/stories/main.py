@@ -2,16 +2,20 @@ from hydra.utils import to_absolute_path
 from torch.utils.data import Dataset
 import torch
 from dataclasses import dataclass
-from typing import Callable, Optional
+from typing import Callable, List, Optional
 import pandas as pd
 from tokenizers import Tokenizer
 from sentence_transformers import SentenceTransformer
+from torch.nn.utils.rnn import pad_sequence
+import os
+
 
 @dataclass
 class StoriesDatasetConfig:
-    csv_path: str
+    path: str
     start_index: int = 100
     end_index: int = 1000
+
 
 class StoriesDataset(Dataset):
     """
@@ -28,7 +32,7 @@ class StoriesDataset(Dataset):
     This class does not move tensors to GPU; that should be handled by the training loop / collate_fn.
     """
 
-    def __init__(self, cfg: StoriesDatasetConfig, tokenizer: Tokenizer, semb: SentenceTransformer):
+    def __init__(self, cfg: StoriesDatasetConfig, tokenizers: List[Tokenizer]):
         """
         Args:
             csv_path (str): path to CSV file (will be passed through hydra.to_absolute_path)
@@ -37,28 +41,47 @@ class StoriesDataset(Dataset):
             start_index (int): first CSV row index to load (inclusive)
             end_index (int): last CSV row index to load (exclusive)
         """
+
         # store cfg and resolve paths
         self.cfg = cfg
-        self.cfg.csv_path = to_absolute_path(self.cfg.csv_path)
+        self.cfg.path = to_absolute_path(self.cfg.path)
 
-        df = pd.read_csv(self.cfg.csv_path)
+        df = pd.read_csv(os.path.join(self.cfg.path, "stories.csv"))
 
-        # Build in-memory records
-        self.data = []
-        for idx in range(self.cfg.start_index, min(self.cfg.end_index, len(df))):
-            row = df.iloc[idx]
+        sentences = [df[f"sentence{i}"].tolist() for i in range(1, 6)]
+        self.sentences = [
+            " ".join([sentences[j][i] for j in range(5)])
+            for i in range(len(sentences[0]))
+        ]
 
-            input_str = " ".join(row)
-            item = {"input_str" : input_str,
-                    "input_idx": tokenizer.encode(input_str)["input_ids"][0],
-                    "input_emb": semb.encode([input_str])[0]}
-            self.data.append(item)
-
+        # Embedding cache path
+        self.input_ids = [
+            tokenizer.batch_encode_plus(self.sentences)["input_ids"]
+            for tokenizer in tokenizers
+        ]
 
     def __len__(self):
-        return len(self.data)
+        return len(self.sentences)
 
     def __getitem__(self, idx):
-        item = self.data[idx].copy()
-        # Expose data as-is. Token tensors are torch.LongTensor if tokenizer provided.
+        item = {
+            "input_str": self.sentences[idx],
+            "input_ids": self.input_ids[idx],
+        }
         return item
+
+    def __getitems__(self, indices):
+        batch = {
+            "input_str": [self.sentences[idx] for idx in indices],
+            "indices": torch.LongTensor(indices),
+        }
+        for i in range(len(self.input_ids)):
+            batch[f"input_ids_{i}"] = [
+                pad_sequence(
+                    [torch.LongTensor(self.input_ids[i][idx]) for idx in indices],
+                    padding_value=0,
+                    batch_first=True,
+                )
+            ]
+
+        return batch
