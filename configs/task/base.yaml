@@ -1,0 +1,30 @@
+batch_size: 128
+lr: 2e-4
+
+variational: True
+input_sub_p: 0.3
+kl_beta: 5e-6
+
+encoder:
+  name: bert-base-uncased
+  k: 16
+  lora_cfg: 
+    r: 64
+    lora_alpha: 16
+    target_modules: ["query", "value", "dense"]
+    lora_dropout: 0.1
+    bias: "none"
+
+decoder:
+  name: gpt2
+  lora_cfg: 
+    r: 64
+    lora_alpha: 16
+    target_modules: ["c_attn", "c_proj"]
+    lora_dropout: 0.1
+    bias: "none"
+
+dataset:
+  path: data/stories/
+  start_index: 100
+  end_index: 1000

@@ -15,52 +15,98 @@ from peft import get_peft_model
 from model.diffusion_transformer import DiTConfig, DiT
 from data.stories.main import StoriesDatasetConfig, StoriesDataset
 from hydra.utils import instantiate
+from model.encoder import EncoderConfig, EncoderModel
+from model.decoder import DecoderConfig, DecoderModel
 
 
 @dataclass
-class DecoderTaskConfig:
+class AETaskConfig:
     lr: float
     batch_size: int
-    lm_name: str
-    encoder: dict
-    lora_config: dict
+    encoder: EncoderConfig
+    decoder: DecoderConfig
+    variational: bool
+    input_sub_p: float
+    kl_beta: float
     dataset: StoriesDatasetConfig
 
 
 class AETask(L.LightningModule):
-    def __init__(self, cfg: Optional[DecoderTaskConfig] = None, **kwargs):
+    def __init__(self, cfg: Optional[AETaskConfig] = None, **kwargs):
         super().__init__()
 
         if cfg == None:
             cfg = OmegaConf.to_object(
                 OmegaConf.merge(
-                    OmegaConf.create(DecoderTaskConfig),
+                    OmegaConf.create(AETaskConfig),
                     OmegaConf.create(kwargs),
                 )
             )
 
-        self.cfg = cfg
+        # Load decoder
+        self.decoder = DecoderModel(cfg.decoder)
 
-        # Load language model and tokenizer
-        tokenizer = AutoTokenizer.from_pretrained(cfg.lm_name, add_bos_token=False)
-        self.decoder_lm = get_peft_model(
-            AutoModelForCausalLM.from_pretrained(cfg.lm_name, device_map="auto"),
-            LoraConfig(**cfg.lora_config),
+        # Load encoder
+        self.encoder = EncoderModel(cfg.encoder)
+
+        # Load tokenizers
+        enc_tokenizer = AutoTokenizer.from_pretrained(
+            cfg.encoder.name, add_bos_token=False
         )
-        self.bos_token = self.tokenizer.bos_token_id
+        dec_tokenizer = AutoTokenizer.from_pretrained(
+            cfg.decoder.name, add_bos_token=False
+        )
+        # Make sure decoder has padding token (i.e. GPT2 doesn't)
+        if dec_tokenizer.pad_token_id is None:
+            dec_tokenizer.add_special_tokens({"pad_token": "[PAD]"})
+            self.decoder.backbone.resize_token_embeddings(len(dec_tokenizer))
+        self.dec_bos_token = dec_tokenizer.bos_token_id
+        self.enc_vocab_size = len(enc_tokenizer)
+        self.dataset = StoriesDataset(
+            cfg.dataset, tokenizers={"enc": enc_tokenizer, "dec": dec_tokenizer}
+        )
 
-        self.encoder = instantiate(cfg.encoder)
-
-        # Load prompt generator (use the model's dimension as <dim>)
-        if "VariationalEncoder" in cfg.encoder["target"]:
-            cfg.encoder["out_dim"] = self.decoder_lm.config.hidden_size
-
-        # Remove dropout
-        for mod in self.decoder_lm.modules():
+        # Make sure there is no dropout in the decoder
+        for mod in self.decoder.modules():
             if isinstance(mod, torch.nn.Dropout):
                 mod.p = 0.0
 
-        self.dataset = StoriesDataset(cfg.dataset, tokenizer)
+        # Initialize variational/output projections
+        in_dim = self.encoder.backbone.config.hidden_size
+        out_dim = self.decoder.backbone.config.hidden_size
+        if cfg.variational:
+
+            self.fc_mean = torch.nn.Linear(in_dim, out_dim)
+            self.fc_log_var = torch.nn.Linear(in_dim, out_dim)
+        else:
+            self.out_proj = torch.nn.Linear(
+                in_dim,
+                out_dim,
+            )
+
+        self.cfg = cfg
+
+    def random_substitution(self, inputs):
+
+        probability = torch.full(
+            inputs.shape,
+            self.cfg.input_sub_p,
+            dtype=torch.float32,
+            device=inputs.device,
+        )
+
+        masked_indices = torch.bernoulli(probability).bool()
+        random_words = torch.randint(
+            self.enc_vocab_size, inputs.shape, dtype=torch.long, device=inputs.device
+        )
+        inputs[masked_indices] = random_words[masked_indices]
+
+        return inputs
+
+    def reparameterize(self, mean, log_var):
+        std = torch.exp(0.5 * log_var)
+        eps = torch.randn_like(std)
+        return eps.mul(std).add_(mean)
 
     def train_dataloader(self):
         return DataLoader(
@@ -71,44 +117,38 @@ class AETask(L.LightningModule):
         )
 
     def configure_optimizers(self):
-        optimizer = torch.optim.AdamW(self.model.parameters(), lr=self.cfg.lr)
+        optimizer = torch.optim.Adamax(self.parameters(), lr=self.cfg.lr)
         return optimizer
 
     def training_step(self, batch, batch_idx):
 
-        loss = 0
+        if self.cfg.input_sub_p > 0:
+            input_ids_enc = self.random_substitution(batch["input_ids_enc"])
 
-        if "VariationalEncoder" in self.cfg.encoder["target"]:
-            z, enc_loss = self.encoder(batch["sentences"])
-            loss += enc_loss
-        else:
-            z = self.encoder(batch["input_ids_enc"])
+        z = self.encoder(input_ids_enc, attention_mask=batch["padding_mask_enc"])
+
+        if self.cfg.variational:
+            mean = self.fc_mean(z)
+            log_var = self.fc_log_var(z)
+            z = self.reparameterize(mean, log_var)
 
         # Get embeddings of input_ids
-        input_ids_dec = torch.cat(
-            [
-                torch.full_like(
-                    batch["input_ids"][:, [0]],
-                    self.bos_token,
-                ),
-                batch["input_ids_dec"],
-            ],
-            dim=1,
+        logits = self.decoder(
+            batch["input_ids_dec"], z, attention_mask=batch["padding_mask_dec"]
         )
-        tokens = self.decoder_lm.get_input_embeddings()(input_ids_dec)
-        tokens = torch.cat([z, tokens], dim=1)
 
-        # Forward pass
-        output = self.decoder_lm(inputs_embeds=tokens)
-        logits = output.logits[:, z.shape[1] : -1, :]
-        logits = logits.contiguous()
+        # Ignore padding tokens
+        targets = batch["input_ids_dec"].masked_fill(batch["padding_mask_dec"], -1)
 
         # Apply cross-entropy loss
         loss = torch.nn.functional.cross_entropy(
-            logits.view(-1, logits.size(-1)), batch["input_ids"].view(-1)
+            logits.view(-1, logits.size(-1)),
+            targets.view(-1),
+            ignore_index=-1,
         )
 
-        if enc_loss is not None:
-            loss += enc_loss
-            
+        if self.cfg.variational:
+            KLD = -0.5 * torch.sum(1 + log_var - mean.pow(2) - log_var.exp())
+            loss += self.cfg.kl_beta * KLD
+
         return loss

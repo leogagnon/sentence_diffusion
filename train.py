@@ -9,12 +9,12 @@ import wandb
 from hydra.core.config_store import ConfigStore
 from lightning.pytorch.loggers import WandbLogger
 from omegaconf import MISSING, DictConfig, OmegaConf, SCMode
-from tasks.decoder import DecoderTaskConfig, DecoderTask
+from tasks.autoencoder import AETask, AETaskConfig
 
 
 @dataclass
 class TrainConfig:
-    task: DecoderTaskConfig
+    task: AETaskConfig
     seed: int
     log_dir: str
     max_epochs: int
@@ -26,7 +26,6 @@ class TrainConfig:
     model_checkpoint: Optional[dict] = None
     early_stopping: Optional[dict] = None
     gradient_clip_val: float = 1.0
-
 
 cs = ConfigStore.instance()
 cs.store(name="train_config", node=TrainConfig)
@@ -73,7 +72,7 @@ def main(cfg: Optional[TrainConfig] = None, run_id: Optional[str] = None):
         structured_config_mode=SCMode.INSTANTIATE,
     )
 
-    task = DecoderTask(cfg.task)
+    task = AETask(cfg.task)
 
      # Instantiate the trainer
     trainer = L.Trainer(

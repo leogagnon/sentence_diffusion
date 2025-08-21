@@ -32,7 +32,9 @@ class StoriesDataset(Dataset):
     This class does not move tensors to GPU; that should be handled by the training loop / collate_fn.
     """
 
-    def __init__(self, cfg: StoriesDatasetConfig, tokenizers: List[Tokenizer]):
+    def __init__(
+        self, cfg: StoriesDatasetConfig, tokenizers: dict[str, Tokenizer] = None
+    ):
         """
         Args:
             csv_path (str): path to CSV file (will be passed through hydra.to_absolute_path)
@@ -55,10 +57,13 @@ class StoriesDataset(Dataset):
         ]
 
         # Embedding cache path
-        self.input_ids = [
-            tokenizer.batch_encode_plus(self.sentences)["input_ids"]
-            for tokenizer in tokenizers
-        ]
+        self.input_ids = {
+            name: tokenizer.batch_encode_plus(self.sentences)["input_ids"]
+            for name, tokenizer in tokenizers.items()
+        }
+        self.padding_token_id = {
+            key: tokenizer.pad_token_id for key, tokenizer in tokenizers.items()
+        }
 
     def __len__(self):
         return len(self.sentences)
@@ -75,13 +80,14 @@ class StoriesDataset(Dataset):
             "input_str": [self.sentences[idx] for idx in indices],
             "indices": torch.LongTensor(indices),
         }
-        for i in range(len(self.input_ids)):
-            batch[f"input_ids_{i}"] = [
-                pad_sequence(
-                    [torch.LongTensor(self.input_ids[i][idx]) for idx in indices],
-                    padding_value=0,
-                    batch_first=True,
-                )
-            ]
+        for key in self.input_ids.keys():
+            batch[f"input_ids_{key}"] = pad_sequence(
+                [torch.LongTensor(self.input_ids[key][idx]) for idx in indices],
+                padding_value=self.padding_token_id[key],
+                batch_first=True,
+            )
+            batch[f"padding_mask_{key}"] = (
+                batch[f"input_ids_{key}"] != self.padding_token_id[key]
+            )
 
         return batch
