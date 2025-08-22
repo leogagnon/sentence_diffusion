@@ -152,3 +152,30 @@ class AETask(L.LightningModule):
             loss += self.cfg.kl_beta * KLD
 
         return loss
+
+    def encode(self, input_ids, attention_mask):
+        z = self.encoder(input_ids, attention_mask=attention_mask)
+        if self.cfg.variational:
+            z = self.fc_mean(z)
+        return z
+
+    def validation_step(self, batch, batch_idx):
+
+        input_ids_enc_clean = batch["input_ids_enc"]
+        input_ids_enc_corrupted = self.random_substitution(input_ids_enc_clean)
+
+        z_clean, z_corrupted = [
+            self.encode(inp, attention_mask=batch["padding_mask_enc"])
+            for inp in (input_ids_enc_clean, input_ids_enc_corrupted)
+        ]
+
+        gen_clean, gen_corrupted = [
+            self.decoder.generate_from(z) for z in (z_clean, z_corrupted)
+        ]
+
+        z_groups = [
+            z_clean[indices] for indices in torch.randperm(gen_clean.shape[0]).chunk(2)
+        ]
+        z_interp = z_groups[0] + 0.5 * (z_groups[1] - z_groups[0])
+
+        gen_interp = self.decoder.generate_from(z_interp)

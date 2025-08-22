@@ -65,3 +65,28 @@ class DecoderModel(nn.Module):
         logits = output.logits[:, z.shape[1] : -1, :]
 
         return logits.contiguous()
+
+    @torch.no_grad()
+    def generate_from(self, z):
+
+        prefill = self.backbone(
+            inputs_embeds=z,
+            use_cache=True,
+        )
+        cache = prefill.past_key_values
+
+        bos = torch.full((z.shape[0], 1), self.bos_token, device=z.device, dtype=torch.long)
+
+        output = self.backbone.generate(
+            inputs=bos,
+            past_key_values=cache,
+            attention_mask=torch.ones(1, z.shape[1] + 1, device=z.device, dtype=torch.long),
+            max_new_tokens=60,
+            do_sample=True,
+            temperature=0.9,
+            return_dict_in_generate=True,
+        )
+
+        output = output.sequences[:, 1:]  # Remove BOS token
+
+        return output

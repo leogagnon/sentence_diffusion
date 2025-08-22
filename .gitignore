@@ -2,3 +2,5 @@ venv
 outputs
 *.pt
 *.csv
+*.pyc
+*/__pycache__/
