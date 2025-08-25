@@ -13,10 +13,12 @@ from transformers import AutoTokenizer
 from transformers.models.auto.modeling_auto import AutoModelForCausalLM
 from peft import get_peft_model
 from model.diffusion_transformer import DiTConfig, DiT
-from data.stories.main import StoriesDatasetConfig, StoriesDataset
+from data.stories import StoriesDatasetConfig, StoriesDataset
 from hydra.utils import instantiate
 from model.encoder import EncoderConfig, EncoderModel
 from model.decoder import DecoderConfig, DecoderModel
+import evaluate
+import wandb
 
 
 @dataclass
@@ -153,29 +155,67 @@ class AETask(L.LightningModule):
 
         return loss
 
-    def encode(self, input_ids, attention_mask):
-        z = self.encoder(input_ids, attention_mask=attention_mask)
-        if self.cfg.variational:
-            z = self.fc_mean(z)
-        return z
-
     def validation_step(self, batch, batch_idx):
 
         input_ids_enc_clean = batch["input_ids_enc"]
         input_ids_enc_corrupted = self.random_substitution(input_ids_enc_clean)
 
-        z_clean, z_corrupted = [
-            self.encode(inp, attention_mask=batch["padding_mask_enc"])
-            for inp in (input_ids_enc_clean, input_ids_enc_corrupted)
-        ]
+        z_clean = self.encoder(
+            input_ids_enc_clean, attention_mask=batch["padding_mask_enc"]
+        )
+        z_corrupted = self.encoder(
+            input_ids_enc_corrupted, attention_mask=batch["padding_mask_enc"]
+        )
+        if self.cfg.variational:
+            mean_clean = self.fc_mean(z_clean)
+            log_var_clean = self.fc_log_var(z_clean)
+            z_clean = self.reparameterize(mean_clean, log_var_clean)
+
+            mean_corrupted = self.fc_mean(z_corrupted)
+            log_var_corrupted = self.fc_log_var(z_corrupted)
+            z_corrupted = self.reparameterize(mean_corrupted, log_var_corrupted)
+
+
+        # Get embeddings of input_ids
+        logits = self.decoder(
+            batch["input_ids_dec"], z_clean, attention_mask=batch["padding_mask_dec"]
+        )
+        targets = batch["input_ids_dec"].masked_fill(batch["padding_mask_dec"], -1)
+        loss = torch.nn.functional.cross_entropy(
+            logits.view(-1, logits.size(-1)),
+            targets.view(-1),
+            ignore_index=-1,
+        )
+
+        if self.cfg.variational:
+            KLD = -0.5 * torch.sum(1 + log_var_clean - mean_clean.pow(2) - log_var_clean.exp())
+            loss += self.cfg.kl_beta * KLD
+
+        wandb.log({"loss": loss})
+        wandb.log({"KLD": KLD})
 
         gen_clean, gen_corrupted = [
             self.decoder.generate_from(z) for z in (z_clean, z_corrupted)
         ]
 
         z_groups = [
-            z_clean[indices] for indices in torch.randperm(gen_clean.shape[0]).chunk(2)
+            z_clean[indices]
+            for indices in torch.randperm(input_ids_enc_clean.shape[0]).chunk(2)
         ]
-        z_interp = z_groups[0] + 0.5 * (z_groups[1] - z_groups[0])
-
+        z_interp = 0.5 * z_groups[0] + 0.5 * z_groups[1]
         gen_interp = self.decoder.generate_from(z_interp)
+
+        bleu = evaluate.load("bleu")
+
+        bleu_clean = bleu.compute(predictions=gen_clean, references=batch["input_str"])
+        bleu_corrupted = bleu.compute(
+            predictions=gen_corrupted, references=batch["input_str"]
+        )
+
+        ppl_interp = torch.exp(self.decoder(input_ids=gen_interp).loss)
+
+        wandb.log({"bleu_clean": bleu_clean})
+        wandb.log({"bleu_corrupted": bleu_corrupted})
+        wandb.log({"ppl_interp": ppl_interp})
+
+
