@@ -33,7 +33,7 @@ class StoriesDataset(Dataset):
     """
 
     def __init__(
-        self, cfg: StoriesDatasetConfig, tokenizers: dict[str, Tokenizer] = None
+        self, cfg: StoriesDatasetConfig, enc_tokenizer: Tokenizer, dec_tokenizer: Tokenizer
     ):
         """
         Args:
@@ -56,13 +56,20 @@ class StoriesDataset(Dataset):
             for i in range(len(sentences[0]))
         ]
 
-        # Embedding cache path
+        # Tokenize sentences
         self.input_ids = {
-            name: tokenizer.batch_encode_plus(self.sentences)["input_ids"]
-            for name, tokenizer in tokenizers.items()
+            'enc': enc_tokenizer.batch_encode_plus(self.sentences)["input_ids"],
+            'dec': dec_tokenizer.batch_encode_plus(self.sentences)["input_ids"]
         }
+        # For some reason add_special_tokens doesn't work, so add BOS/EOS manually to decoder
+        self.input_ids['dec'] = [
+            [dec_tokenizer.bos_token_id] + ids + [dec_tokenizer.eos_token_id]
+            for ids in self.input_ids['dec']
+        ]
+
         self.padding_token_id = {
-            key: tokenizer.pad_token_id for key, tokenizer in tokenizers.items()
+            'enc': enc_tokenizer.pad_token_id,
+            'dec': dec_tokenizer.pad_token_id
         }
 
     def __len__(self):
@@ -86,7 +93,7 @@ class StoriesDataset(Dataset):
                 padding_value=self.padding_token_id[key],
                 batch_first=True,
             )
-            batch[f"padding_mask_{key}"] = (
+            batch[f"attention_mask_{key}"] = (
                 batch[f"input_ids_{key}"] != self.padding_token_id[key]
             )
 

@@ -33,6 +33,8 @@ class EncoderModel(nn.Module):
                 LoraConfig(**self.cfg.lora_cfg),
             )
 
+        self.tokenizer = AutoTokenizer.from_pretrained(cfg.name)
+
     def forward(self, input_ids, attention_mask=None):
         
         # Run through backbone and get first k tokens

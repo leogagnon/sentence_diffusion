@@ -89,6 +89,8 @@ def main(cfg: Optional[TrainConfig] = None, run_id: Optional[str] = None):
         accumulate_grad_batches=cfg.accumulate_grad_batches
     )
 
+    trainer.validate(model=task)
+
     trainer.fit(
         model=task,
         ckpt_path=(

@@ -31,21 +31,14 @@ class DecoderModel(nn.Module):
                 self.backbone,
                 LoraConfig(**self.cfg.lora_cfg),
             )
-        self.bos_token = AutoTokenizer.from_pretrained(cfg.name).bos_token_id
+
+        # Init tokenizer (add a padding token)
+        self.tokenizer = AutoTokenizer.from_pretrained(cfg.name)
+        if self.tokenizer.pad_token_id is None:
+            self.tokenizer.add_special_tokens({"pad_token": "[PAD]"})
+            self.backbone.resize_token_embeddings(len(self.tokenizer))
 
     def forward(self, input_ids, z, attention_mask=None):
-
-        # Prepend BOS
-        input_ids = torch.cat(
-            [
-                torch.full_like(
-                    input_ids[:, [0]],
-                    self.bos_token,
-                ),
-                input_ids,
-            ],
-            dim=1,
-        )
 
         # Compute tokens
         tokens = self.backbone.get_input_embeddings()(input_ids)
@@ -62,12 +55,12 @@ class DecoderModel(nn.Module):
         self.backbone.get_input_embeddings()
         # Forward pass
         output = self.backbone(inputs_embeds=tokens)
-        logits = output.logits[:, z.shape[1] : -1, :]
+        logits = output.logits[:, z.shape[1] :]
 
-        return logits.contiguous()
+        return logits
 
     @torch.no_grad()
-    def generate_from(self, z):
+    def generate_from(self, z, max_length):
 
         prefill = self.backbone(
             inputs_embeds=z,
@@ -75,16 +68,20 @@ class DecoderModel(nn.Module):
         )
         cache = prefill.past_key_values
 
-        bos = torch.full((z.shape[0], 1), self.bos_token, device=z.device, dtype=torch.long)
+        bos = torch.full((z.shape[0], 1), self.tokenizer.bos_token_id, device=z.device, dtype=torch.long)
 
         output = self.backbone.generate(
-            inputs=bos,
+            input_ids=bos,
             past_key_values=cache,
-            attention_mask=torch.ones(1, z.shape[1] + 1, device=z.device, dtype=torch.long),
-            max_new_tokens=60,
+            cache_position=torch.tensor([z.shape[1]]),
+            attention_mask=torch.ones(z.shape[0], z.shape[1] + 1, device=z.device, dtype=torch.long),
+            max_length=max_length,
             do_sample=True,
             temperature=0.9,
             return_dict_in_generate=True,
+            use_cache=True,
+            pad_token_id=self.tokenizer.pad_token_id,
+            eos_token_id=self.tokenizer.eos_token_id,
         )
 
         output = output.sequences[:, 1:]  # Remove BOS token

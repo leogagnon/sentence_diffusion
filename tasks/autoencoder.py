@@ -8,7 +8,7 @@ from peft import LoraConfig
 import torch
 import random
 import numpy as np
-from torch.utils.data import DataLoader
+from torch.utils.data import DataLoader, random_split
 from transformers import AutoTokenizer
 from transformers.models.auto.modeling_auto import AutoModelForCausalLM
 from peft import get_peft_model
@@ -51,22 +51,20 @@ class AETask(L.LightningModule):
         # Load encoder
         self.encoder = EncoderModel(cfg.encoder)
 
-        # Load tokenizers
-        enc_tokenizer = AutoTokenizer.from_pretrained(
-            cfg.encoder.name, add_bos_token=False
-        )
-        dec_tokenizer = AutoTokenizer.from_pretrained(
-            cfg.decoder.name, add_bos_token=False
-        )
-        # Make sure decoder has padding token (i.e. GPT2 doesn't)
-        if dec_tokenizer.pad_token_id is None:
-            dec_tokenizer.add_special_tokens({"pad_token": "[PAD]"})
-            self.decoder.backbone.resize_token_embeddings(len(dec_tokenizer))
-        self.dec_bos_token = dec_tokenizer.bos_token_id
-        self.enc_vocab_size = len(enc_tokenizer)
         self.dataset = StoriesDataset(
-            cfg.dataset, tokenizers={"enc": enc_tokenizer, "dec": dec_tokenizer}
+            cfg.dataset,
+            enc_tokenizer=self.encoder.tokenizer,
+            dec_tokenizer=self.decoder.tokenizer,
         )
+        self.train_data, self.val_data = random_split(
+            self.dataset,
+            [
+                int(len(self.dataset) * 0.9),
+                len(self.dataset) - int(len(self.dataset) * 0.9),
+            ],
+        )
+
+        self.bleu = evaluate.load("bleu")
 
         # Make sure there is no dropout in the decoder
         for mod in self.decoder.modules():
@@ -77,7 +75,6 @@ class AETask(L.LightningModule):
         in_dim = self.encoder.backbone.config.hidden_size
         out_dim = self.decoder.backbone.config.hidden_size
         if cfg.variational:
-
             self.fc_mean = torch.nn.Linear(in_dim, out_dim)
             self.fc_log_var = torch.nn.Linear(in_dim, out_dim)
         else:
@@ -99,7 +96,10 @@ class AETask(L.LightningModule):
 
         masked_indices = torch.bernoulli(probability).bool()
         random_words = torch.randint(
-            self.enc_vocab_size, inputs.shape, dtype=torch.long, device=inputs.device
+            len(self.encoder.tokenizer),
+            inputs.shape,
+            dtype=torch.long,
+            device=inputs.device,
         )
         inputs[masked_indices] = random_words[masked_indices]
 
@@ -112,9 +112,17 @@ class AETask(L.LightningModule):
 
     def train_dataloader(self):
         return DataLoader(
-            self.dataset,
+            self.train_data,
             batch_size=self.cfg.batch_size,
             shuffle=True,
+            collate_fn=lambda x: x,
+        )
+
+    def val_dataloader(self):
+        return DataLoader(
+            self.val_data,
+            batch_size=self.cfg.batch_size,
+            shuffle=False,
             collate_fn=lambda x: x,
         )
 
@@ -127,7 +135,7 @@ class AETask(L.LightningModule):
         if self.cfg.input_sub_p > 0:
             input_ids_enc = self.random_substitution(batch["input_ids_enc"])
 
-        z = self.encoder(input_ids_enc, attention_mask=batch["padding_mask_enc"])
+        z = self.encoder(input_ids_enc, attention_mask=batch["attention_mask_enc"])
 
         if self.cfg.variational:
             mean = self.fc_mean(z)
@@ -136,11 +144,16 @@ class AETask(L.LightningModule):
 
         # Get embeddings of input_ids
         logits = self.decoder(
-            batch["input_ids_dec"], z, attention_mask=batch["padding_mask_dec"]
+            batch["input_ids_dec"], z, attention_mask=batch["attention_mask_dec"]
         )
 
         # Ignore padding tokens
-        targets = batch["input_ids_dec"].masked_fill(batch["padding_mask_dec"], -1)
+        targets = batch["input_ids_dec"].masked_fill(
+            batch["attention_mask_dec"] == 0, -1
+        )
+
+        logits = logits[:,:-1].contiguous()
+        targets = targets[:,1:].contiguous()
 
         # Apply cross-entropy loss
         loss = torch.nn.functional.cross_entropy(
@@ -161,10 +174,10 @@ class AETask(L.LightningModule):
         input_ids_enc_corrupted = self.random_substitution(input_ids_enc_clean)
 
         z_clean = self.encoder(
-            input_ids_enc_clean, attention_mask=batch["padding_mask_enc"]
+            input_ids_enc_clean, attention_mask=batch["attention_mask_enc"]
         )
         z_corrupted = self.encoder(
-            input_ids_enc_corrupted, attention_mask=batch["padding_mask_enc"]
+            input_ids_enc_corrupted, attention_mask=batch["attention_mask_enc"]
         )
         if self.cfg.variational:
             mean_clean = self.fc_mean(z_clean)
@@ -175,12 +188,15 @@ class AETask(L.LightningModule):
             log_var_corrupted = self.fc_log_var(z_corrupted)
             z_corrupted = self.reparameterize(mean_corrupted, log_var_corrupted)
 
-
         # Get embeddings of input_ids
         logits = self.decoder(
-            batch["input_ids_dec"], z_clean, attention_mask=batch["padding_mask_dec"]
+            batch["input_ids_dec"], z_clean, attention_mask=batch["attention_mask_dec"]
         )
-        targets = batch["input_ids_dec"].masked_fill(batch["padding_mask_dec"], -1)
+        targets = batch["input_ids_dec"].masked_fill(
+            batch["attention_mask_dec"] == 0, -1
+        )
+        logits = logits[:,:-1].contiguous()
+        targets = targets[:,1:].contiguous()
         loss = torch.nn.functional.cross_entropy(
             logits.view(-1, logits.size(-1)),
             targets.view(-1),
@@ -188,34 +204,39 @@ class AETask(L.LightningModule):
         )
 
         if self.cfg.variational:
-            KLD = -0.5 * torch.sum(1 + log_var_clean - mean_clean.pow(2) - log_var_clean.exp())
+            KLD = -0.5 * torch.sum(
+                1 + log_var_clean - mean_clean.pow(2) - log_var_clean.exp()
+            )
             loss += self.cfg.kl_beta * KLD
 
         wandb.log({"loss": loss})
         wandb.log({"KLD": KLD})
 
         gen_clean, gen_corrupted = [
-            self.decoder.generate_from(z) for z in (z_clean, z_corrupted)
+            self.decoder.tokenizer.batch_decode(
+                self.decoder.generate_from(z, max_length=60)
+            )
+            for z in (z_clean, z_corrupted)
         ]
+
+        bleu_clean = self.bleu.compute(
+            predictions=gen_clean, references=batch["input_str"]
+        )['bleu']
+        bleu_corrupted = self.bleu.compute(
+            predictions=gen_corrupted, references=batch["input_str"]
+        )['bleu']
 
         z_groups = [
             z_clean[indices]
             for indices in torch.randperm(input_ids_enc_clean.shape[0]).chunk(2)
         ]
         z_interp = 0.5 * z_groups[0] + 0.5 * z_groups[1]
-        gen_interp = self.decoder.generate_from(z_interp)
+        gen_interp_ids = self.decoder.generate_from(z_interp, max_length=60)
 
-        bleu = evaluate.load("bleu")
-
-        bleu_clean = bleu.compute(predictions=gen_clean, references=batch["input_str"])
-        bleu_corrupted = bleu.compute(
-            predictions=gen_corrupted, references=batch["input_str"]
-        )
-
-        ppl_interp = torch.exp(self.decoder(input_ids=gen_interp).loss)
+        with self.decoder.backbone.disable_adapter():
+            # Disable LoRA layers for perplexity eval
+            ppl_interp = torch.exp(self.decoder.backbone(input_ids=gen_interp_ids, labels=gen_interp_ids).loss)
 
         wandb.log({"bleu_clean": bleu_clean})
         wandb.log({"bleu_corrupted": bleu_corrupted})
-        wandb.log({"ppl_interp": ppl_interp})
-
-
+        wandb.log({"ppl_interp": ppl_interp.item()})

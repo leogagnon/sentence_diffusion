@@ -25,6 +25,6 @@ decoder:
     bias: "none"
 
 dataset:
-  path: data/stories/
+  path: data/
   start_index: 100
   end_index: 1000
