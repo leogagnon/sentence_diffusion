@@ -80,7 +80,7 @@ def main(cfg: Optional[TrainConfig] = None, run_id: Optional[str] = None):
         num_sanity_val_steps=0,
         max_epochs=cfg.max_epochs,
         log_every_n_steps=100,
-        accumulate_grad_batches=cfg.accumulate_grad_batches,#
+        accumulate_grad_batches=cfg.accumulate_grad_batches,
         precision=16
     )
 

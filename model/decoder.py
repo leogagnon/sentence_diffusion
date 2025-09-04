@@ -27,6 +27,7 @@ class DecoderModel(nn.Module):
             cfg.name,
             device_map="auto",
             attn_implementation="flash_attention_2",
+            torch_dtype=torch.float16,
         )
         if self.cfg.lora_cfg != None:
             self.backbone = get_peft_model(

@@ -24,7 +24,8 @@ import wandb
 @dataclass
 class AETaskConfig:
     lr: float
-    batch_size: int
+    train_batch_size: int
+    val_batch_size: int
     encoder: EncoderConfig
     decoder: DecoderConfig
     variational: bool
@@ -125,7 +126,7 @@ class AETask(L.LightningModule):
     def train_dataloader(self):
         return DataLoader(
             self.train_data,
-            batch_size=self.cfg.batch_size,
+            batch_size=self.cfg.train_batch_size,
             shuffle=True,
             collate_fn=lambda x: x,
         )
@@ -133,7 +134,7 @@ class AETask(L.LightningModule):
     def val_dataloader(self):
         return DataLoader(
             self.val_data,
-            batch_size=self.cfg.batch_size,
+            batch_size=self.cfg.val_batch_size,
             shuffle=False,
             collate_fn=lambda x: x,
         )
@@ -159,6 +160,8 @@ class AETask(L.LightningModule):
             KLD = -0.5 * torch.sum(1 + log_var - mean.pow(2) - log_var.exp())
             loss += self.cfg.kl_beta * KLD
             wandb.log({"train/KLD": KLD})
+        else:
+            z = self.out_proj(z)
 
         # Get embeddings of input_ids
         logits = self.decoder(
@@ -210,7 +213,9 @@ class AETask(L.LightningModule):
             # Note: use mean for evaluation
             z_clean = mean_clean
             z_corrupted = self.fc_mean(z_corrupted)
-            
+        else:
+            z_clean = self.out_proj(z_clean)
+            z_corrupted = self.out_proj(z_corrupted)
 
         # Evaluate loss for clean inputs
         logits = self.decoder(

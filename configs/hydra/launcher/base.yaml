@@ -1,13 +1,13 @@
 defaults:
   - submitit_slurm
 
-mem_gb: 32
-gres: gpu:1
+mem_gb: 256
+gres: gpu:l40s:1
 tasks_per_node: 1
 array_parallelism: 32
 cpus_per_task: 1
-timeout_min: 2880 # 1 days
-partition: long-grace
+timeout_min: 300
+partition: long
 
 setup:
   - "source ~/sentence_diffusion/venv/bin/activate"
