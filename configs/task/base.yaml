@@ -1,4 +1,4 @@
-batch_size: 128
+batch_size: 16
 lr: 2e-4
 
 variational: True
@@ -8,7 +8,7 @@ max_generation_length: 150
 val_size: 512 # batch_size * 4
 
 encoder:
-  name: bert-base-uncased
+  name: bert-large-uncased
   k: 16
   lora_cfg: 
     r: 64
@@ -18,7 +18,7 @@ encoder:
     bias: "none"
 
 decoder:
-  name: gpt2
+  name: gpt2-large
   lora_cfg: 
     r: 64
     lora_alpha: 16

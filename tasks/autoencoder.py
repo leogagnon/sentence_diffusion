@@ -201,14 +201,16 @@ class AETask(L.LightningModule):
         )
 
         if self.cfg.variational:
-            z_clean = self.fc_mean(z_clean)
-            z_corrupted = self.fc_mean(z_corrupted)
-
+            mean_clean = self.fc_mean(z_clean)
             log_val_clean = self.fc_log_var(z_clean)
-            KLD =  -0.5 * torch.sum(1 + log_val_clean - z_clean.pow(2) - log_val_clean.exp())
+            KLD =  -0.5 * torch.sum(1 + log_val_clean - mean_clean.pow(2) - log_val_clean.exp())
             self.log("val/KLD", KLD, on_epoch=True)
-
             loss += self.cfg.kl_beta * KLD
+
+            # Note: use mean for evaluation
+            z_clean = mean_clean
+            z_corrupted = self.fc_mean(z_corrupted)
+            
 
         # Evaluate loss for clean inputs
         logits = self.decoder(
@@ -230,7 +232,8 @@ class AETask(L.LightningModule):
         # Decode from clean and corrupted latents and evaluate BLEU
         gen_clean, gen_corrupted = [
             self.decoder.tokenizer.batch_decode(
-                self.decoder.generate_from(z, max_length=self.cfg.max_generation_length)
+                self.decoder.generate_from(z, max_length=self.cfg.max_generation_length),
+                skip_special_tokens=True
             )
             for z in (z_clean, z_corrupted)
         ]
@@ -265,7 +268,7 @@ class AETask(L.LightningModule):
             for s1, s2, s_interp in zip(
                 [batch["input_str"][i] for i in group_indices[0]][:10],
                 [batch["input_str"][i] for i in group_indices[1]][:10],
-                self.decoder.tokenizer.batch_decode(gen_interp_ids[:10]),
+                self.decoder.tokenizer.batch_decode(gen_interp_ids[:10], skip_special_tokens=True),
             ):
                 table.add_data(s1, s2, s_interp)
             wandb.log({"val/interp_samples": table})

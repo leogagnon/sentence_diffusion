@@ -24,7 +24,9 @@ class DecoderModel(nn.Module):
         self.cfg = cfg
 
         self.backbone = AutoModelForCausalLM.from_pretrained(
-            cfg.name, device_map="auto"
+            cfg.name,
+            device_map="auto",
+            attn_implementation="flash_attention_2",
         )
         if self.cfg.lora_cfg != None:
             self.backbone = get_peft_model(
@@ -63,21 +65,32 @@ class DecoderModel(nn.Module):
     def generate_from(self, z, max_length):
         """Generate text from latent code z using autoregressive decoding."""
 
+        # Get cache from z
         prefill = self.backbone(
             inputs_embeds=z,
             use_cache=True,
         )
         cache = prefill.past_key_values
 
-        bos = torch.full((z.shape[0], 1), self.tokenizer.bos_token_id, device=z.device, dtype=torch.long)
-
+        # Autoregressive generation from BOS token with cached z (nucleus sampling)
+        bos = torch.full(
+            (z.shape[0], 1),
+            self.tokenizer.bos_token_id,
+            device=z.device,
+            dtype=torch.long,
+        )
         output = self.backbone.generate(
             input_ids=bos,
             past_key_values=cache,
             cache_position=torch.tensor([z.shape[1]]),
-            attention_mask=torch.ones(z.shape[0], z.shape[1] + 1, device=z.device, dtype=torch.long),
+            attention_mask=torch.ones(
+                z.shape[0], z.shape[1] + 1, device=z.device, dtype=torch.long
+            ),
             max_length=max_length,
             do_sample=True,
+            top_p=0.92,
+            top_k=50,
+            num_beams=1,
             temperature=0.9,
             return_dict_in_generate=True,
             use_cache=True,

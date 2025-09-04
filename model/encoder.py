@@ -25,7 +25,8 @@ class EncoderModel(nn.Module):
 
         # Init backbone
         self.backbone = AutoModel.from_pretrained(
-            cfg.name, device_map="auto"
+            cfg.name,
+            device_map="auto",
         )
         if self.cfg.lora_cfg != None:
             self.backbone = get_peft_model(
@@ -36,12 +37,9 @@ class EncoderModel(nn.Module):
         self.tokenizer = AutoTokenizer.from_pretrained(cfg.name)
 
     def forward(self, input_ids, attention_mask=None):
-        
+
         # Run through backbone and get first k tokens
         z = self.backbone(input_ids, attention_mask=attention_mask)
         z = z["last_hidden_state"][:, : self.cfg.k, :]
 
         return z
-
-        
-

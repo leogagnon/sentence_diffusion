@@ -21,7 +21,6 @@ class TrainConfig:
     accumulate_grad_batches: int 
     val_check_interval: int
     logger: dict
-    accelerator: Optional[str] = None
     sweep_id: Optional[str] = None
     model_checkpoint: Optional[dict] = None
     early_stopping: Optional[dict] = None
@@ -59,10 +58,6 @@ def main(cfg: Optional[TrainConfig] = None, run_id: Optional[str] = None):
         )
         callbacks.append(hydra.utils.instantiate(cfg.model_checkpoint))
 
-    # Set device
-    if cfg.accelerator == None:
-        cfg.accelerator = "gpu" if torch.cuda.is_available() else "cpu"
-
     # Init config object
     cfg = OmegaConf.to_container(
         cfg=cfg,
@@ -77,7 +72,7 @@ def main(cfg: Optional[TrainConfig] = None, run_id: Optional[str] = None):
      # Instantiate the trainer
     trainer = L.Trainer(
         logger=logger,
-        accelerator=cfg.accelerator,
+        accelerator='gpu',
         enable_checkpointing=True if cfg.model_checkpoint else False,
         callbacks=callbacks,
         val_check_interval=cfg.val_check_interval,
@@ -85,11 +80,11 @@ def main(cfg: Optional[TrainConfig] = None, run_id: Optional[str] = None):
         num_sanity_val_steps=0,
         max_epochs=cfg.max_epochs,
         log_every_n_steps=100,
-        accumulate_grad_batches=cfg.accumulate_grad_batches
+        accumulate_grad_batches=cfg.accumulate_grad_batches,#
+        precision=16
     )
 
-    # Run validation once before training 
-    trainer.validate(model=task)
+    #trainer.validate(model=task)
     trainer.fit(
         model=task,
         ckpt_path=(
