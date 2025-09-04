@@ -13,9 +13,6 @@ import os
 @dataclass
 class StoriesDatasetConfig:
     path: str
-    start_index: int = 100
-    end_index: int = 1000
-
 
 class StoriesDataset(Dataset):
     """

@@ -30,10 +30,22 @@ class AETaskConfig:
     variational: bool
     input_sub_p: float
     kl_beta: float
+    max_generation_length: int
     dataset: StoriesDatasetConfig
+    val_size: int
 
 
 class AETask(L.LightningModule):
+    """
+    Autoencoder Task. Combines an encoder and a decoder model to form an autoencoder.
+    Trains the autoencoder to reconstruct the input text.
+    Supports variational autoencoding.
+    Evaluates using
+        - BLEU score of reconstructed clean text
+        - BLEU score of reconstructed corrupted text (with random token substitutions in the input)
+        - Perplexity of interpolated samples in the latent space
+    """
+
     def __init__(self, cfg: Optional[AETaskConfig] = None, **kwargs):
         super().__init__()
 
@@ -59,8 +71,8 @@ class AETask(L.LightningModule):
         self.train_data, self.val_data = random_split(
             self.dataset,
             [
-                int(len(self.dataset) * 0.9),
-                len(self.dataset) - int(len(self.dataset) * 0.9),
+                len(self.dataset) - cfg.val_size,
+                cfg.val_size,
             ],
         )
 
@@ -132,6 +144,8 @@ class AETask(L.LightningModule):
 
     def training_step(self, batch, batch_idx):
 
+        loss = 0.0
+
         if self.cfg.input_sub_p > 0:
             input_ids_enc = self.random_substitution(batch["input_ids_enc"])
 
@@ -141,6 +155,10 @@ class AETask(L.LightningModule):
             mean = self.fc_mean(z)
             log_var = self.fc_log_var(z)
             z = self.reparameterize(mean, log_var)
+
+            KLD = -0.5 * torch.sum(1 + log_var - mean.pow(2) - log_var.exp())
+            loss += self.cfg.kl_beta * KLD
+            wandb.log({"train/KLD": KLD})
 
         # Get embeddings of input_ids
         logits = self.decoder(
@@ -152,23 +170,25 @@ class AETask(L.LightningModule):
             batch["attention_mask_dec"] == 0, -1
         )
 
-        logits = logits[:,:-1].contiguous()
-        targets = targets[:,1:].contiguous()
+        logits = logits[:, :-1].contiguous()
+        targets = targets[:, 1:].contiguous()
 
         # Apply cross-entropy loss
-        loss = torch.nn.functional.cross_entropy(
+        recon_loss = torch.nn.functional.cross_entropy(
             logits.view(-1, logits.size(-1)),
             targets.view(-1),
             ignore_index=-1,
         )
+        loss += recon_loss
 
-        if self.cfg.variational:
-            KLD = -0.5 * torch.sum(1 + log_var - mean.pow(2) - log_var.exp())
-            loss += self.cfg.kl_beta * KLD
+        wandb.log({"train/reconstruction_loss": recon_loss})
 
         return loss
 
     def validation_step(self, batch, batch_idx):
+
+        # Encode clean and corrupted inputs
+        loss = 0.0
 
         input_ids_enc_clean = batch["input_ids_enc"]
         input_ids_enc_corrupted = self.random_substitution(input_ids_enc_clean)
@@ -179,64 +199,83 @@ class AETask(L.LightningModule):
         z_corrupted = self.encoder(
             input_ids_enc_corrupted, attention_mask=batch["attention_mask_enc"]
         )
+
         if self.cfg.variational:
-            mean_clean = self.fc_mean(z_clean)
-            log_var_clean = self.fc_log_var(z_clean)
-            z_clean = self.reparameterize(mean_clean, log_var_clean)
+            z_clean = self.fc_mean(z_clean)
+            z_corrupted = self.fc_mean(z_corrupted)
 
-            mean_corrupted = self.fc_mean(z_corrupted)
-            log_var_corrupted = self.fc_log_var(z_corrupted)
-            z_corrupted = self.reparameterize(mean_corrupted, log_var_corrupted)
+            log_val_clean = self.fc_log_var(z_clean)
+            KLD =  -0.5 * torch.sum(1 + log_val_clean - z_clean.pow(2) - log_val_clean.exp())
+            self.log("val/KLD", KLD, on_epoch=True)
 
-        # Get embeddings of input_ids
+            loss += self.cfg.kl_beta * KLD
+
+        # Evaluate loss for clean inputs
         logits = self.decoder(
             batch["input_ids_dec"], z_clean, attention_mask=batch["attention_mask_dec"]
         )
         targets = batch["input_ids_dec"].masked_fill(
             batch["attention_mask_dec"] == 0, -1
         )
-        logits = logits[:,:-1].contiguous()
-        targets = targets[:,1:].contiguous()
-        loss = torch.nn.functional.cross_entropy(
+        logits = logits[:, :-1].contiguous()
+        targets = targets[:, 1:].contiguous()
+        recon_loss = torch.nn.functional.cross_entropy(
             logits.view(-1, logits.size(-1)),
             targets.view(-1),
             ignore_index=-1,
         )
+        self.log("val/reconstruction_loss", recon_loss, on_epoch=True)
+        loss += recon_loss
 
-        if self.cfg.variational:
-            KLD = -0.5 * torch.sum(
-                1 + log_var_clean - mean_clean.pow(2) - log_var_clean.exp()
-            )
-            loss += self.cfg.kl_beta * KLD
-
-        wandb.log({"loss": loss})
-        wandb.log({"KLD": KLD})
-
+        # Decode from clean and corrupted latents and evaluate BLEU
         gen_clean, gen_corrupted = [
             self.decoder.tokenizer.batch_decode(
-                self.decoder.generate_from(z, max_length=60)
+                self.decoder.generate_from(z, max_length=self.cfg.max_generation_length)
             )
             for z in (z_clean, z_corrupted)
         ]
 
+        if batch_idx == 0:
+            # Log a table of clean and reconstructed sentences to W&B
+            table = wandb.Table(columns=["Clean", "Reconstructed"])
+            for clean, reconstructed in zip(batch["input_str"][:10], gen_clean[:10]):
+                table.add_data(clean, reconstructed)
+            wandb.log({"val/clean_samples": table})
+
         bleu_clean = self.bleu.compute(
             predictions=gen_clean, references=batch["input_str"]
-        )['bleu']
+        )["bleu"]
         bleu_corrupted = self.bleu.compute(
             predictions=gen_corrupted, references=batch["input_str"]
-        )['bleu']
+        )["bleu"]
 
-        z_groups = [
-            z_clean[indices]
-            for indices in torch.randperm(input_ids_enc_clean.shape[0]).chunk(2)
-        ]
+        self.log("val/bleu_clean", bleu_clean, on_epoch=True)
+        self.log("val/bleu_corrupted", bleu_corrupted, on_epoch=True)
+
+        # Interpolate between pairs of clean latents and evaluate perplexity
+        group_indices = torch.randperm(input_ids_enc_clean.shape[0]).chunk(2)
+        z_groups = [z_clean[indices] for indices in group_indices]
         z_interp = 0.5 * z_groups[0] + 0.5 * z_groups[1]
-        gen_interp_ids = self.decoder.generate_from(z_interp, max_length=60)
+        gen_interp_ids = self.decoder.generate_from(
+            z_interp, max_length=self.cfg.max_generation_length
+        )
+        if batch_idx == 0:
+            # Log a table of clean and reconstructed sentences to W&B
+            table = wandb.Table(columns=["S1", "S2", "Interpolated"])
+            for s1, s2, s_interp in zip(
+                [batch["input_str"][i] for i in group_indices[0]][:10],
+                [batch["input_str"][i] for i in group_indices[1]][:10],
+                self.decoder.tokenizer.batch_decode(gen_interp_ids[:10]),
+            ):
+                table.add_data(s1, s2, s_interp)
+            wandb.log({"val/interp_samples": table})
 
         with self.decoder.backbone.disable_adapter():
             # Disable LoRA layers for perplexity eval
-            ppl_interp = torch.exp(self.decoder.backbone(input_ids=gen_interp_ids, labels=gen_interp_ids).loss)
+            ppl_interp = torch.exp(
+                self.decoder.backbone(
+                    input_ids=gen_interp_ids, labels=gen_interp_ids
+                ).loss
+            )
 
-        wandb.log({"bleu_clean": bleu_clean})
-        wandb.log({"bleu_corrupted": bleu_corrupted})
-        wandb.log({"ppl_interp": ppl_interp.item()})
+        self.log("val/ppl_interp", ppl_interp.item(), on_epoch=True)

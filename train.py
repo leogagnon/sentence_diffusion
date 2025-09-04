@@ -81,16 +81,15 @@ def main(cfg: Optional[TrainConfig] = None, run_id: Optional[str] = None):
         enable_checkpointing=True if cfg.model_checkpoint else False,
         callbacks=callbacks,
         val_check_interval=cfg.val_check_interval,
-        reload_dataloaders_every_n_epochs=1,
-        check_val_every_n_epoch=None,
         gradient_clip_val=cfg.gradient_clip_val,
         num_sanity_val_steps=0,
         max_epochs=cfg.max_epochs,
+        log_every_n_steps=100,
         accumulate_grad_batches=cfg.accumulate_grad_batches
     )
 
+    # Run validation once before training 
     trainer.validate(model=task)
-
     trainer.fit(
         model=task,
         ckpt_path=(

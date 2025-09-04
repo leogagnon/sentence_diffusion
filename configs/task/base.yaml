@@ -4,6 +4,8 @@ lr: 2e-4
 variational: True
 input_sub_p: 0.3
 kl_beta: 5e-6
+max_generation_length: 150
+val_size: 512 # batch_size * 4
 
 encoder:
   name: bert-base-uncased
@@ -26,5 +28,3 @@ decoder:
 
 dataset:
   path: data/
-  start_index: 100
-  end_index: 1000

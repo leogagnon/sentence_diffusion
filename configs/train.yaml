@@ -10,7 +10,7 @@ seed: 42
 log_dir: /network/scratch/l/leo.gagnon/sentence_diffusion/logs
 max_epochs: 10
 accumulate_grad_batches: 1
-val_check_interval: 1000
+val_check_interval: 250
 
 logger:
   _target_: lightning.pytorch.loggers.WandbLogger

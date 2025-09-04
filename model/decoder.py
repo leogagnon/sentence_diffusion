@@ -32,7 +32,7 @@ class DecoderModel(nn.Module):
                 LoraConfig(**self.cfg.lora_cfg),
             )
 
-        # Init tokenizer (add a padding token)
+        # Init tokenizer and add pad token if missing
         self.tokenizer = AutoTokenizer.from_pretrained(cfg.name)
         if self.tokenizer.pad_token_id is None:
             self.tokenizer.add_special_tokens({"pad_token": "[PAD]"})
@@ -61,6 +61,7 @@ class DecoderModel(nn.Module):
 
     @torch.no_grad()
     def generate_from(self, z, max_length):
+        """Generate text from latent code z using autoregressive decoding."""
 
         prefill = self.backbone(
             inputs_embeds=z,
