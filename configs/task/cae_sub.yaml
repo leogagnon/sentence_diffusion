@@ -1,0 +1,33 @@
+name: cae_sub
+
+train_batch_size: 16
+val_batch_size: 128
+lr: 1e-4
+
+variational: False
+input_sub_p: 0.3
+kl_beta: 1e-6
+max_generation_length: 150
+val_size: 256
+
+encoder:
+  name: bert-large-uncased # 336M params
+  k: 16
+  compressor_cfg:
+    n_layers: 6
+    n_heads: 8
+    act_masking_p: 0.0
+    feat_masking_p: 0.0
+    act_delta: 0.0
+    
+decoder:
+  name: gpt2-large # 774M params
+  lora_cfg: 
+    r: 128
+    lora_alpha: 32
+    target_modules: ["c_attn", "c_proj"]
+    lora_dropout: 0.1
+    bias: "none"
+
+dataset:
+  path: data/

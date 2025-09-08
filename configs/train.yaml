@@ -1,7 +1,7 @@
 defaults:
   - train_config
   - _self_
-  - task: base
+  - task: ae
   - model_checkpoint: null
   - hydra/sweeper/params : null
   - override hydra/launcher: base
@@ -9,7 +9,7 @@ defaults:
 seed: 42
 log_dir: /network/scratch/l/leo.gagnon/sentence_diffusion/logs
 max_epochs: 200
-accumulate_grad_batches: 64
+accumulate_grad_batches: 32
 val_check_interval: 250
 
 hydra:
@@ -26,4 +26,5 @@ logger:
   save_dir: ${log_dir}
   offline: False
   tags: null
-  resume: allow  
+  resume: allow
+  name: ${task.name}_${now:%Y-%m-%d}_${now:%H-%M-%S}  

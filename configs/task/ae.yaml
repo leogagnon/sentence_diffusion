@@ -1,9 +1,11 @@
-train_batch_size: 8
-val_batch_size: 128
-lr: 2e-4
+name: ae
 
-variational: True
-input_sub_p: 0.3
+train_batch_size: 16
+val_batch_size: 128
+lr: 1e-4
+
+variational: False
+input_sub_p: 0.0
 kl_beta: 1e-6
 max_generation_length: 150
 val_size: 256
@@ -17,7 +19,7 @@ encoder:
     target_modules: ["query", "value", "dense"]
     lora_dropout: 0.1
     bias: "none"
-
+    
 decoder:
   name: gpt2-large # 774M params
   lora_cfg: 

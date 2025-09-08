@@ -34,6 +34,7 @@ class AETaskConfig:
     max_generation_length: int
     dataset: StoriesDatasetConfig
     val_size: int
+    name: Optional[str] = None
 
 
 class AETask(L.LightningModule):
@@ -102,11 +103,11 @@ class AETask(L.LightningModule):
             OmegaConf.to_container(OmegaConf.structured(cfg)), logger=False
         )
 
-    def random_substitution(self, inputs):
+    def random_substitution(self, inputs, p=None):
         inputs = inputs.clone()
         probability = torch.full(
             inputs.shape,
-            self.cfg.input_sub_p,
+            p if p is not None else self.cfg.input_sub_p,
             dtype=torch.float32,
             device=inputs.device,
         )
@@ -199,7 +200,7 @@ class AETask(L.LightningModule):
         loss = 0.0
 
         input_ids_enc_clean = batch["input_ids_enc"]
-        input_ids_enc_corrupted = self.random_substitution(input_ids_enc_clean)
+        input_ids_enc_corrupted = self.random_substitution(input_ids_enc_clean, p=0.3)
 
         z_clean = self.encoder(
             input_ids_enc_clean, attention_mask=batch["attention_mask_enc"]

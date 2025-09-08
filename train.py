@@ -91,17 +91,15 @@ def main(cfg: Optional[TrainConfig] = None, run_id: Optional[str] = None):
     )
 
     #trainer.validate(model=task)
-    try:
-        trainer.fit(
-            model=task,
-            ckpt_path=(
-                os.path.join(cfg.model_checkpoint["dirpath"], "last.ckpt")
-                if run_id != None
-                else None
-            ),
-        )
-    except Exception as e:
-        print(f"Exception during trainer.fit: {e}")
+    trainer.fit(
+        model=task,
+        ckpt_path=(
+            os.path.join(cfg.model_checkpoint["dirpath"], "last.ckpt")
+            if run_id != None
+            else None
+        ),
+    )
+    
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
