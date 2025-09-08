@@ -18,6 +18,7 @@ from hydra.utils import instantiate
 from model.encoder import EncoderConfig, EncoderModel
 from model.decoder import DecoderConfig, DecoderModel
 import evaluate
+import os
 import wandb
 
 
@@ -78,7 +79,7 @@ class AETask(L.LightningModule):
             ],
         )
 
-        self.bleu = evaluate.load("bleu")
+        self.bleu = evaluate.load("bleu", experiment_id=os.urandom(15).hex()) # To avoid cache conflicts
 
         # Make sure there is no dropout in the decoder
         for mod in self.decoder.modules():

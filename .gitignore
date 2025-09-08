@@ -8,3 +8,4 @@ outputs
 *_submitted.pkl
 multirun
 slurm-*
+logs/

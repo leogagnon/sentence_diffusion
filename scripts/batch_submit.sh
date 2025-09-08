@@ -8,8 +8,8 @@ else
 	exit 1
 fi
 shift
-for arg in "$@"; do
-	sbatch scripts/submit.sh sweep_id="$sweep_id" task="$arg"
+for task in "$@"; do
+	sbatch -J "$task" -o "logs/${sweep_id}_${task}.log" scripts/submit.sh task="$task" sweep_id="$sweep_id" 
 done
 
 

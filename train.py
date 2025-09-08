@@ -11,7 +11,6 @@ from lightning.pytorch.loggers import WandbLogger
 from omegaconf import MISSING, DictConfig, OmegaConf, SCMode
 from tasks.autoencoder import AETask, AETaskConfig
 
-
 @dataclass
 class TrainConfig:
     task: AETaskConfig
@@ -32,6 +31,7 @@ OmegaConf.register_new_resolver("eval", eval)
 
 def main(cfg: Optional[TrainConfig] = None, run_id: Optional[str] = None):
     L.seed_everything(cfg.seed)
+    print('what')
 
     # If run_id is provided, use the associated config
     if run_id != None:
@@ -102,6 +102,7 @@ def main(cfg: Optional[TrainConfig] = None, run_id: Optional[str] = None):
     
 
 if __name__ == "__main__":
+    print('wtf')
     parser = argparse.ArgumentParser()
     parser.add_argument("--wandb_id")
     args, _ = parser.parse_known_args()

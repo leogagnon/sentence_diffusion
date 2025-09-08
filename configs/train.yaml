@@ -1,10 +1,8 @@
 defaults:
   - train_config
   - _self_
-  - task: ae
+  - task: ae/ae
   - model_checkpoint: null
-  - hydra/sweeper/params : null
-  - override hydra/launcher: base
  
 seed: 42
 log_dir: /network/scratch/l/leo.gagnon/sentence_diffusion/logs
@@ -15,9 +13,6 @@ val_check_interval: 250
 hydra:
   run:
     dir: ${log_dir}/hydra/${now:%Y-%m-%d}_${now:%H-%M-%S}
-  sweep:
-    dir: ${log_dir}/hydra_multiruns/${sweep_id}
-    subdir: ${hydra.job.num}
 
 logger:
   _target_: lightning.pytorch.loggers.WandbLogger
@@ -27,4 +22,4 @@ logger:
   offline: False
   tags: null
   resume: allow
-  name: ${task.name}_${now:%Y-%m-%d}_${now:%H-%M-%S}  
+  #name: ${task.name}_${now:%Y-%m-%d}_${now:%H-%M-%S}  
