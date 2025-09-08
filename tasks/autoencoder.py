@@ -97,9 +97,13 @@ class AETask(L.LightningModule):
             )
 
         self.cfg = cfg
+        
+        self.save_hyperparameters(
+            OmegaConf.to_container(OmegaConf.structured(cfg)), logger=False
+        )
 
     def random_substitution(self, inputs):
-
+        inputs = inputs.clone()
         probability = torch.full(
             inputs.shape,
             self.cfg.input_sub_p,
@@ -147,8 +151,9 @@ class AETask(L.LightningModule):
 
         loss = 0.0
 
+        input_ids_enc = batch["input_ids_enc"]
         if self.cfg.input_sub_p > 0:
-            input_ids_enc = self.random_substitution(batch["input_ids_enc"])
+            input_ids_enc = self.random_substitution(input_ids_enc)
 
         z = self.encoder(input_ids_enc, attention_mask=batch["attention_mask_enc"])
 

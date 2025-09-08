@@ -7,3 +7,4 @@ outputs
 *.pyc
 *_submitted.pkl
 multirun
+slurm-*

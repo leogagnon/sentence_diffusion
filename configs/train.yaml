@@ -9,7 +9,7 @@ defaults:
 seed: 42
 log_dir: /network/scratch/l/leo.gagnon/sentence_diffusion/logs
 max_epochs: 200
-accumulate_grad_batches: 16
+accumulate_grad_batches: 64
 val_check_interval: 250
 
 hydra:
@@ -18,7 +18,6 @@ hydra:
   sweep:
     dir: ${log_dir}/hydra_multiruns/${sweep_id}
     subdir: ${hydra.job.num}
-
 
 logger:
   _target_: lightning.pytorch.loggers.WandbLogger

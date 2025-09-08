@@ -1,47 +1,37 @@
-import math
 import os
 import random
 from collections import namedtuple
 from dataclasses import dataclass
 from functools import partial, singledispatchmethod
 from typing import *
+import math
 
 import hydra
-import jax
-import jax.numpy as jnp
 import lightning as L
 import numpy as np
 import torch
 import torch.nn.functional as F
 import wandb
 from einops import rearrange, reduce, repeat
-from jax.scipy.special import rel_entr
 from omegaconf import OmegaConf
-from torch2jax import j2t, t2j
 from torch.utils.data import DataLoader, Dataset, Subset, random_split
 from torchmetrics.functional import kl_divergence
 from tqdm import tqdm
 from transformers.activations import ACT2FN
 
-from models.diffusion import DiT, DiTConfig
-from tasks.metalearn import MetaLearningTask
-from utils import *
+from model.diffusion_transformer import DiT, DiTConfig
 
 ModelPrediction = namedtuple(
     "ModelPrediction", ["pred_noise", "pred_x_start", "pred_v"]
 )
 
-
 @dataclass
-class DiffusionTaskConfig:
+class DSMDiffusionConfig:
     model: DiTConfig
     dataset: dict
     batch_size: int
     val_split: float
     lr: float
-    mc_eval: bool
-    mc_samples: int = 5
-    mc_seqs: int = 50
     tag: Optional[str] = None
 
     loss: str = "l2"
@@ -54,18 +44,18 @@ class DiffusionTaskConfig:
     normalize_latent: bool = False
 
 
-class DiffusionTask(L.LightningModule):
+class DSMDiffusion(L.LightningModule):
     """
     Trains a diffusion model with a Denoising Score Matching (DSM, https://arxiv.org/pdf/2101.09258) loss, i.e. maximum likelihood.
     """
 
-    def __init__(self, cfg: Optional[DiffusionTaskConfig] = None, **kwargs) -> None:
+    def __init__(self, cfg: Optional[DSMDiffusionConfig] = None, **kwargs) -> None:
         super().__init__()
 
         if cfg == None:
             cfg = OmegaConf.to_object(
                 OmegaConf.merge(
-                    OmegaConf.create(DiffusionTaskConfig),
+                    OmegaConf.create(DSMDiffusionConfig),
                     OmegaConf.create(kwargs),
                 )
             )
@@ -216,6 +206,7 @@ class DiffusionTask(L.LightningModule):
         z_t,
         t,
         x_self_cond=None,
+        class_id=None,
         cond=None,
         cond_input_ids=None,
         cond_mask=None,  # IGNORE WHEN MASK IS FALSE
@@ -228,16 +219,23 @@ class DiffusionTask(L.LightningModule):
             z_t,
             time_cond,
             x_self_cond,
+            class_id=class_id,
             cond=cond,
             cond_input_ids=cond_input_ids,
             cond_mask=cond_mask,
         )
         if cls_free_guidance != 1.0:
-            unc_class_id = None
+            if exists(class_id):
+                unc_class_id = torch.full_like(
+                    class_id, fill_value=self.model.cfg.num_classes
+                )
+            else:
+                unc_class_id = None
             unc_model_output = self.model(
                 z_t,
                 time_cond,
                 x_self_cond,
+                class_id=unc_class_id,
                 cond=None,
                 cond_input_ids=None,
                 cond_mask=None,
@@ -273,6 +271,7 @@ class DiffusionTask(L.LightningModule):
     def ddim_sample(
         self,
         shape,
+        class_id,
         cond,
         cond_input_ids,
         cond_mask,
@@ -297,6 +296,7 @@ class DiffusionTask(L.LightningModule):
             model_output = self.diffusion_model_predictions(
                 z_t,
                 time,
+                class_id=class_id,
                 x_self_cond=x_start,
                 cond=cond,
                 cond_input_ids=cond_input_ids,
@@ -334,6 +334,7 @@ class DiffusionTask(L.LightningModule):
     def ddpm_sample(
         self,
         shape,
+        class_id,
         cond,
         cond_input_ids,
         cond_mask,
@@ -356,6 +357,7 @@ class DiffusionTask(L.LightningModule):
             model_output = self.diffusion_model_predictions(
                 z_t,
                 time,
+                class_id=class_id,
                 x_self_cond=x_start,
                 cond=cond,
                 cond_input_ids=cond_input_ids,
@@ -399,6 +401,7 @@ class DiffusionTask(L.LightningModule):
     def dpmpp_sample(
         self,
         shape,
+        class_id,
         cond,
         cond_input_ids,
         cond_mask,
@@ -423,6 +426,7 @@ class DiffusionTask(L.LightningModule):
             model_output = self.diffusion_model_predictions(
                 z_t,
                 time,
+                class_id=class_id,
                 x_self_cond=x_start,
                 cond=cond,
                 cond_input_ids=cond_input_ids,
@@ -471,6 +475,7 @@ class DiffusionTask(L.LightningModule):
     def sample(
         self,
         batch_size,
+        class_id=None,
         cond=None,
         cond_input_ids=None,
         cond_mask=None,
@@ -487,6 +492,7 @@ class DiffusionTask(L.LightningModule):
             raise ValueError(f"invalid sampler {self.cfg.sampler}")
         return sample_fn(
             (batch_size,) + tuple(self.model.cfg.latent_shape),
+            class_id,
             cond,
             cond_input_ids,
             cond_mask,
@@ -526,6 +532,7 @@ class DiffusionTask(L.LightningModule):
     def compute_diffusion_loss(
         self,
         latent,
+        class_id=None,
         cond=None,
         cond_input_ids=None,
         cond_ignore_mask=None,
@@ -554,6 +561,16 @@ class DiffusionTask(L.LightningModule):
             cond_input_ids = None
             cond_mask = None
 
+        if (
+            self.model.cfg.class_conditional
+            and self.model.cfg.class_unconditional_prob > 0
+        ):
+            assert exists(class_id)
+            class_unconditional_mask = self.model.class_unconditional_bernoulli.sample(
+                class_id.shape
+            ).bool()
+            class_id[class_unconditional_mask] = self.model.cfg.num_classes
+
         self_cond = None
 
         if self.model.cfg.self_condition and (
@@ -563,6 +580,7 @@ class DiffusionTask(L.LightningModule):
                 model_output = self.diffusion_model_predictions(
                     z_t,
                     times,
+                    class_id=class_id,
                     cond=cond,
                     cond_mask=cond_mask,
                 )
@@ -574,6 +592,7 @@ class DiffusionTask(L.LightningModule):
             z_t,
             times,
             x_self_cond=self_cond,
+            class_id=class_id,
             cond=cond,
             cond_input_ids=cond_input_ids,
             cond_mask=cond_mask,
@@ -623,40 +642,6 @@ class DiffusionTask(L.LightningModule):
         )
 
         return loss
-
-    def validation_step(self, batch, batch_idx):
-        bs = batch["raw_latent"].shape[0]
-
-        latent = batch["latent"]
-        if self.cfg.normalize_latent:
-            latent_ = rearrange(latent, "b s d -> (b s) d")
-            self.latent_mean = torch.mean(latent_, dim=0)
-            self.latent_scale = torch.std(latent_ - self.latent_mean, unbiased=False)
-            latent = self.normalize_latent(latent)
-
-        loss = self.compute_diffusion_loss(
-            latent,
-            cond=batch["cond_tokens"],
-            cond_input_ids=batch["cond_input_ids"],
-            cond_ignore_mask=batch["cond_ignore_mask"],
-        )
-
-        self.log(
-            "val/loss",
-            loss.detach().cpu().numpy().item(),
-            prog_bar=True,
-            add_dataloader_idx=False,
-            batch_size=latent.shape[0],
-        )
-
-        if (batch_idx == 0) & self.cfg.mc_eval:
-            mc_dict = self.evaluate_mc_estimate(
-                batch["cond_input_ids"], batch["cond_tokens"]
-            )
-            if mc_dict != None:
-                for k in mc_dict.keys():
-                    self.log(k, mc_dict[k], prog_bar=False, add_dataloader_idx=False)
-
 
 #######################################
 ################ UTILS ################

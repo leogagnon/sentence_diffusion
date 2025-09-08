@@ -23,6 +23,7 @@ import torch.nn.functional as F
 from einops import rearrange, reduce, repeat
 from einops.layers.torch import Rearrange
 from omegaconf import MISSING
+from PIL import Image
 from torch import einsum, nn
 from torch.optim import AdamW
 from torch.optim.optimizer import Optimizer
@@ -30,12 +31,9 @@ from torch.utils.data import DataLoader, Dataset
 from tqdm.auto import tqdm
 from transformers.modeling_outputs import BaseModelOutput
 from transformers.models.bart.modeling_bart import BartForConditionalGeneration
-from x_transformers.x_transformers import (
-    AbsolutePositionalEmbedding,
-    Encoder,
-    ScaledSinusoidalEmbedding,
-    init_zero_,
-)
+from x_transformers.x_transformers import (AbsolutePositionalEmbedding,
+                                           Encoder, ScaledSinusoidalEmbedding,
+                                           init_zero_)
 
 
 @dataclass
@@ -43,11 +41,13 @@ class DiTConfig:
     n_layers: int
     n_heads: int
     dropout: float
+    scale_shift: bool
     cond_encoder_kwargs: Optional[dict]
     latent_shape: Optional[Tuple[int]] = None
     n_embd: Optional[int] = None
     seq_conditional: Optional[bool] = False
     seq_conditional_dim: Optional[int] = None
+    class_conditional: Optional[bool] = False
     num_classes: Optional[int] = 0
     cond_modulation: Optional[bool] = False
 
@@ -61,7 +61,7 @@ class DiTConfig:
 class DiT(nn.Module):
     """
     Diffusion transformer (DiT, https://arxiv.org/pdf/2212.09748) with adaptive layer norm zero (adaLN-Zero) conditionning.
-    Super-charged with other tricks and add-ons (self-conditionning, sequence-conditioning, class-conditionning, langevin model)
+    Super-charged with other tricks and add-ons (self-conditionning, sequence-conditioning, class-conditionning)
     Can be the backbone of a DSM or GFN diffusion model.
     """
 
@@ -100,13 +100,25 @@ class DiT(nn.Module):
             rel_pos_bias=False,
             ff_glu=True,
             cross_attend=cfg.seq_conditional,
-            # Enables DiT adalnzero 
-            use_adaptive_layernorm=True,
-            use_adaptive_layerscale=True,
-            adaptive_condition_mlp=True,
+            # DiT scale-shift stuff
+            use_adaptive_layernorm=cfg.scale_shift,
+            use_adaptive_layerscale=cfg.scale_shift,
             dim_condition=time_emb_dim,
+            adaptive_condition_mlp=cfg.scale_shift,
         )
 
+        if cfg.class_conditional:
+            assert (
+                False
+            ), "Careful, never tested the class conditional setting for real."
+            assert cfg.num_classes > 0
+            self.class_embedding = nn.Sequential(
+                nn.Embedding(cfg.num_classes + 1, self.cfg.n_embd),
+                nn.Linear(self.cfg.n_embd, time_emb_dim),
+            )
+            self.class_unconditional_bernoulli = torch.distributions.Bernoulli(
+                probs=cfg.class_unconditional_prob
+            )
         if cfg.seq_conditional:
             assert cfg.seq_conditional_dim != None
             self.null_embedding_cond = nn.Embedding(1, self.cfg.n_embd)
@@ -126,8 +138,6 @@ class DiT(nn.Module):
         )
 
         if cfg.cond_encoder_kwargs != None:
-            assert cfg.seq_conditional
-
             self.cond_encoder = Encoder(
                 dim=cfg.seq_conditional_dim,
                 depth=cfg.cond_encoder_kwargs["n_layers"],
@@ -150,13 +160,22 @@ class DiT(nn.Module):
         x: torch.Tensor,
         time,
         x_self_cond=None,
+        class_id=None,
         cond=None,
+        cond_input_ids=None,
         cond_mask=None,
+        log_r_fn=None,
     ):
 
         time_emb = self.time_mlp(time[None] * 1000)
 
         time_emb = rearrange(time_emb, "b d -> b 1 d")
+
+        if self.cfg.class_conditional:
+            assert class_id != None
+            class_emb = self.class_embedding(class_id)
+            class_emb = rearrange(class_emb, "b d -> b 1 d")
+            time_emb = time_emb + class_emb
 
         pos_emb = self.pos_emb(x)
 
@@ -174,9 +193,8 @@ class DiT(nn.Module):
 
         if self.cfg.seq_conditional:
             context, context_mask = [], []
-            if cond is None:
-                # If the model is conditional but no conditionning 
-                # is passed, give <null_embedding_cond>
+            if (cond is None) & (cond_input_ids is None):
+                # If the model is conditional but no conditionning is passed, give <null_embedding_cond>
                 null_context = repeat(
                     self.null_embedding_cond.weight, "1 d -> b 1 d", b=x.shape[0]
                 )
@@ -199,11 +217,10 @@ class DiT(nn.Module):
                     condition = time_emb
 
             else:
-                # Maybe process the conditionning tokens
+                # Maybe process the conditionning tokens 
                 if self.cfg.cond_encoder_kwargs != None:
-                    # If directly taking in <input_ids>
                     cond = self.cond_encoder(cond, mask=cond_mask)
-
+                   
                 context.append(self.cond_proj(cond))
                 context_mask.append(cond_mask)
 

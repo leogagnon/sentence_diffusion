@@ -1,19 +1,19 @@
-train_batch_size: 32
-val_batch_size: 512
+train_batch_size: 8
+val_batch_size: 128
 lr: 2e-4
 
-variational: False
+variational: True
 input_sub_p: 0.3
-kl_beta: 5e-6
+kl_beta: 1e-6
 max_generation_length: 150
-val_size: 512
+val_size: 256
 
 encoder:
   name: bert-large-uncased # 336M params
   k: 16
   lora_cfg: 
-    r: 64
-    lora_alpha: 16
+    r: 128
+    lora_alpha: 32
     target_modules: ["query", "value", "dense"]
     lora_dropout: 0.1
     bias: "none"
@@ -21,8 +21,8 @@ encoder:
 decoder:
   name: gpt2-large # 774M params
   lora_cfg: 
-    r: 64
-    lora_alpha: 16
+    r: 128
+    lora_alpha: 32
     target_modules: ["c_attn", "c_proj"]
     lora_dropout: 0.1
     bias: "none"

@@ -69,6 +69,12 @@ def main(cfg: Optional[TrainConfig] = None, run_id: Optional[str] = None):
 
     task = AETask(cfg.task)
 
+    # Give the whole TrainConfig to wandb
+    if cfg.logger:
+        logger.experiment.config.update(
+            OmegaConf.to_container(OmegaConf.structured(cfg)), allow_val_change=True
+        )
+
      # Instantiate the trainer
     trainer = L.Trainer(
         logger=logger,
@@ -81,18 +87,21 @@ def main(cfg: Optional[TrainConfig] = None, run_id: Optional[str] = None):
         max_epochs=cfg.max_epochs,
         log_every_n_steps=100,
         accumulate_grad_batches=cfg.accumulate_grad_batches,
-        precision=16
+        precision='16-mixed'
     )
 
     #trainer.validate(model=task)
-    trainer.fit(
-        model=task,
-        ckpt_path=(
-            os.path.join(cfg.model_checkpoint["dirpath"], "last.ckpt")
-            if run_id != None
-            else None
-        ),
-    )
+    try:
+        trainer.fit(
+            model=task,
+            ckpt_path=(
+                os.path.join(cfg.model_checkpoint["dirpath"], "last.ckpt")
+                if run_id != None
+                else None
+            ),
+        )
+    except Exception as e:
+        print(f"Exception during trainer.fit: {e}")
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()

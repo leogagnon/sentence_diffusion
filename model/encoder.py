@@ -10,7 +10,6 @@ from transformers.models.auto.modeling_auto import AutoModelForCausalLM, AutoMod
 from transformers.models.auto.tokenization_auto import AutoTokenizer
 import torch
 
-
 @dataclass
 class EncoderConfig:
     name: str
