@@ -9,10 +9,11 @@ import torch
 import random
 import numpy as np
 from torch.utils.data import DataLoader, random_split
+from torch.utils.data.dataset import Subset
 from transformers import AutoTokenizer
 from transformers.models.auto.modeling_auto import AutoModelForCausalLM
 from peft import get_peft_model
-from model.diffusion_transformer import DiTConfig, DiT
+from model.gaussian_diffusion import DiTConfig, DiT
 from data.stories import StoriesDatasetConfig, StoriesDataset
 from hydra.utils import instantiate
 from model.encoder import EncoderConfig, EncoderModel
@@ -71,15 +72,12 @@ class AETask(L.LightningModule):
             enc_tokenizer=self.encoder.tokenizer,
             dec_tokenizer=self.decoder.tokenizer,
         )
-        self.train_data, self.val_data = random_split(
-            self.dataset,
-            [
-                len(self.dataset) - cfg.val_size,
-                cfg.val_size,
-            ],
-        )
+        # Randomly choose split into train and val
+        indices = torch.randperm(len(self.dataset))
+        self.register_buffer('train_indices', indices[:-cfg.val_size])
+        self.register_buffer('val_indices', indices[-cfg.val_size:])
 
-        self.bleu = evaluate.load("bleu", experiment_id=os.urandom(15).hex()) # To avoid cache conflicts
+        self.bleu = evaluate.load("bleu", experiment_id=os.urandom(15).hex()) # Random experiment_id to avoid cache conflicts
 
         # Make sure there is no dropout in the decoder
         for mod in self.decoder.modules():
@@ -103,6 +101,11 @@ class AETask(L.LightningModule):
         self.save_hyperparameters(
             OmegaConf.to_container(OmegaConf.structured(cfg)), logger=False
         )
+        
+    def setup(self, **kwargs):
+        """Setup the data"""
+        self.train_data = Subset(self.dataset, indices=self.train_indices)
+        self.val_data = Subset(self.dataset, indices=self.val_indices)
 
     def random_substitution(self, inputs, p=None):
         inputs = inputs.clone()

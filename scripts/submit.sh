@@ -3,7 +3,7 @@
 #SBATCH --cpus-per-task=1
 #SBATCH --mem=256G
 #SBATCH --gres=gpu:l40s:1
-#SBATCH --output=~/sentence_diffusion/logs/misc/%j.out
+#SBATCH --output=logs/misc/%j.out
 
 task_arg=""
 for arg in "$@"; do

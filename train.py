@@ -11,6 +11,8 @@ from lightning.pytorch.loggers import WandbLogger
 from omegaconf import MISSING, DictConfig, OmegaConf, SCMode
 from tasks.autoencoder import AETask, AETaskConfig
 
+os.environ["LATENT_CONTROL_CKPT_DIR"] = '/network/scratch/l/leo.gagnon/sentence_diffusion/logs/checkpoints'
+
 @dataclass
 class TrainConfig:
     task: AETaskConfig
@@ -30,25 +32,33 @@ cs.store(name="train_config", node=TrainConfig)
 OmegaConf.register_new_resolver("eval", eval)
 
 def main(cfg: Optional[TrainConfig] = None, run_id: Optional[str] = None):
-    L.seed_everything(cfg.seed)
-    print('what')
+    
 
     # If run_id is provided, use the associated config
     if run_id != None:
         assert cfg is None
+        # Gather the run's config
         wandb_id = run_id
         api = wandb.Api()
         entity = "guillaume-lajoie"
-        project = "hlm"
+        project = "sentence_diffusion"
         run = api.run(f"{entity}/{project}/{run_id}")
         cfg = OmegaConf.merge(OmegaConf.structured(TrainConfig), run.config)
 
-    # Add user to logger
-    if "USER" in os.environ:
-        cfg.logger.tags = [os.environ["USER"]]
+        # Set the logger ID to the provided run_id (to resume the run)
+        cfg.logger.id = wandb_id
+    else:
+        # Setup tags for wandb
+        tags = [k for k in cfg.task.keys() if cfg.task[k] != None]
+        # Add user to logger
+        if "USER" in os.environ:
+            tags += [os.environ["USER"]]
+        cfg.logger.tags = tags
 
     logger = hydra.utils.instantiate(cfg.logger)
-    wandb_id = logger.experiment.path.split("/")[-1]
+    wandb_id = logger.experiment.path.split("/")[-1] 
+
+    L.seed_everything(cfg.seed)
     
     # Setup checkpoint (with wandb ID as <dirpath>)
     callbacks = []

@@ -19,11 +19,11 @@ from torchmetrics.functional import kl_divergence
 from tqdm import tqdm
 from transformers.activations import ACT2FN
 
-from model.diffusion_transformer import DiT, DiTConfig
+from model.gaussian_diffusion import *
 from tasks.autoencoder import AETask
 import torch.nn as nn
+from data.stories import StoriesDatasetConfig, StoriesDataset
 
-ModelPrediction = namedtuple("ModelPrediction", ["pred_noise", "pred_x_start", "pred_v"])
 
 @dataclass
 class DSMDiffusionConfig:
@@ -32,6 +32,7 @@ class DSMDiffusionConfig:
     batch_size: int
     val_split: float
     lr: float
+    ae_id: str
     name: Optional[str] = None
 
     loss: str = "l2"
@@ -46,7 +47,7 @@ class DSMDiffusionConfig:
 
 class DSMDiffusion(L.LightningModule):
     """
-    Trains a diffusion model with a Denoising Score Matching (DSM, https://arxiv.org/pdf/2101.09258) loss, i.e. maximum likelihood.
+    Trains a diffusion model.
     """
 
     def __init__(self, cfg: Optional[DSMDiffusionConfig] = None, **kwargs) -> None:
@@ -60,50 +61,18 @@ class DSMDiffusion(L.LightningModule):
                 )
             )
 
-        assert cfg.sampler in {
-            "ddim",
-            "ddpm",
-            "dpmpp",
-        }, "sampler must be one of ddim, ddpm, dpmpp"
-
-        assert cfg.diffusion_objective in {
-            "pred_noise",
-            "pred_x0",
-            "pred_v",
-        }, "objective must be one of pred_noise, pred_x0, pred_v"
-
-        if cfg.train_schedule == "simple_linear":
-            alpha_schedule = simple_linear_schedule
-        elif cfg.train_schedule == "beta_linear":
-            alpha_schedule = beta_linear_schedule
-        elif cfg.train_schedule == "cosine":
-            alpha_schedule = cosine_schedule
-        elif cfg.train_schedule == "sigmoid":
-            alpha_schedule = sigmoid_schedule
-        else:
-            raise ValueError(f"invalid noise schedule {cfg.train_schedule}")
+        # Setup diffusion stuff
+        self.model = DiT(cfg.model)
 
         self.train_schedule = partial(
-            time_to_alpha, alpha_schedule=alpha_schedule, scale=cfg.schedule_scale
+            time_to_alpha,
+            alpha_schedule=get_sampling_schedule(cfg.train_schedule),
+            scale=cfg.schedule_scale,
         )
-
-        if cfg.sampling_schedule is None:
-            sampling_alpha_schedule = None
-        elif cfg.sampling_schedule == "simple_linear":
-            sampling_alpha_schedule = simple_linear_schedule
-        elif cfg.sampling_schedule == "beta_linear":
-            sampling_alpha_schedule = beta_linear_schedule
-        elif cfg.sampling_schedule == "cosine":
-            sampling_alpha_schedule = cosine_schedule
-        elif cfg.sampling_schedule == "sigmoid":
-            sampling_alpha_schedule = sigmoid_schedule
-        else:
-            raise ValueError(f"invalid sampling schedule {cfg.sampling_schedule}")
-
-        if exists(sampling_alpha_schedule):
+        if cfg.sampling_schedule != None:
             self.sampling_schedule = partial(
                 time_to_alpha,
-                alpha_schedule=sampling_alpha_schedule,
+                alpha_schedule=get_sampling_schedule(cfg.sampling_schedule),
                 scale=cfg.schedule_scale,
             )
         else:
@@ -116,29 +85,48 @@ class DSMDiffusion(L.LightningModule):
             self.register_buffer("latent_scale", torch.tensor(1).to(torch.float32))
             self.latent_scale: torch.FloatTensor
 
-        # Setup dataset and freeze it (since it contains models)
-        self.dataset = hydra.utils.instantiate(cfg.dataset)
-        self.dataset.requires_grad_(False)
-        self.train_data, self.val_data = random_split(
-            self.dataset, [1 - cfg.val_split, cfg.val_split]
-        )
-
-        AETask.load_from_checkpoint(
+        # Load the AutoEncoder Task
+        ae_task = AETask.load_from_checkpoint(
             os.path.join(
                 os.environ["LATENT_CONTROL_CKPT_DIR"],
-                cfg.pretrained_id,
+                cfg.ae_id,
                 "last.ckpt",
             ),
             strict=False,
         )
+        ae_task.setup()
 
-        self.model = DiT(cfg.model)
+        self.encoder = ae_task.encoder.eval().requires_grad_(False)
+        self.decoder = ae_task.decoder.eval().requires_grad_(False).cpu()
+        self.train_data = ae_task.train_data
+        self.val_data = ae_task.val_data
 
         self.cfg = cfg
         # Important for checkpoints
         self.save_hyperparameters(
             OmegaConf.to_container(OmegaConf.structured(cfg)), logger=False
         )
+
+    @property
+    def loss_fn(self):
+        if self.cfg.loss == "l1":
+            return F.l1_loss
+        elif self.cfg.loss == "l2":
+            return F.mse_loss
+        elif self.cfg.loss == "smooth_l1":
+            return F.smooth_l1_loss
+        else:
+            raise ValueError(f"invalid loss type {self.cfg.loss}")
+
+    def normalize_latent(self, x_start):
+        eps = 1e-5
+
+        return (x_start - self.latent_mean) / (self.latent_scale).clamp(min=eps)
+
+    def unnormalize_latent(self, x_start):
+        eps = 1e-5
+
+        return x_start * (self.latent_scale.clamp(min=eps)) + self.latent_mean
 
     def configure_optimizers(self):
         return torch.optim.AdamW(self.model.parameters(), lr=self.cfg.lr)
@@ -159,105 +147,24 @@ class DSMDiffusion(L.LightningModule):
             shuffle=False,
         )
 
-    def compute_diffusion_loss(
-        self,
-        latent,
-        class_id=None,
-        cond=None,
-        cond_input_ids=None,
-        cond_ignore_mask=None,
-    ):
-        # NOTE: Important to flip the <ignore_mask> to a <don't_ignore_mask>
-        cond_mask = None
-        if cond_ignore_mask != None:
-            cond_mask = torch.logical_not(cond_ignore_mask)
-
-        bs, l, d = (*latent.shape,)
-        device = latent.device
-
-        times = torch.zeros((bs,), device=device).float().uniform_(0, 1.0)
-        noise = torch.randn_like(latent)
-
-        alpha = self.train_schedule(times)
-        alpha = right_pad_dims_to(latent, alpha)
-
-        z_t = alpha.sqrt() * latent + (1 - alpha).sqrt() * noise
-
-        # Sample unconditionally with some probability
-        if self.model.cfg.seq_conditional and (
-            random.random() < self.model.cfg.seq_unconditional_prob
-        ):
-            cond = None
-            cond_input_ids = None
-            cond_mask = None
-
-        if (
-            self.model.cfg.class_conditional
-            and self.model.cfg.class_unconditional_prob > 0
-        ):
-            assert exists(class_id)
-            class_unconditional_mask = self.model.class_unconditional_bernoulli.sample(
-                class_id.shape
-            ).bool()
-            class_id[class_unconditional_mask] = self.model.cfg.num_classes
-
-        self_cond = None
-
-        if self.model.cfg.self_condition and (
-            random.random() < self.model.cfg.train_prob_self_cond
-        ):
-            with torch.no_grad():
-                model_output = self.diffusion_model_predictions(
-                    z_t,
-                    times,
-                    class_id=class_id,
-                    cond=cond,
-                    cond_mask=cond_mask,
-                )
-                self_cond = model_output.pred_x_start.detach()
-
-        # predict and take gradient step
-
-        predictions = self.diffusion_model_predictions(
-            z_t,
-            times,
-            x_self_cond=self_cond,
-            class_id=class_id,
-            cond=cond,
-            cond_input_ids=cond_input_ids,
-            cond_mask=cond_mask,
-        )
-
-        if self.cfg.diffusion_objective == "pred_x0":
-            target = latent
-            pred = predictions.pred_x_start
-        elif self.cfg.diffusion_objective == "pred_noise":
-            target = noise
-            pred = predictions.pred_noise
-        elif self.cfg.diffusion_objective == "pred_v":
-            target = alpha.sqrt() * noise - (1 - alpha).sqrt() * latent
-            assert exists(predictions.pred_v)
-            pred = predictions.pred_v
-
-        loss = self.loss_fn(pred, target, reduction="none")
-        loss = rearrange(
-            [reduce(loss[i], "l d -> 1", "mean") for i in range(latent.shape[0])],
-            "b 1 -> b 1",
-        )
-
-        return loss.mean()
-
     def training_step(self, batch, batch_idx=None):
+        
+        # Compute latents
+        with torch.no_grad():
+            latent = self.encoder(batch["input_ids_enc"])
 
-        latent = batch["latent"]
         if self.cfg.normalize_latent:
             latent_ = rearrange(latent, "b s d -> (b s) d")
             self.latent_mean = torch.mean(latent_, dim=0)
             self.latent_scale = torch.std(latent_ - self.latent_mean, unbiased=False)
             latent = self.normalize_latent(latent)
 
-        loss = self.compute_diffusion_loss(
+        loss = compute_diffusion_loss(
+            self.model,
             latent,
+            schedule=self.train_schedule,
+            diffusion_objective=self.cfg.diffusion_objective,
+            loss_fn=self.loss_fn,
             cond=batch["cond_tokens"],
             cond_input_ids=batch["cond_input_ids"],
             cond_ignore_mask=batch["cond_ignore_mask"],
