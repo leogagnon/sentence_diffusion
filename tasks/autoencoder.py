@@ -196,7 +196,6 @@ class AETask(L.LightningModule):
         return loss
 
     def validation_step(self, batch, batch_idx):
-
         # Encode clean and corrupted inputs
         loss = 0.0
 
