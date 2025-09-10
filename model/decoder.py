@@ -23,7 +23,7 @@ class DecoderModel(nn.Module):
         super().__init__()
         self.cfg = cfg
 
-        self.backbone = AutoModelForCausalLM.from_pretrained(
+        self.backbone = AutoModelForChausalLM.from_pretrained(
             cfg.name,
             device_map="auto",
             attn_implementation="flash_attention_2",
@@ -100,5 +100,6 @@ class DecoderModel(nn.Module):
         )
 
         output = output.sequences[:, 1:]  # Remove BOS token
+
 
         return output

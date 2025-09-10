@@ -1,4 +1,5 @@
 """Diffusion Transformer (DiT) and Gaussian Diffusion utilities to train and sample."""
+
 import math
 from abc import ABC, abstractmethod, abstractproperty
 from collections import Counter, defaultdict, namedtuple
@@ -26,23 +27,27 @@ from torch.utils.data import DataLoader, Dataset
 from tqdm.auto import tqdm
 from transformers.modeling_outputs import BaseModelOutput
 from transformers.models.bart.modeling_bart import BartForConditionalGeneration
-from x_transformers.x_transformers import (AbsolutePositionalEmbedding,
-                                           Encoder, ScaledSinusoidalEmbedding,
-                                           init_zero_)
+from x_transformers.x_transformers import (
+    AbsolutePositionalEmbedding,
+    Encoder,
+    ScaledSinusoidalEmbedding,
+    init_zero_,
+)
+
 
 @dataclass
 class DiTConfig:
     n_layers: int
     n_heads: int
-    dropout: float
-    scale_shift: bool
-    cond_encoder_kwargs: Optional[dict]
-    latent_shape: Optional[Tuple[int]] = None
-    n_embd: Optional[int] = None
-    seq_conditional: Optional[bool] = False
+
+    latent_shape: Optional[Tuple[int]] = None # not actually optional, will should be set automatically if None 
+
+    n_embd: Optional[int] = None # if None, set to latent_shape[-1]
+    dropout: float = 0.0
+    seq_conditional: bool = False
     seq_conditional_dim: Optional[int] = None
-    class_conditional: Optional[bool] = False
-    num_classes: Optional[int] = 0
+    class_conditional: bool = False
+    num_classes: int = 0
     cond_modulation: Optional[bool] = False
 
     # DDPM features
@@ -56,7 +61,6 @@ class DiT(nn.Module):
     """
     Diffusion transformer (DiT, https://arxiv.org/pdf/2212.09748) with adaptive layer norm zero (adaLN-Zero) conditionning.
     Super-charged with other tricks and add-ons (self-conditionning, sequence-conditioning, class-conditionning)
-    Can be the backbone of a DSM or GFN diffusion model.
     """
 
     def __init__(self, cfg: DiTConfig):
@@ -94,11 +98,11 @@ class DiT(nn.Module):
             rel_pos_bias=False,
             ff_glu=True,
             cross_attend=cfg.seq_conditional,
-            # DiT scale-shift stuff
-            use_adaptive_layernorm=cfg.scale_shift,
-            use_adaptive_layerscale=cfg.scale_shift,
+            # DiT adalnzero stuff
+            use_adaptive_layernorm=True,
+            use_adaptive_layerscale=True,
             dim_condition=time_emb_dim,
-            adaptive_condition_mlp=cfg.scale_shift,
+            adaptive_condition_mlp=True,
         )
 
         if cfg.class_conditional:
@@ -130,13 +134,6 @@ class DiT(nn.Module):
             self.cfg.n_embd,
             cfg.latent_shape[1],
         )
-
-        if cfg.cond_encoder_kwargs != None:
-            self.cond_encoder = Encoder(
-                dim=cfg.seq_conditional_dim,
-                depth=cfg.cond_encoder_kwargs["n_layers"],
-                heads=cfg.cond_encoder_kwargs["n_heads"],
-            )
 
         if cfg.cond_modulation:
             assert cfg.seq_conditional
@@ -184,6 +181,7 @@ class DiT(nn.Module):
         x_input = self.input_proj(x)
         tx_input = x_input + pos_emb + self.time_pos_embed_mlp(time_emb)
 
+        # Process conditionning
         if self.cfg.seq_conditional:
             context, context_mask = [], []
             if (cond is None) & (cond_input_ids is None):
@@ -210,10 +208,7 @@ class DiT(nn.Module):
                     condition = time_emb
 
             else:
-                # Maybe process the conditionning tokens 
-                if self.cfg.cond_encoder_kwargs != None:
-                    cond = self.cond_encoder(cond, mask=cond_mask)
-                   
+
                 context.append(self.cond_proj(cond))
                 context_mask.append(cond_mask)
 
@@ -250,7 +245,14 @@ class DiT(nn.Module):
         return x
 
 
-ModelPrediction = namedtuple("ModelPrediction", ["pred_noise", "pred_x_start", "pred_v"])
+################################################
+########## Gaussian Diffusion utils ############
+################################################
+
+ModelPrediction = namedtuple(
+    "ModelPrediction", ["pred_noise", "pred_x_start", "pred_v"]
+)
+
 
 def predict_start_from_noise(z_t, t, noise, schedule):
     alpha = schedule(t)
@@ -258,11 +260,13 @@ def predict_start_from_noise(z_t, t, noise, schedule):
 
     return (z_t - (1 - alpha).sqrt() * noise) / alpha.sqrt().clamp(min=1e-8)
 
+
 def predict_noise_from_start(z_t, t, x0, schedule):
     alpha = schedule(t)
     alpha = right_pad_dims_to(z_t, alpha)
 
     return (z_t - alpha.sqrt() * x0) / (1 - alpha).sqrt().clamp(min=1e-8)
+
 
 def predict_start_from_v(z_t, t, v, schedule):
     alpha = schedule(t)
@@ -272,6 +276,7 @@ def predict_start_from_v(z_t, t, v, schedule):
 
     return x
 
+
 def predict_noise_from_v(z_t, t, v, schedule):
     alpha = schedule(t)
     alpha = right_pad_dims_to(z_t, alpha)
@@ -280,6 +285,7 @@ def predict_noise_from_v(z_t, t, v, schedule):
 
     return eps
 
+
 def predict_v_from_start_and_eps(z_t, t, x, noise, schedule):
     alpha = schedule(t)
     alpha = right_pad_dims_to(z_t, alpha)
@@ -287,6 +293,7 @@ def predict_v_from_start_and_eps(z_t, t, x, noise, schedule):
     v = alpha.sqrt() * noise - x * (1 - alpha).sqrt()
 
     return v
+
 
 def get_sampling_timesteps(batch, *, sampling_timesteps, device, invert=False):
     times = torch.linspace(1.0, 0.0, sampling_timesteps + 1, device=device)
@@ -297,8 +304,9 @@ def get_sampling_timesteps(batch, *, sampling_timesteps, device, invert=False):
     times = times.unbind(dim=-1)
     return times
 
+
 def diffusion_model_predictions(
-    model : DiT,
+    model: DiT,
     z_t,
     t,
     schedule,
@@ -307,7 +315,7 @@ def diffusion_model_predictions(
     class_id=None,
     cond=None,
     cond_input_ids=None,
-    cond_mask=None,  
+    cond_mask=None,
     cls_free_guidance=1.0,
 ) -> ModelPrediction:
     time_cond = schedule(t)
@@ -322,9 +330,7 @@ def diffusion_model_predictions(
     )
     if cls_free_guidance != 1.0:
         if exists(class_id):
-            unc_class_id = torch.full_like(
-                class_id, fill_value=model.cfg.num_classes
-            )
+            unc_class_id = torch.full_like(class_id, fill_value=model.cfg.num_classes)
         else:
             unc_class_id = None
         unc_model_output = model(
@@ -343,17 +349,11 @@ def diffusion_model_predictions(
     pred_v = None
     if diffusion_objective == "pred_noise":
         pred_noise = model_output
-        x_start = predict_start_from_noise(
-            z_t, t, pred_noise, sampling=schedule
-        )
+        x_start = predict_start_from_noise(z_t, t, pred_noise, sampling=schedule)
     elif diffusion_objective == "pred_x0":
         x_start = model_output
-        pred_noise = predict_noise_from_start(
-            z_t, t, x_start, schedule
-        )
-        pred_v = predict_v_from_start_and_eps(
-            z_t, t, x_start, pred_noise, schedule
-        )
+        pred_noise = predict_noise_from_start(z_t, t, x_start, schedule)
+        pred_v = predict_v_from_start_and_eps(z_t, t, x_start, pred_noise, schedule)
     elif diffusion_objective == "pred_v":
         pred_v = model_output
         x_start = predict_start_from_v(z_t, t, pred_v, schedule)
@@ -362,6 +362,7 @@ def diffusion_model_predictions(
         raise ValueError(f"invalid objective {diffusion_objective}")
 
     return ModelPrediction(pred_noise, x_start, pred_v)
+
 
 @torch.no_grad()
 def ddim_sample(
@@ -379,7 +380,9 @@ def ddim_sample(
 ):
     batch, device = shape[0], next(model.parameters()).device
 
-    time_pairs = get_sampling_timesteps(batch, sampling_timesteps=sampling_timesteps, device=device, invert=invert)
+    time_pairs = get_sampling_timesteps(
+        batch, sampling_timesteps=sampling_timesteps, device=device, invert=invert
+    )
     if invert:
         assert exists(z_t)
 
@@ -407,9 +410,7 @@ def ddim_sample(
 
         alpha = schedule(time)
         alpha_next = schedule(time_next)
-        alpha, alpha_next = map(
-            partial(right_pad_dims_to, z_t), (alpha, alpha_next)
-        )
+        alpha, alpha_next = map(partial(right_pad_dims_to, z_t), (alpha, alpha_next))
 
         # # calculate x0 and noise
 
@@ -429,6 +430,7 @@ def ddim_sample(
         z_t = x_start * alpha_next.sqrt() + eps * (1 - alpha_next).sqrt()
     return z_t
 
+
 @torch.no_grad()
 def ddpm_sample(
     model: DiT,
@@ -445,7 +447,9 @@ def ddpm_sample(
 ):
     batch, device = shape[0], next(model.parameters()).device
 
-    time_pairs = get_sampling_timesteps(batch, sampling_timesteps=sampling_timesteps, device=device)
+    time_pairs = get_sampling_timesteps(
+        batch, sampling_timesteps=sampling_timesteps, device=device
+    )
 
     if not exists(z_t):
         z_t = torch.randn(shape, device=device)
@@ -471,9 +475,7 @@ def ddpm_sample(
 
         alpha = schedule(time)
         alpha_next = schedule(time_next)
-        alpha, alpha_next = map(
-            partial(right_pad_dims_to, z_t), (alpha, alpha_next)
-        )
+        alpha, alpha_next = map(partial(right_pad_dims_to, z_t), (alpha, alpha_next))
 
         alpha_now = alpha / alpha_next
 
@@ -492,12 +494,11 @@ def ddpm_sample(
         noise = torch.randn_like(z_t)
 
         z_t = (
-            1
-            / alpha_now.sqrt()
-            * (z_t - (1 - alpha_now) / (1 - alpha).sqrt() * eps)
+            1 / alpha_now.sqrt() * (z_t - (1 - alpha_now) / (1 - alpha).sqrt() * eps)
             + torch.sqrt(1 - alpha_now) * noise
         )
     return z_t
+
 
 @torch.no_grad()
 def dpmpp_sample(
@@ -515,7 +516,9 @@ def dpmpp_sample(
 ):
     batch, device = shape[0], next(model.parameters()).device
 
-    time_pairs = get_sampling_timesteps(batch, sampling_timesteps=sampling_timesteps, device=device)
+    time_pairs = get_sampling_timesteps(
+        batch, sampling_timesteps=sampling_timesteps, device=device
+    )
 
     if not exists(z_t):
         z_t = torch.randn(shape, device=device)
@@ -543,9 +546,7 @@ def dpmpp_sample(
 
         alpha = schedule(time)
         alpha_next = schedule(time_next)
-        alpha, alpha_next = map(
-            partial(right_pad_dims_to, z_t), (alpha, alpha_next)
-        )
+        alpha, alpha_next = map(partial(right_pad_dims_to, z_t), (alpha, alpha_next))
         sigma, sigma_next = 1 - alpha, 1 - alpha_next
 
         alpha_now = alpha / alpha_next
@@ -576,9 +577,10 @@ def dpmpp_sample(
         ) * z_t - alpha_next.sqrt() * phi_1 * denoised_x
     return z_t
 
+
 @torch.no_grad()
 def sample(
-    model : DiT,
+    model: DiT,
     schedule,
     batch_size,
     sampling_timesteps,
@@ -607,9 +609,9 @@ def sample(
         cond_mask,
         schedule,
         sampling_timesteps,
-        cls_free_guidance
+        cls_free_guidance,
     )
-    
+
 
 def right_pad_dims_to(x, t):
     padding_dims = x.ndim - t.ndim
@@ -664,12 +666,13 @@ def log(t, eps=1e-12):
 def exists(x):
     return x is not None
 
+
 def get_sampling_schedule(name):
     if name is None:
         return None
     elif name == "simple_linear":
         return simple_linear_schedule
-    elif name  == "beta_linear":
+    elif name == "beta_linear":
         return beta_linear_schedule
     elif name == "cosine":
         return cosine_schedule
@@ -678,12 +681,23 @@ def get_sampling_schedule(name):
     else:
         raise ValueError(f"invalid noise schedule {name}")
 
+def loss_fn(name):
+    if name == "l1":
+        return F.l1_loss
+    elif name == "l2":
+        return F.mse_loss
+    elif name == "smooth_l1":
+        return F.smooth_l1_loss
+    else:
+        raise ValueError(f"invalid loss type {name}")
+
+
 def compute_diffusion_loss(
     model: DiT,
     latent,
     schedule,
     diffusion_objective,
-    loss_fn,
+    loss_name,
     class_id=None,
     cond=None,
     cond_input_ids=None,
@@ -713,10 +727,7 @@ def compute_diffusion_loss(
         cond_input_ids = None
         cond_mask = None
 
-    if (
-        model.cfg.class_conditional
-        and model.cfg.class_unconditional_prob > 0
-    ):
+    if model.cfg.class_conditional and model.cfg.class_unconditional_prob > 0:
         assert exists(class_id)
         class_unconditional_mask = model.class_unconditional_bernoulli.sample(
             class_id.shape
@@ -725,9 +736,7 @@ def compute_diffusion_loss(
 
     self_cond = None
 
-    if model.cfg.self_condition and (
-        random.random() < model.cfg.train_prob_self_cond
-    ):
+    if model.cfg.self_condition and (random.random() < model.cfg.train_prob_self_cond):
         with torch.no_grad():
             model_output = diffusion_model_predictions(
                 model,
@@ -767,7 +776,7 @@ def compute_diffusion_loss(
         assert exists(predictions.pred_v)
         pred = predictions.pred_v
 
-    loss = loss_fn(pred, target, reduction="none")
+    loss = loss_fn(loss_name)(pred, target, reduction="none")
     loss = rearrange(
         [reduce(loss[i], "l d -> 1", "mean") for i in range(latent.shape[0])],
         "b 1 -> b 1",

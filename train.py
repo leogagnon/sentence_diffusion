@@ -10,12 +10,18 @@ from hydra.core.config_store import ConfigStore
 from lightning.pytorch.loggers import WandbLogger
 from omegaconf import MISSING, DictConfig, OmegaConf, SCMode
 from tasks.autoencoder import AETask, AETaskConfig
+from tasks.diffusion import GaussianDiffusionTask, GaussianDiffusionTaskConfig
 
 os.environ["LATENT_CONTROL_CKPT_DIR"] = '/network/scratch/l/leo.gagnon/sentence_diffusion/logs/checkpoints'
 
 @dataclass
+class TaskConfig:
+    ae: Optional[AETaskConfig] = None
+    diffusion: Optional[GaussianDiffusionTaskConfig] = None
+
+@dataclass
 class TrainConfig:
-    task: AETaskConfig
+    task: TaskConfig
     seed: int
     log_dir: str
     max_epochs: int
@@ -77,7 +83,24 @@ def main(cfg: Optional[TrainConfig] = None, run_id: Optional[str] = None):
         structured_config_mode=SCMode.INSTANTIATE,
     )
 
-    task = AETask(cfg.task)
+    # Init lightning module
+    if cfg.task.diffusion != None:
+        task = GaussianDiffusionTask(cfg.task.diffusion)
+        cfg.task.diffusion = task.cfg
+
+        # If the task is diffusion, add the autoencoder config to cfg
+        run = wandb.Api().run(
+            f"guillaume-lajoie/sentence_diffusion/{cfg.task.diffusion.ae_id}"
+        )
+        cfg.task.ae = OmegaConf.merge(
+#            OmegaConf.structured(AETaskConfig), run.config['task']['ae']    TODO: uncomment this for newer experiments  
+             OmegaConf.structured(AETaskConfig), run.config['task']
+        )
+    elif cfg.task.ae != None:
+        task = AETask(cfg.task.ae)
+        cfg.task.ae = task.cfg
+    else:
+        raise ValueError("No task specified in config")
 
     # Give the whole TrainConfig to wandb
     if cfg.logger:

@@ -1,13 +1,14 @@
 defaults:
   - train_config
   - _self_
-  - task: cae/cae++
-  - model_checkpoint: base
+  - task/ae: null
+  - task/diffusion: null
+  - model_checkpoint: null
  
 seed: 42
 log_dir: /network/scratch/l/leo.gagnon/sentence_diffusion/logs
 max_epochs: 200
-accumulate_grad_batches: 32
+accumulate_grad_batches: 8
 val_check_interval: 250
 
 hydra:

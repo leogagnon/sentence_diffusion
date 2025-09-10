@@ -26,9 +26,8 @@ from data.stories import StoriesDatasetConfig, StoriesDataset
 
 
 @dataclass
-class DSMDiffusionConfig:
+class GaussianDiffusionTaskConfig:
     model: DiTConfig
-    dataset: dict
     batch_size: int
     val_split: float
     lr: float
@@ -45,25 +44,23 @@ class DSMDiffusionConfig:
     normalize_latent: bool = False
 
 
-class DSMDiffusion(L.LightningModule):
+class GaussianDiffusionTask(L.LightningModule):
     """
-    Trains a diffusion model.
+    Trains a latent diffusion transformer on the latent space of a pretrained autoencoder (ae_id).
     """
 
-    def __init__(self, cfg: Optional[DSMDiffusionConfig] = None, **kwargs) -> None:
+    def __init__(self, cfg: Optional[GaussianDiffusionTaskConfig] = None, **kwargs) -> None:
         super().__init__()
 
         if cfg == None:
             cfg = OmegaConf.to_object(
                 OmegaConf.merge(
-                    OmegaConf.create(DSMDiffusionConfig),
+                    OmegaConf.create(GaussianDiffusionTaskConfig),
                     OmegaConf.create(kwargs),
                 )
             )
 
-        # Setup diffusion stuff
-        self.model = DiT(cfg.model)
-
+        # Init noise schedules
         self.train_schedule = partial(
             time_to_alpha,
             alpha_schedule=get_sampling_schedule(cfg.train_schedule),
@@ -78,14 +75,7 @@ class DSMDiffusion(L.LightningModule):
         else:
             self.sampling_schedule = self.train_schedule
 
-        if cfg.normalize_latent:
-            # Buffers for latent mean and scale values
-            self.register_buffer("latent_mean", torch.tensor(0).to(torch.float32))
-            self.latent_mean: torch.FloatTensor
-            self.register_buffer("latent_scale", torch.tensor(1).to(torch.float32))
-            self.latent_scale: torch.FloatTensor
-
-        # Load the AutoEncoder Task
+        # Extract encoder, decoder and dataset from pretrained autoencoder
         ae_task = AETask.load_from_checkpoint(
             os.path.join(
                 os.environ["LATENT_CONTROL_CKPT_DIR"],
@@ -97,26 +87,30 @@ class DSMDiffusion(L.LightningModule):
         ae_task.setup()
 
         self.encoder = ae_task.encoder.eval().requires_grad_(False)
-        self.decoder = ae_task.decoder.eval().requires_grad_(False).cpu()
+        self.decoder = ae_task.decoder.eval().requires_grad_(False)
         self.train_data = ae_task.train_data
         self.val_data = ae_task.val_data
+
+        # Init latent normalization if needed
+        if cfg.normalize_latent:
+            self.register_buffer(
+                "latent_mean", torch.zeros(size=self.encoder.latent_shape).float()
+            )
+            self.latent_mean: torch.FloatTensor
+            self.register_buffer(
+                "latent_scale", torch.ones(size=self.encoder.latent_shape).float()
+            )
+            self.latent_scale: torch.FloatTensor
+
+        # Init diffusion model
+        cfg.model.latent_shape = self.encoder.latent_shape
+        self.model = DiT(cfg.model)
 
         self.cfg = cfg
         # Important for checkpoints
         self.save_hyperparameters(
             OmegaConf.to_container(OmegaConf.structured(cfg)), logger=False
         )
-
-    @property
-    def loss_fn(self):
-        if self.cfg.loss == "l1":
-            return F.l1_loss
-        elif self.cfg.loss == "l2":
-            return F.mse_loss
-        elif self.cfg.loss == "smooth_l1":
-            return F.smooth_l1_loss
-        else:
-            raise ValueError(f"invalid loss type {self.cfg.loss}")
 
     def normalize_latent(self, x_start):
         eps = 1e-5
@@ -147,31 +141,80 @@ class DSMDiffusion(L.LightningModule):
             shuffle=False,
         )
 
+    def on_fit_start(self):
+        # Ensure decoder is on CPU to save GPU memory
+        self.decoder = self.decoder.cpu()
+
+        # Compute latent mean and scale if needed (on 10000 samples)
+        if self.cfg.normalize_latent:
+            with torch.no_grad():
+                latent_samples = []
+                for batch in tqdm(
+                    DataLoader(
+                        Subset(
+                            self.train_data,
+                            torch.randperm(len(self.train_data))[:10000],
+                        ),
+                        batch_size=self.cfg.batch_size,
+                        collate_fn=lambda x: x,
+                        shuffle=False,
+                    ),
+                    desc="Computing latent mean and scale on 10000 training samples...",
+                ):
+                    latent_samples.append(self.encoder(batch["input_ids_enc"].cuda(), attention_mask=batch["attention_mask_enc"].cuda()))
+
+                latent_samples = torch.cat(latent_samples, dim=0)
+                self.latent_mean = torch.mean(latent_samples, dim=0)
+                self.latent_scale = torch.std(
+                    latent_samples - self.latent_mean, unbiased=False
+                )
+
+                print("Latent mean and scale computed.")
+
     def training_step(self, batch, batch_idx=None):
-        
+
         # Compute latents
         with torch.no_grad():
             latent = self.encoder(batch["input_ids_enc"])
-
-        if self.cfg.normalize_latent:
-            latent_ = rearrange(latent, "b s d -> (b s) d")
-            self.latent_mean = torch.mean(latent_, dim=0)
-            self.latent_scale = torch.std(latent_ - self.latent_mean, unbiased=False)
-            latent = self.normalize_latent(latent)
+            if self.cfg.normalize_latent:
+                latent = self.normalize_latent(latent)
 
         loss = compute_diffusion_loss(
             self.model,
             latent,
             schedule=self.train_schedule,
             diffusion_objective=self.cfg.diffusion_objective,
-            loss_fn=self.loss_fn,
-            cond=batch["cond_tokens"],
-            cond_input_ids=batch["cond_input_ids"],
-            cond_ignore_mask=batch["cond_ignore_mask"],
+            loss_name=self.cfg.loss
         )
 
         self.log(
             "train/loss",
+            loss.detach().cpu().numpy().item(),
+            prog_bar=True,
+            add_dataloader_idx=False,
+            batch_size=latent.shape[0],
+        )
+
+        return loss
+    
+    def validation_step(self, batch, batch_idx=None):
+
+        # Compute latents
+        with torch.no_grad():
+            latent = self.encoder(batch["input_ids_enc"])
+            if self.cfg.normalize_latent:
+                latent = self.normalize_latent(latent)
+
+        loss = compute_diffusion_loss(
+            self.model,
+            latent,
+            schedule=self.train_schedule,
+            diffusion_objective=self.cfg.diffusion_objective,
+            loss_name=self.cfg.loss
+        )
+
+        self.log(
+            "val/loss",
             loss.detach().cpu().numpy().item(),
             prog_bar=True,
             add_dataloader_idx=False,
