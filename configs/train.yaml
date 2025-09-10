@@ -3,7 +3,7 @@ defaults:
   - _self_
   - task/ae: null
   - task/diffusion: null
-  - model_checkpoint: null
+  - model_checkpoint: base
  
 seed: 42
 log_dir: /network/scratch/l/leo.gagnon/sentence_diffusion/logs

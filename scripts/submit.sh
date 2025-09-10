@@ -7,8 +7,8 @@
 
 task_arg=""
 for arg in "$@"; do
-	if [[ $arg == task=* ]]; then
-		task_arg="${arg#task=}"
+	if [[ $arg == task/ae=* ]]; then
+		task_arg="${arg#task/ae=}"
 		break
 	fi
 done

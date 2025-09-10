@@ -4,7 +4,6 @@ train_batch_size: 16
 val_batch_size: 128
 lr: 1e-4
 
-variational: False
 input_sub_p: 0.3
 kl_beta: 1e-6
 max_generation_length: 150

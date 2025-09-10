@@ -200,7 +200,7 @@ class AETask(L.LightningModule):
             input_ids_enc_corrupted, attention_mask=batch["attention_mask_enc"]
         )
 
-        if self.cfg.variational:
+        if self.encoder.cfg.variational:
             mean_clean, log_val_clean = z_clean
             KLD = -0.5 * torch.sum(
                 1 + log_val_clean - mean_clean.pow(2) - log_val_clean.exp()

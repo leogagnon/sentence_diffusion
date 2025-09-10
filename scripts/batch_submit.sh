@@ -9,7 +9,7 @@ else
 fi
 shift
 for task in "$@"; do
-	sbatch -J "$task" -o "logs/${sweep_id}/${task}.out" scripts/submit.sh task="$task" sweep_id="$sweep_id" 
+	sbatch -J "$task" -o "logs/${sweep_id}/${task}.out" scripts/submit.sh task/ae="$task" sweep_id="$sweep_id" 
 done
 
 

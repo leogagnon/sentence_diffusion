@@ -23,7 +23,7 @@ class DecoderModel(nn.Module):
         super().__init__()
         self.cfg = cfg
 
-        self.backbone = AutoModelForChausalLM.from_pretrained(
+        self.backbone = AutoModelForCausalLM.from_pretrained(
             cfg.name,
             device_map="auto",
             attn_implementation="flash_attention_2",
