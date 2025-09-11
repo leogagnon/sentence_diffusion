@@ -1,3 +1,0 @@
-sweep_id: first_sweep${now:%Y-%m-%d}-${now:%H-%M-%S}
-
-task.variational: True, False

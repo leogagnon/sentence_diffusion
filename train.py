@@ -32,6 +32,7 @@ class TrainConfig:
     model_checkpoint: Optional[dict] = None
     early_stopping: Optional[dict] = None
     gradient_clip_val: float = 1.0
+    name: Optional[str] = None
 
 cs = ConfigStore.instance()
 cs.store(name="train_config", node=TrainConfig)
@@ -93,8 +94,7 @@ def main(cfg: Optional[TrainConfig] = None, run_id: Optional[str] = None):
             f"guillaume-lajoie/sentence_diffusion/{cfg.task.diffusion.ae_id}"
         )
         cfg.task.ae = OmegaConf.merge(
-#            OmegaConf.structured(AETaskConfig), run.config['task']['ae']    TODO: uncomment this for newer experiments  
-             OmegaConf.structured(AETaskConfig), run.config['task']
+            OmegaConf.structured(AETaskConfig), run.config['task']['ae']
         )
     elif cfg.task.ae != None:
         task = AETask(cfg.task.ae)

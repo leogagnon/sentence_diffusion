@@ -1,0 +1,7 @@
+_target_: lightning.pytorch.loggers.WandbLogger
+entity: guillaume-lajoie
+project: sentence_diffusion
+save_dir: ${log_dir}
+offline: False
+tags: null
+resume: allow
