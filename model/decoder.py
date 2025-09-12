@@ -10,6 +10,8 @@ from transformers.models.auto.modeling_auto import AutoModelForCausalLM
 from transformers.models.auto.tokenization_auto import AutoTokenizer
 from x_transformers import Encoder
 import torch
+from typing import Optional
+from einops import rearrange, repeat
 
 
 @dataclass
@@ -19,6 +21,8 @@ class DecoderConfig:
 
 
 class DecoderModel(nn.Module):
+    """Wrapper around a pretrained decoder model (e.g. GPT) with optional LoRA adaptation and soft prompting."""
+
     def __init__(self, cfg: DecoderConfig):
         super().__init__()
         self.cfg = cfg
@@ -41,37 +45,48 @@ class DecoderModel(nn.Module):
             self.tokenizer.add_special_tokens({"pad_token": "[PAD]"})
             self.backbone.resize_token_embeddings(len(self.tokenizer))
 
-    def forward(self, input_ids, z, attention_mask=None):
+    def forward(self, input_ids, z: Optional[torch.Tensor] = None):
+        if z == None:
+            return self.backbone(input_ids=input_ids).logits
+        else:
+            # set position_ids so that input_ids uses positions 0,..., len(input_ids)-1
+            # and z position_ids are all 0
+            z_pos = torch.zeros_like(z[:, :, 0], dtype=torch.long)
+            input_pos = torch.arange(0, input_ids.shape[1], device=input_ids.device)
+            input_pos = repeat(input_pos, "n -> b n", b=input_ids.shape[0])
+            position_ids = torch.cat([z_pos, input_pos], dim=1)
 
-        # Compute tokens
-        tokens = self.backbone.get_input_embeddings()(input_ids)
-        tokens = torch.cat([z, tokens], dim=1)
+            # compute input embeddings
+            input_embeds = self.backbone.get_input_embeddings()(input_ids)
+            input_embeds = torch.cat([z, input_embeds], dim=1)
 
-        # Update attention_mask (bos and z)
-        attention_mask = torch.cat(
-            [
-                torch.ones((z.shape[0], z.shape[1] + 1), device=tokens.device),
-                attention_mask,
-            ],
-            dim=1,
-        )
-        self.backbone.get_input_embeddings()
-        # Forward pass
-        output = self.backbone(inputs_embeds=tokens)
-        logits = output.logits[:, z.shape[1] :]
+            # Forward pass
+            output = self.backbone(
+                inputs_embeds=input_embeds, position_ids=position_ids
+            )
+            logits = output.logits[:, z.shape[1] :]
 
         return logits
 
     @torch.no_grad()
-    def generate_from(self, z, max_length):
-        """Generate text from latent code z using autoregressive decoding."""
+    def generate(self, max_length: int, z: Optional[torch.Tensor] = None):
+        """Generate text using autoregressive decoding, potentially conditioned on soft prefix z"""
 
-        # Get cache from z
-        prefill = self.backbone(
-            inputs_embeds=z,
-            use_cache=True,
-        )
-        cache = prefill.past_key_values
+        if z != None:
+            # Compute paste_key_values for z
+            prefill = self.backbone(
+                inputs_embeds=z,
+                use_cache=True,
+            )
+            cache = prefill.past_key_values
+            cache_position = torch.tensor([z.shape[1]])
+            attention_mask = torch.ones(
+                z.shape[0], z.shape[1] + 1, device=z.device, dtype=torch.long
+            )
+        else:
+            cache = None
+            cache_position = None
+            attention_mask = None
 
         # Autoregressive generation from BOS token with cached z (nucleus sampling)
         bos = torch.full(
@@ -83,10 +98,8 @@ class DecoderModel(nn.Module):
         output = self.backbone.generate(
             input_ids=bos,
             past_key_values=cache,
-            cache_position=torch.tensor([z.shape[1]]),
-            attention_mask=torch.ones(
-                z.shape[0], z.shape[1] + 1, device=z.device, dtype=torch.long
-            ),
+            cache_position=cache_position,
+            attention_mask=attention_mask,
             max_length=max_length,
             do_sample=True,
             top_p=0.92,
@@ -100,6 +113,5 @@ class DecoderModel(nn.Module):
         )
 
         output = output.sequences[:, 1:]  # Remove BOS token
-
 
         return output

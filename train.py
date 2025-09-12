@@ -11,6 +11,7 @@ from lightning.pytorch.loggers import WandbLogger
 from omegaconf import MISSING, DictConfig, OmegaConf, SCMode
 from tasks.autoencoder import AETask, AETaskConfig
 from tasks.diffusion import GaussianDiffusionTask, GaussianDiffusionTaskConfig
+from tasks.finetune import FinetuneTask, FinetuneTaskConfig
 
 os.environ["LATENT_CONTROL_CKPT_DIR"] = '/network/scratch/l/leo.gagnon/sentence_diffusion/logs/checkpoints'
 
@@ -18,6 +19,7 @@ os.environ["LATENT_CONTROL_CKPT_DIR"] = '/network/scratch/l/leo.gagnon/sentence_
 class TaskConfig:
     ae: Optional[AETaskConfig] = None
     diffusion: Optional[GaussianDiffusionTaskConfig] = None
+    finetune: Optional[FinetuneTaskConfig] = None
 
 @dataclass
 class TrainConfig:
@@ -99,6 +101,9 @@ def main(cfg: Optional[TrainConfig] = None, run_id: Optional[str] = None):
     elif cfg.task.ae != None:
         task = AETask(cfg.task.ae)
         cfg.task.ae = task.cfg
+    elif cfg.task.finetune != None:
+        task = FinetuneTask(cfg.task.finetune)
+        cfg.task.finetune = task.cfg
     else:
         raise ValueError("No task specified in config")
 

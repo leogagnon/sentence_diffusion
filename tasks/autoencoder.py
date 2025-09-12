@@ -163,7 +163,7 @@ class AETask(L.LightningModule):
 
         # Get embeddings of input_ids
         logits = self.decoder(
-            batch["input_ids_dec"], z, attention_mask=batch["attention_mask_dec"]
+            batch["input_ids_dec"], z
         )
 
         # Ignore padding tokens
@@ -214,7 +214,7 @@ class AETask(L.LightningModule):
 
         # Evaluate loss for clean inputs
         logits = self.decoder(
-            batch["input_ids_dec"], z_clean, attention_mask=batch["attention_mask_dec"]
+            batch["input_ids_dec"], z_clean
         )
         targets = batch["input_ids_dec"].masked_fill(
             batch["attention_mask_dec"] == 0, -1

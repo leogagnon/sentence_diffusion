@@ -30,7 +30,7 @@ class StoriesDataset(Dataset):
     """
 
     def __init__(
-        self, cfg: StoriesDatasetConfig, enc_tokenizer: Tokenizer, dec_tokenizer: Tokenizer
+        self, cfg: StoriesDatasetConfig, dec_tokenizer: Tokenizer, enc_tokenizer: Optional[Tokenizer] = None,
     ):
         """
         Args:
@@ -55,7 +55,7 @@ class StoriesDataset(Dataset):
 
         # Tokenize sentences
         self.input_ids = {
-            'enc': enc_tokenizer.batch_encode_plus(self.sentences)["input_ids"],
+            'enc': enc_tokenizer.batch_encode_plus(self.sentences)["input_ids"] if enc_tokenizer != None else None,
             'dec': dec_tokenizer.batch_encode_plus(self.sentences)["input_ids"]
         }
         # For some reason add_special_tokens doesn't work, so add BOS/EOS manually to decoder
@@ -65,7 +65,7 @@ class StoriesDataset(Dataset):
         ]
 
         self.padding_token_id = {
-            'enc': enc_tokenizer.pad_token_id,
+            'enc': enc_tokenizer.pad_token_id if enc_tokenizer != None else None,
             'dec': dec_tokenizer.pad_token_id
         }
 
@@ -85,13 +85,14 @@ class StoriesDataset(Dataset):
             "indices": torch.LongTensor(indices),
         }
         for key in self.input_ids.keys():
-            batch[f"input_ids_{key}"] = pad_sequence(
-                [torch.LongTensor(self.input_ids[key][idx]) for idx in indices],
-                padding_value=self.padding_token_id[key],
-                batch_first=True,
-            )
-            batch[f"attention_mask_{key}"] = (
-                batch[f"input_ids_{key}"] != self.padding_token_id[key]
-            )
+            if self.input_ids[key] is not None:
+                batch[f"input_ids_{key}"] = pad_sequence(
+                    [torch.LongTensor(self.input_ids[key][idx]) for idx in indices],
+                    padding_value=self.padding_token_id[key],
+                    batch_first=True,
+                )
+                batch[f"attention_mask_{key}"] = (
+                    batch[f"input_ids_{key}"] != self.padding_token_id[key]
+                )
 
         return batch

@@ -5,6 +5,7 @@ defaults:
   - hydra: base
   - task/ae: null
   - task/diffusion: null
+  - task/finetune: null
   - model_checkpoint: base
   - hydra/sweeper/params : null
   
