@@ -76,7 +76,7 @@ class EncoderModel(nn.Module):
 
     @property
     def latent_shape(self):
-        return (self.cfg.k, self.backbone.config.hidden_size)
+        return (self.cfg.k, self.cfg.out_proj_dim)
 
     def forward(self, input_ids, attention_mask=None):
 

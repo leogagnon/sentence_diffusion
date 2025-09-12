@@ -1,0 +1,16 @@
+defaults:
+  - train_config
+  - _self_
+  - logger: base
+  - hydra: base
+  - task/ae: null
+  - task/diffusion: null
+  - model_checkpoint: base
+  - hydra/sweeper/params : null
+  
+seed: 42
+log_dir: /network/scratch/l/leo.gagnon/sentence_diffusion/logs
+max_epochs: 200
+accumulate_grad_batches: 4
+val_check_interval: 250
+sweep_id: null

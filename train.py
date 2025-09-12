@@ -135,7 +135,6 @@ def main(cfg: Optional[TrainConfig] = None, run_id: Optional[str] = None):
     
 
 if __name__ == "__main__":
-    print('wtf')
     parser = argparse.ArgumentParser()
     parser.add_argument("--wandb_id")
     args, _ = parser.parse_known_args()
@@ -143,7 +142,7 @@ if __name__ == "__main__":
     # If --wandb_id is provided, resume the associated run
     if args.wandb_id == None:
         hydra_wrapper = hydra.main(
-            version_base=None, config_name="train", config_path="configs/"
+            version_base=None, config_path="configs/", config_name="train"
         )
         hydra_wrapper(main)()
     else:

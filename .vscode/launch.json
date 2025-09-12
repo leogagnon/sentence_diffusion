@@ -12,7 +12,7 @@
             "program": "train.py",
             "console": "integratedTerminal",
             "justMyCode": false,
-            "args": ["task/diffusion=base"]
+            //"args": ["task/diffusion=base"]
         }
     ]
 }

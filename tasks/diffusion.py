@@ -175,7 +175,8 @@ class GaussianDiffusionTask(L.LightningModule):
 
         # Compute latents
         with torch.no_grad():
-            latent = self.encoder(batch["input_ids_enc"])
+            assert self.encoder.training == False
+            latent = self.encoder(batch["input_ids_enc"], attention_mask=batch["attention_mask_enc"])
             if self.cfg.normalize_latent:
                 latent = self.normalize_latent(latent)
 
