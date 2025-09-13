@@ -31,8 +31,6 @@ class FinetuneTaskConfig:
     max_generation_length: int
     dataset: StoriesDatasetConfig
     val_size: int
-    name: Optional[str] = None
-
 
 class FinetuneTask(L.LightningModule):
     """
@@ -104,7 +102,6 @@ class FinetuneTask(L.LightningModule):
             targets.view(-1),
             ignore_index=-100,
         )
-        self.log("train/loss", loss)
         loss += loss
 
         self.log(
@@ -130,7 +127,6 @@ class FinetuneTask(L.LightningModule):
             targets.view(-1),
             ignore_index=-100,
         )
-        self.log("val/loss", loss)
         loss += loss
 
         self.log(
@@ -139,6 +135,7 @@ class FinetuneTask(L.LightningModule):
             prog_bar=True,
             add_dataloader_idx=False,
             batch_size=logits.shape[0],
+            on_epoch=True
         )
 
         return loss

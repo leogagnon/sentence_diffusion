@@ -1,0 +1,3 @@
+task/finetune: base
+task.finetune.batch_size: 64
+accumulate_grad_batches: 8

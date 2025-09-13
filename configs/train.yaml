@@ -8,6 +8,7 @@ defaults:
   - task/finetune: null
   - model_checkpoint: base
   - hydra/sweeper/params : null
+  - override hydra/launcher : base
   
 seed: 42
 log_dir: /network/scratch/l/leo.gagnon/sentence_diffusion/logs
