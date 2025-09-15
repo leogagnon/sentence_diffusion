@@ -6,7 +6,8 @@ defaults:
   - task/ae: null
   - task/diffusion: null
   - task/finetune: null
-  - model_checkpoint: base
+  - model_checkpoint: null
+  - early_stopping: null
   - hydra/sweeper/params : null
   - override hydra/launcher : base
   
@@ -14,5 +15,5 @@ seed: 42
 log_dir: /network/scratch/l/leo.gagnon/sentence_diffusion/logs
 max_epochs: 200
 accumulate_grad_batches: 4
-val_check_interval: 250
+val_check_interval: 200
 sweep_id: null

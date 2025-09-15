@@ -12,6 +12,7 @@ from omegaconf import MISSING, DictConfig, OmegaConf, SCMode
 from tasks.autoencoder import AETask, AETaskConfig
 from tasks.diffusion import GaussianDiffusionTask, GaussianDiffusionTaskConfig
 from tasks.finetune import FinetuneTask, FinetuneTaskConfig
+from lightning.pytorch.callbacks import EarlyStopping
 
 os.environ["LATENT_CONTROL_CKPT_DIR"] = '/network/scratch/l/leo.gagnon/sentence_diffusion/logs/checkpoints'
 
@@ -86,6 +87,9 @@ def main(cfg: Optional[TrainConfig] = None, run_id: Optional[str] = None):
         structured_config_mode=SCMode.INSTANTIATE,
     )
 
+    if cfg.early_stopping is not None:
+        callbacks.append(hydra.utils.instantiate(cfg.early_stopping))
+    
     # Init lightning module
     if cfg.task.diffusion != None:
         task = GaussianDiffusionTask(cfg.task.diffusion)
@@ -119,11 +123,11 @@ def main(cfg: Optional[TrainConfig] = None, run_id: Optional[str] = None):
         accelerator='gpu',
         enable_checkpointing=True if cfg.model_checkpoint else False,
         callbacks=callbacks,
-        val_check_interval=cfg.val_check_interval,
+        val_check_interval=cfg.val_check_interval * cfg.accumulate_grad_batches, # to account for accumulation
         gradient_clip_val=cfg.gradient_clip_val,
         num_sanity_val_steps=0,
         max_epochs=cfg.max_epochs,
-        log_every_n_steps=100,
+        log_every_n_steps=50,
         accumulate_grad_batches=cfg.accumulate_grad_batches,
         precision='16-mixed'
     )

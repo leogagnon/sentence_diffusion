@@ -21,6 +21,7 @@ from model.decoder import DecoderConfig, DecoderModel
 import evaluate
 import os
 import wandb
+from tasks.finetune import FinetuneTask
 
 
 @dataclass
@@ -29,7 +30,7 @@ class AETaskConfig:
     train_batch_size: int
     val_batch_size: int
     encoder: EncoderConfig
-    decoder: DecoderConfig
+    pretrained_decoder_id: str
     input_sub_p: float
     kl_beta: float
     max_generation_length: int
@@ -45,7 +46,6 @@ class AETask(L.LightningModule):
     Supports variational autoencoding.
     Evaluates using
         - BLEU score of reconstructed clean text
-        - BLEU score of reconstructed corrupted text (with random token substitutions in the input)
         - Perplexity of interpolated samples in the latent space
     """
 
@@ -61,7 +61,26 @@ class AETask(L.LightningModule):
             )
 
         # Load decoder
-        self.decoder = DecoderModel(cfg.decoder)
+        finetune_task = FinetuneTask.load_from_checkpoint(
+            os.path.join(
+                os.environ["LATENT_CONTROL_CKPT_DIR"],
+                cfg.pretrained_decoder_id,
+                "last.ckpt",
+            ),
+            strict=False,
+        )
+        self.train_indices = finetune_task.train_indices
+        self.val_indices = finetune_task.val_indices
+
+        self.decoder: DecoderModel = finetune_task.decoder
+        if self.decoder.cfg.lora_cfg is not None:
+            # Merge pretraining LoRA weights and create new ones for AE training
+            self.decoder.backbone = self.decoder.backbone.merge_and_unload()
+            self.decoder.backbone = get_peft_model(
+                self.decoder.backbone,
+                LoraConfig(**self.decoder.cfg.lora_cfg),
+            )
+
 
         # Load encoder (set the encoder output dimension to match the decoder input dimension)
         cfg.encoder.out_proj_dim = self.decoder.backbone.config.hidden_size
@@ -72,10 +91,6 @@ class AETask(L.LightningModule):
             enc_tokenizer=self.encoder.tokenizer,
             dec_tokenizer=self.decoder.tokenizer,
         )
-        # Randomly choose split into train and val
-        indices = torch.randperm(len(self.dataset))
-        self.register_buffer("train_indices", indices[: -cfg.val_size])
-        self.register_buffer("val_indices", indices[-cfg.val_size :])
 
         self.bleu = evaluate.load(
             "bleu", experiment_id=os.urandom(15).hex()
@@ -95,7 +110,9 @@ class AETask(L.LightningModule):
     def setup(self, **kwargs):
         """Setup the data"""
         self.train_data = Subset(self.dataset, indices=self.train_indices)
-        self.val_data = Subset(self.dataset, indices=self.val_indices)
+        self.val_data = Subset(
+            self.dataset, indices=self.val_indices[: self.cfg.val_size]
+        )
 
     def random_substitution(self, inputs, p=None):
         inputs = inputs.clone()
@@ -162,9 +179,7 @@ class AETask(L.LightningModule):
             wandb.log({"train/KLD": KLD})
 
         # Get embeddings of input_ids
-        logits = self.decoder(
-            batch["input_ids_dec"], z
-        )
+        logits = self.decoder(batch["input_ids_dec"], z)
 
         # Ignore padding tokens
         targets = batch["input_ids_dec"].masked_fill(
@@ -190,32 +205,25 @@ class AETask(L.LightningModule):
         # Encode clean and corrupted inputs
         loss = 0.0
 
-        input_ids_enc_clean = batch["input_ids_enc"]
-        input_ids_enc_corrupted = self.random_substitution(input_ids_enc_clean, p=0.3)
+        input_ids_enc = batch["input_ids_enc"]
 
-        z_clean = self.encoder(
-            input_ids_enc_clean, attention_mask=batch["attention_mask_enc"]
-        )
-        z_corrupted = self.encoder(
-            input_ids_enc_corrupted, attention_mask=batch["attention_mask_enc"]
+        z = self.encoder(
+            input_ids_enc, attention_mask=batch["attention_mask_enc"]
         )
 
         if self.encoder.cfg.variational:
-            mean_clean, log_val_clean = z_clean
+            mean, log_var = z
             KLD = -0.5 * torch.sum(
-                1 + log_val_clean - mean_clean.pow(2) - log_val_clean.exp()
+                1 + log_var - mean.pow(2) - log_var.exp()
             )
             self.log("val/KLD", KLD, on_epoch=True)
             loss += self.cfg.kl_beta * KLD
 
             # Note: use mean for evaluation
-            z_clean = mean_clean
-            z_corrupted = z_corrupted[0]
+            z = mean
 
         # Evaluate loss for clean inputs
-        logits = self.decoder(
-            batch["input_ids_dec"], z_clean
-        )
+        logits = self.decoder(batch["input_ids_dec"], z)
         targets = batch["input_ids_dec"].masked_fill(
             batch["attention_mask_dec"] == 0, -1
         )
@@ -229,37 +237,30 @@ class AETask(L.LightningModule):
         self.log("val/reconstruction_loss", recon_loss, on_epoch=True)
         loss += recon_loss
 
-        # Decode from clean and corrupted latents and evaluate BLEU
-        gen_clean, gen_corrupted = [
-            self.decoder.tokenizer.batch_decode(
-                self.decoder.generate_from(
-                    z, max_length=self.cfg.max_generation_length
-                ),
-                skip_special_tokens=True,
-            )
-            for z in (z_clean, z_corrupted)
-        ]
+        # Decode from z and evaluate BLEU
+        generation = self.decoder.tokenizer.batch_decode(
+            self.decoder.generate_from(
+                z, max_length=self.cfg.max_generation_length
+            ),
+            skip_special_tokens=True,
+        )
 
         if batch_idx == 0:
             # Log a table of clean and reconstructed sentences to W&B
             table = wandb.Table(columns=["Clean", "Reconstructed"])
-            for clean, reconstructed in zip(batch["input_str"][:10], gen_clean[:10]):
+            for clean, reconstructed in zip(batch["input_str"][:10], generation[:10]):
                 table.add_data(clean, reconstructed)
             wandb.log({"val/clean_samples": table})
 
         bleu_clean = self.bleu.compute(
-            predictions=gen_clean, references=batch["input_str"]
-        )["bleu"]
-        bleu_corrupted = self.bleu.compute(
-            predictions=gen_corrupted, references=batch["input_str"]
+            predictions=generation, references=batch["input_str"]
         )["bleu"]
 
         self.log("val/bleu_clean", bleu_clean, on_epoch=True)
-        self.log("val/bleu_corrupted", bleu_corrupted, on_epoch=True)
 
         # Interpolate between pairs of clean latents and evaluate perplexity
-        group_indices = torch.randperm(input_ids_enc_clean.shape[0]).chunk(2)
-        z_groups = [z_clean[indices] for indices in group_indices]
+        group_indices = torch.randperm(input_ids_enc.shape[0]).chunk(2)
+        z_groups = [z[indices] for indices in group_indices]
         z_interp = 0.5 * z_groups[0] + 0.5 * z_groups[1]
         gen_interp_ids = self.decoder.generate_from(
             z_interp, max_length=self.cfg.max_generation_length
@@ -279,7 +280,7 @@ class AETask(L.LightningModule):
 
         with self.decoder.backbone.disable_adapter():
             # Disable LoRA layers for perplexity eval
-            mask = (gen_interp_ids != self.decoder.tokenizer.pad_token_id)
+            mask = gen_interp_ids != self.decoder.tokenizer.pad_token_id
             labels = gen_interp_ids.masked_fill(~mask, -100)
             ppl_interp = torch.exp(
                 self.decoder.backbone(

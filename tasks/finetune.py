@@ -102,7 +102,6 @@ class FinetuneTask(L.LightningModule):
             targets.view(-1),
             ignore_index=-100,
         )
-        loss += loss
 
         self.log(
             "train/loss",
@@ -110,6 +109,8 @@ class FinetuneTask(L.LightningModule):
             prog_bar=True,
             add_dataloader_idx=False,
             batch_size=logits.shape[0],
+            on_step=True,
+            on_epoch=False
         )
 
         return loss
@@ -127,7 +128,6 @@ class FinetuneTask(L.LightningModule):
             targets.view(-1),
             ignore_index=-100,
         )
-        loss += loss
 
         self.log(
             "val/loss",
@@ -135,6 +135,7 @@ class FinetuneTask(L.LightningModule):
             prog_bar=True,
             add_dataloader_idx=False,
             batch_size=logits.shape[0],
+            on_step=False,
             on_epoch=True
         )
 
