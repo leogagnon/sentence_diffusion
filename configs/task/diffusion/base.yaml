@@ -1,12 +1,11 @@
 model:     
-  n_layers: 8
+  n_layers: 16
   n_heads: 8
-  n_embd: 512
+  n_embd: 768
 
 batch_size: 128
-val_split: 0.1
 lr: 1e-4
-ae_id: jvktv590
+pretrained_ae_id: 983t3fhv
 
 loss: l2
 sampling_timesteps: 50

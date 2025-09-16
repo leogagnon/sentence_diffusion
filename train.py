@@ -97,7 +97,7 @@ def main(cfg: Optional[TrainConfig] = None, run_id: Optional[str] = None):
 
         # If the task is diffusion, add the autoencoder config to cfg
         run = wandb.Api().run(
-            f"guillaume-lajoie/sentence_diffusion/{cfg.task.diffusion.ae_id}"
+            f"guillaume-lajoie/sentence_diffusion/{cfg.task.diffusion.pretrained_ae_id}"
         )
         cfg.task.ae = OmegaConf.merge(
             OmegaConf.structured(AETaskConfig), run.config['task']['ae']
@@ -131,7 +131,6 @@ def main(cfg: Optional[TrainConfig] = None, run_id: Optional[str] = None):
         accumulate_grad_batches=cfg.accumulate_grad_batches,
         precision='16-mixed'
     )
-
     trainer.fit(
         model=task,
         ckpt_path=(

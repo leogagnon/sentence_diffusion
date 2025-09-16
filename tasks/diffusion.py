@@ -30,9 +30,8 @@ from ema_pytorch import EMA
 class GaussianDiffusionTaskConfig:
     model: DiTConfig
     batch_size: int
-    val_split: float
     lr: float
-    ae_id: str
+    pretrained_ae_id: str
     name: Optional[str] = None
 
     loss: str = "l2"
@@ -80,17 +79,17 @@ class GaussianDiffusionTask(L.LightningModule):
         ae_task = AETask.load_from_checkpoint(
             os.path.join(
                 os.environ["LATENT_CONTROL_CKPT_DIR"],
-                cfg.ae_id,
+                cfg.pretrained_ae_id,
                 "last.ckpt",
             ),
             strict=False,
         )
-        ae_task.setup()
 
+        self.train_indices = ae_task.train_indices
+        self.val_indices = ae_task.val_indices
+        self.dataset = ae_task.dataset
         self.encoder = ae_task.encoder.eval().requires_grad_(False)
         self.decoder = ae_task.decoder.eval().requires_grad_(False)
-        self.train_data = ae_task.train_data
-        self.val_data = ae_task.val_data
 
         # Init latent normalization if needed
         if cfg.normalize_latent:
@@ -107,12 +106,16 @@ class GaussianDiffusionTask(L.LightningModule):
         cfg.model.latent_shape = self.encoder.latent_shape
         self.model = DiT(cfg.model)
 
-        self.ema = EMA(self.model, beta=0.995, update_every=10, power=3/4).cpu()
-
         self.cfg = cfg
         # Important for checkpoints
         self.save_hyperparameters(
             OmegaConf.to_container(OmegaConf.structured(cfg)), logger=False
+        )
+    
+    def setup(self, stage: Optional[str] = None):
+        self.train_data = Subset(self.dataset, indices=self.train_indices)
+        self.val_data = Subset(
+            self.dataset, indices=self.val_indices
         )
 
     def normalize_latent(self, x_start):
@@ -173,11 +176,6 @@ class GaussianDiffusionTask(L.LightningModule):
                 )
 
                 print("Latent mean and scale computed.")
-                self.ema.ema_model.latent_mean = self.latent_mean
-                self.ema.ema_model.latent_scale = self.latent_scale
-
-    def sample(self, xd):
-        pass
 
     def training_step(self, batch, batch_idx=None):
 

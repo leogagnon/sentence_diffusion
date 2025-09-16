@@ -197,13 +197,13 @@ class AETask(L.LightningModule):
         )
         loss += recon_loss
 
-        wandb.log({"train/reconstruction_loss": recon_loss})
+        self.log("train/reconstruction_loss", recon_loss, on_epoch=False, on_step=True)
 
         return loss
 
     @torch.no_grad()
     def validation_step(self, batch, batch_idx):
-        
+
         loss = 0.0
 
         # Encode input_ids
@@ -218,7 +218,7 @@ class AETask(L.LightningModule):
             # Note: use mean for evaluation
             z = mean
 
-        # Loss evaluation
+        # Reconstruction loss of clean sample
         logits = self.decoder(batch["input_ids_dec"], z)
         targets = batch["input_ids_dec"].masked_fill(
             batch["attention_mask_dec"] == 0, -1
@@ -233,21 +233,16 @@ class AETask(L.LightningModule):
         self.log("val/reconstruction_loss", recon_loss, on_epoch=True)
         loss += recon_loss
 
-        # Noise robustness evaluation
-        z_noised = 0.7 * z + (1 - math.sqrt(0.7)) * torch.randn_like(z)
-        generation = self.decoder.tokenizer.batch_decode(
-            self.decoder.generate(z=z_noised, max_length=self.cfg.max_generation_length),
-            skip_special_tokens=True,
+        # Reconstruction loss of noised sample
+        z_noised = z + (0.7 * torch.randn_like(z))
+        logits = self.decoder(batch["input_ids_dec"], z_noised)
+        logits = logits[:, :-1].contiguous()
+        recon_loss_noised = torch.nn.functional.cross_entropy(
+            logits.view(-1, logits.size(-1)),
+            targets.view(-1),
+            ignore_index=-1,
         )
-        bleu_noised = self.bleu.compute(
-            predictions=generation, references=batch["input_str"]
-        )["bleu"]
-        self.log("val/bleu_noised", bleu_noised, on_epoch=True)
-        if batch_idx == 0:
-            table = wandb.Table(columns=["Original", "Noise+Reconstructed"])
-            for original, reconstructed in zip(batch["input_str"][:10], generation[:10]):
-                table.add_data(original, reconstructed)
-            wandb.log({"val/noise_samples": table})
+        self.log("val/reconstruction_loss_noised", recon_loss_noised, on_epoch=True)
 
         # Interpolation evaluation
         group_indices = torch.randperm(input_ids_enc.shape[0]).chunk(2)
@@ -268,7 +263,10 @@ class AETask(L.LightningModule):
                 ).loss
             )
         self.log("val/ppl_interp", ppl_interp.item(), on_epoch=True)
+
+        # Log some generation for the first batch
         if batch_idx == 0:
+            # Log generations from interpolated samples
             table = wandb.Table(columns=["S1", "S2", "Interpolated"])
             for s1, s2, s_interp in zip(
                 [batch["input_str"][i] for i in group_indices[0]][:10],
@@ -279,3 +277,31 @@ class AETask(L.LightningModule):
             ):
                 table.add_data(s1, s2, s_interp)
             wandb.log({"val/interp_samples": table})
+
+            # Log generation from clean samples
+            table_clean = wandb.Table(columns=["Original", "Reconstructed"])
+            for original, reconstructed in zip(
+                batch["input_str"][:10],
+                self.decoder.tokenizer.batch_decode(
+                    self.decoder.generate(
+                        z=z[:10], max_length=self.cfg.max_generation_length
+                    ),
+                    skip_special_tokens=True,
+                ),
+            ):
+                table_clean.add_data(original, reconstructed)
+            wandb.log({"val/clean_samples": table_clean})
+
+            # Log generation from noised samples
+            table_noised = wandb.Table(columns=["Original", "Noise+Reconstructed"])
+            for original, reconstructed in zip(
+                batch["input_str"][:10],
+                self.decoder.tokenizer.batch_decode(
+                    self.decoder.generate(
+                        z=z_noised[:10], max_length=self.cfg.max_generation_length
+                    ),
+                    skip_special_tokens=True,
+                ),
+            ):
+                table_noised.add_data(original, reconstructed)
+            wandb.log({"val/noised_samples": table_noised})
