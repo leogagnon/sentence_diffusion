@@ -1,4 +1,5 @@
 from functools import partial
+import math
 import os
 import lightning as L
 from omegaconf import OmegaConf
@@ -80,7 +81,6 @@ class AETask(L.LightningModule):
                 self.decoder.backbone,
                 LoraConfig(**self.decoder.cfg.lora_cfg),
             )
-
 
         # Load encoder (set the encoder output dimension to match the decoder input dimension)
         cfg.encoder.out_proj_dim = self.decoder.backbone.config.hidden_size
@@ -201,28 +201,24 @@ class AETask(L.LightningModule):
 
         return loss
 
+    @torch.no_grad()
     def validation_step(self, batch, batch_idx):
-        # Encode clean and corrupted inputs
+        
         loss = 0.0
 
+        # Encode input_ids
         input_ids_enc = batch["input_ids_enc"]
-
-        z = self.encoder(
-            input_ids_enc, attention_mask=batch["attention_mask_enc"]
-        )
-
+        z = self.encoder(input_ids_enc, attention_mask=batch["attention_mask_enc"])
         if self.encoder.cfg.variational:
             mean, log_var = z
-            KLD = -0.5 * torch.sum(
-                1 + log_var - mean.pow(2) - log_var.exp()
-            )
+            KLD = -0.5 * torch.sum(1 + log_var - mean.pow(2) - log_var.exp())
             self.log("val/KLD", KLD, on_epoch=True)
             loss += self.cfg.kl_beta * KLD
 
             # Note: use mean for evaluation
             z = mean
 
-        # Evaluate loss for clean inputs
+        # Loss evaluation
         logits = self.decoder(batch["input_ids_dec"], z)
         targets = batch["input_ids_dec"].masked_fill(
             batch["attention_mask_dec"] == 0, -1
@@ -237,36 +233,42 @@ class AETask(L.LightningModule):
         self.log("val/reconstruction_loss", recon_loss, on_epoch=True)
         loss += recon_loss
 
-        # Decode from z and evaluate BLEU
+        # Noise robustness evaluation
+        z_noised = 0.7 * z + (1 - math.sqrt(0.7)) * torch.randn_like(z)
         generation = self.decoder.tokenizer.batch_decode(
-            self.decoder.generate_from(
-                z, max_length=self.cfg.max_generation_length
-            ),
+            self.decoder.generate(z=z_noised, max_length=self.cfg.max_generation_length),
             skip_special_tokens=True,
         )
-
-        if batch_idx == 0:
-            # Log a table of clean and reconstructed sentences to W&B
-            table = wandb.Table(columns=["Clean", "Reconstructed"])
-            for clean, reconstructed in zip(batch["input_str"][:10], generation[:10]):
-                table.add_data(clean, reconstructed)
-            wandb.log({"val/clean_samples": table})
-
-        bleu_clean = self.bleu.compute(
+        bleu_noised = self.bleu.compute(
             predictions=generation, references=batch["input_str"]
         )["bleu"]
+        self.log("val/bleu_noised", bleu_noised, on_epoch=True)
+        if batch_idx == 0:
+            table = wandb.Table(columns=["Original", "Noise+Reconstructed"])
+            for original, reconstructed in zip(batch["input_str"][:10], generation[:10]):
+                table.add_data(original, reconstructed)
+            wandb.log({"val/noise_samples": table})
 
-        self.log("val/bleu_clean", bleu_clean, on_epoch=True)
-
-        # Interpolate between pairs of clean latents and evaluate perplexity
+        # Interpolation evaluation
         group_indices = torch.randperm(input_ids_enc.shape[0]).chunk(2)
         z_groups = [z[indices] for indices in group_indices]
         z_interp = 0.5 * z_groups[0] + 0.5 * z_groups[1]
-        gen_interp_ids = self.decoder.generate_from(
-            z_interp, max_length=self.cfg.max_generation_length
+        gen_interp_ids = self.decoder.generate(
+            z=z_interp, max_length=self.cfg.max_generation_length
         )
+        with self.decoder.backbone.disable_adapter():
+            # Evaluate perplexity of interpolated samples with pre-trained decoder
+            mask = gen_interp_ids != self.decoder.tokenizer.pad_token_id
+            labels = gen_interp_ids.masked_fill(~mask, -100)
+            ppl_interp = torch.exp(
+                self.decoder.backbone(
+                    input_ids=gen_interp_ids,
+                    labels=labels,
+                    attention_mask=mask,
+                ).loss
+            )
+        self.log("val/ppl_interp", ppl_interp.item(), on_epoch=True)
         if batch_idx == 0:
-            # Log a table of clean and reconstructed sentences to W&B
             table = wandb.Table(columns=["S1", "S2", "Interpolated"])
             for s1, s2, s_interp in zip(
                 [batch["input_str"][i] for i in group_indices[0]][:10],
@@ -277,17 +279,3 @@ class AETask(L.LightningModule):
             ):
                 table.add_data(s1, s2, s_interp)
             wandb.log({"val/interp_samples": table})
-
-        with self.decoder.backbone.disable_adapter():
-            # Disable LoRA layers for perplexity eval
-            mask = gen_interp_ids != self.decoder.tokenizer.pad_token_id
-            labels = gen_interp_ids.masked_fill(~mask, -100)
-            ppl_interp = torch.exp(
-                self.decoder.backbone(
-                    input_ids=gen_interp_ids,
-                    labels=labels,
-                    attention_mask=mask,
-                ).loss
-            )
-
-        self.log("val/ppl_interp", ppl_interp.item(), on_epoch=True)

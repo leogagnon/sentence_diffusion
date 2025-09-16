@@ -6,7 +6,7 @@ gres: gpu:l40s:1
 tasks_per_node: 1
 array_parallelism: 32
 cpus_per_task: 1
-timeout_min: 300 # 5 hours
+timeout_min: 720 # 12 hours
 partition: long
 
 setup:

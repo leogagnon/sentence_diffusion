@@ -23,6 +23,7 @@ from model.gaussian_diffusion import *
 from tasks.autoencoder import AETask
 import torch.nn as nn
 from data.stories import StoriesDatasetConfig, StoriesDataset
+from ema_pytorch import EMA
 
 
 @dataclass
@@ -106,6 +107,8 @@ class GaussianDiffusionTask(L.LightningModule):
         cfg.model.latent_shape = self.encoder.latent_shape
         self.model = DiT(cfg.model)
 
+        self.ema = EMA(self.model, beta=0.995, update_every=10, power=3/4).cpu()
+
         self.cfg = cfg
         # Important for checkpoints
         self.save_hyperparameters(
@@ -170,6 +173,11 @@ class GaussianDiffusionTask(L.LightningModule):
                 )
 
                 print("Latent mean and scale computed.")
+                self.ema.ema_model.latent_mean = self.latent_mean
+                self.ema.ema_model.latent_scale = self.latent_scale
+
+    def sample(self, xd):
+        pass
 
     def training_step(self, batch, batch_idx=None):
 
@@ -194,6 +202,8 @@ class GaussianDiffusionTask(L.LightningModule):
             prog_bar=True,
             add_dataloader_idx=False,
             batch_size=latent.shape[0],
+            on_step=True,
+            on_epoch=False
         )
 
         return loss
@@ -202,7 +212,8 @@ class GaussianDiffusionTask(L.LightningModule):
 
         # Compute latents
         with torch.no_grad():
-            latent = self.encoder(batch["input_ids_enc"])
+            assert self.encoder.training == False
+            latent = self.encoder(batch["input_ids_enc"], attention_mask=batch["attention_mask_enc"])
             if self.cfg.normalize_latent:
                 latent = self.normalize_latent(latent)
 
@@ -220,6 +231,8 @@ class GaussianDiffusionTask(L.LightningModule):
             prog_bar=True,
             add_dataloader_idx=False,
             batch_size=latent.shape[0],
+            on_epoch=True,
+            on_step=False
         )
 
         return loss

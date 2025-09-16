@@ -132,7 +132,6 @@ def main(cfg: Optional[TrainConfig] = None, run_id: Optional[str] = None):
         precision='16-mixed'
     )
 
-    #trainer.validate(model=task)
     trainer.fit(
         model=task,
         ckpt_path=(

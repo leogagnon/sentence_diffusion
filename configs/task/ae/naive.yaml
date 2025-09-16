@@ -1,4 +1,4 @@
-train_batch_size: 16
+train_batch_size: 32
 val_batch_size: 128
 lr: 1e-4
 input_sub_p: 0.0
@@ -22,14 +22,7 @@ encoder:
     lora_dropout: 0.1
     bias: "none"
 
-decoder:
-  name: gpt2-large # 774M params
-  lora_cfg: 
-    r: 128
-    lora_alpha: 32
-    target_modules: ["c_attn", "c_proj"]
-    lora_dropout: 0.1
-    bias: "none"
+pretrained_decoder_id: oj4gfj5q #7s8obxmf
     
 dataset:
   path: data/

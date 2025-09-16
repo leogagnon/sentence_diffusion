@@ -15,5 +15,5 @@ seed: 42
 log_dir: /network/scratch/l/leo.gagnon/sentence_diffusion/logs
 max_epochs: 200
 accumulate_grad_batches: 4
-val_check_interval: 200
+val_check_interval: 64
 sweep_id: null
