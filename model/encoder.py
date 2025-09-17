@@ -57,10 +57,16 @@ class EncoderModel(nn.Module):
 
         assert cfg.out_proj_dim != None
         if cfg.variational:
-            self.out_proj = nn.Linear(self.backbone.config.hidden_size, cfg.out_proj_dim)
-            self.out_proj_logvar = nn.Linear(self.backbone.config.hidden_size, cfg.out_proj_dim)
+            self.out_proj = nn.Linear(
+                self.backbone.config.hidden_size, cfg.out_proj_dim
+            )
+            self.out_proj_logvar = nn.Linear(
+                self.backbone.config.hidden_size, cfg.out_proj_dim
+            )
         else:
-            self.out_proj = nn.Linear(self.backbone.config.hidden_size, cfg.out_proj_dim)
+            self.out_proj = nn.Linear(
+                self.backbone.config.hidden_size, cfg.out_proj_dim
+            )
 
         if cfg.compressor_cfg is not None:
             self.compressor = AttentionLayers(
@@ -90,30 +96,31 @@ class EncoderModel(nn.Module):
                     if self.cfg.compressor_cfg.act_masking_p > 0:
                         # Mask each token with probability act_masking_p
                         mask = (
-                            torch.rand(size=(z.shape[0], z.shape[1]), device=z.device)
+                            torch.rand_like(z[:, :, 0])
                             < self.cfg.compressor_cfg.act_masking_p
                         )
-                        mask = einx.rearrange("b n -> b n 1", mask)
+                        mask = einx.rearrange("b n -> b n d", mask, d=z.shape[-1])
                         z = z.masked_fill(mask, 0.0)
                 else:
                     if self.cfg.compressor_cfg.act_delta > 0:
-                        noise = torch.randn(z.shape, device=z.device)
-                        z = (
-                            self.cfg.compressor_cfg.act_delta * z
-                            + (1 - math.sqrt(self.cfg.compressor_cfg.act_delta)) * noise
-                        )
+                        # Interpolate between z and Gaussian noise
+                        z = self.cfg.compressor_cfg.act_delta * z + (
+                            1 - math.sqrt(self.cfg.compressor_cfg.act_delta)
+                        ) * torch.randn_like(z)
 
-            placeholders = self.placeholders.unsqueeze(0).expand(z.shape[0], -1, -1)
+            # Cross-attend to learned k placeholders
+            placeholders = einx.rearrange("k d -> 1 k d", self.placeholders)
             z = self.compressor(placeholders, context=z, context_mask=attention_mask)
 
-            if (self.cfg.compressor_cfg.feat_masking_p > 0) and self.training:
+            if self.training and (self.cfg.compressor_cfg.feat_masking_p > 0):
                 # Mask each feature independently with probability feat_masking_p
                 mask = (
-                    torch.rand(size=z.shape, device=z.device)
+                    torch.rand_like(z)
                     < self.cfg.compressor_cfg.feat_masking_p
                 )
                 z = z.masked_fill(mask, 0.0)
         else:
+            # If no compressor, just take first k tokens
             z = z[:, : self.cfg.k]
 
         if self.cfg.variational:

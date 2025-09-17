@@ -12,7 +12,7 @@
             "program": "train.py",
             "console": "integratedTerminal",
             "justMyCode": false,
-            "args": ["task/ae=denoising"],
+            "args": ["task/diffusion=base"],
         }
     ]
 }
