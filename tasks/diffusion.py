@@ -8,6 +8,7 @@ import math
 
 import hydra
 import lightning as L
+from mauve.compute_mauve import get_features_from_input, compute_mauve
 import numpy as np
 import torch
 import torch.nn.functional as F
@@ -23,10 +24,8 @@ from model.gaussian_diffusion import *
 from tasks.autoencoder import AETask
 import torch.nn as nn
 from data.stories import StoriesDatasetConfig, StoriesDataset
-from ema_pytorch import EMA
 from torch.optim.swa_utils import AveragedModel, get_ema_avg_fn
 from lightning.pytorch.utilities.rank_zero import rank_zero_info
-
 
 @dataclass
 class GaussianDiffusionTaskConfig:
@@ -44,6 +43,8 @@ class GaussianDiffusionTaskConfig:
     schedule_scale: float = 1.0
     sampler: str = "ddpm"
     normalize_latent: bool = False
+    validation_mauve: bool = False
+    max_generation_length: int = 150
 
 
 class GaussianDiffusionTask(L.LightningModule):
@@ -121,6 +122,12 @@ class GaussianDiffusionTask(L.LightningModule):
             OmegaConf.to_container(OmegaConf.structured(cfg)), logger=False
         )
 
+    def to(self, *args, **kwargs):
+        # Override so that decoder and ema_model stay on CPU by default
+        self.model.to(*args, **kwargs)
+        self.encoder.to(*args, **kwargs)
+        return self
+
     def setup(self, stage: Optional[str] = None):
         self.train_data = Subset(self.dataset, indices=self.train_indices)
         self.val_data = Subset(self.dataset, indices=self.val_indices)
@@ -185,7 +192,7 @@ class GaussianDiffusionTask(L.LightningModule):
                 latent_samples = torch.cat(latent_samples, dim=0)
                 self.latent_mean = torch.mean(latent_samples, dim=0)
                 self.latent_scale = torch.std(
-                    latent_samples - self.latent_mean, unbiased=False
+                    latent_samples - self.latent_mean, unbiased=False, dim=0
                 )
 
                 print("Latent mean and scale computed.")
@@ -230,6 +237,39 @@ class GaussianDiffusionTask(L.LightningModule):
         self.ema_model = self.ema_model.cuda()
         self.model = self.model.cpu()
 
+    @torch.no_grad()
+    def get_mauve_score(self):
+        """Compute MAUVE score on the validation set using the EMA model."""
+        self.decoder = self.decoder.cuda()
+        if not hasattr(self, "val_feats"):
+            val_sentences = []
+            for batch in self.val_dataloader():
+                val_sentences += batch["input_str"]
+                feats = get_features_from_input(
+                    None, None, val_sentences, "gpt2-large", 256, 0, "q", 128
+                )
+                self.val_feats = torch.Tensor(feats)
+        
+        generations = []
+        for it in tqdm(range(len(self.val_feats) // 128)):
+            z = sample(
+                model=self.ema_model.module,
+                batch_size=128,
+                sampling_timesteps=self.cfg.sampling_timesteps,
+                sampler=self.cfg.sampler,
+                schedule=self.train_schedule,
+                diffusion_objective=self.cfg.diffusion_objective,
+            )
+            tokens = self.decoder.generate(z=z, max_length=self.cfg.max_generation_length)
+            generations += self.decoder.tokenizer.batch_decode(
+                tokens, skip_special_tokens=True
+            )
+        
+        mauve = compute_mauve(p_text=generations, q_features=self.val_feats, max_text_length=self.cfg.max_generation_length, batch_size=128).mauve
+        self.decoder = self.decoder.cpu()
+
+        return mauve
+
     def on_validation_epoch_end(self):
         self.ema_model = self.ema_model.cpu()
         self.model = self.model.cuda()
@@ -238,7 +278,9 @@ class GaussianDiffusionTask(L.LightningModule):
     def validation_step(self, batch, batch_idx=None):
         if self.ema_model.module.training:
             self.ema_model = self.ema_model.eval()
-            rank_zero_info("The EMA model was in training mode, setting it to eval mode.")
+            rank_zero_info(
+                "The EMA model was in training mode, setting it to eval mode."
+            )
         # Compute latents
         latent = self.encoder(
             batch["input_ids_enc"], attention_mask=batch["attention_mask_enc"]

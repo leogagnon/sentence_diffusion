@@ -136,7 +136,7 @@ def main(cfg: Optional[TrainConfig] = None, run_id: Optional[str] = None):
         logger.experiment.config.update(
             OmegaConf.to_container(OmegaConf.structured(cfg)), allow_val_change=True
         )
-
+        
     # Instantiate the trainer
     trainer = L.Trainer(
         logger=logger,

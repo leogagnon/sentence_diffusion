@@ -375,6 +375,7 @@ def ddim_sample(
     schedule,
     sampling_timesteps,
     cls_free_guidance,
+    diffusion_objective,
     invert=False,
     z_t=None,
 ):
@@ -405,6 +406,7 @@ def ddim_sample(
             cond_mask=cond_mask,
             schedule=schedule,
             cls_free_guidance=cls_free_guidance,
+            diffusion_objective=diffusion_objective,
         )
         # get alpha sigma of time and next time
 
@@ -441,6 +443,7 @@ def ddpm_sample(
     cond_mask,
     schedule,
     sampling_timesteps,
+    diffusion_objective,
     cls_free_guidance,
     invert=False,
     z_t=None,
@@ -470,6 +473,7 @@ def ddpm_sample(
             cond_mask=cond_mask,
             schedule=schedule,
             cls_free_guidance=cls_free_guidance,
+            diffusion_objective=diffusion_objective,
         )
         # get alpha sigma of time and next time
 
@@ -511,6 +515,7 @@ def dpmpp_sample(
     schedule,
     sampling_timesteps,
     cls_free_guidance,
+    diffusion_objective,
     invert=False,
     z_t=None,
 ):
@@ -541,6 +546,7 @@ def dpmpp_sample(
             cond_mask=cond_mask,
             schedule=schedule,
             cls_free_guidance=cls_free_guidance,
+            diffusion_objective=diffusion_objective,
         )
         # get alpha sigma of time and next time
 
@@ -585,7 +591,8 @@ def sample(
     batch_size,
     sampling_timesteps,
     sampler,
-    cls_free_guidance,
+    diffusion_objective,
+    cls_free_guidance=1.0,
     class_id=None,
     cond=None,
     cond_input_ids=None,
@@ -601,15 +608,16 @@ def sample(
     else:
         raise ValueError(f"invalid sampler {sampler}")
     return sample_fn(
-        (batch_size,) + tuple(model.cfg.latent_shape),
-        model,
-        class_id,
-        cond,
-        cond_input_ids,
-        cond_mask,
-        schedule,
-        sampling_timesteps,
-        cls_free_guidance,
+        model=model,
+        shape=(batch_size,) + tuple(model.cfg.latent_shape),
+        class_id=class_id, 
+        cond=cond,
+        cond_input_ids=cond_input_ids,
+        cond_mask=cond_mask,
+        schedule=schedule,
+        sampling_timesteps=sampling_timesteps,
+        cls_free_guidance=cls_free_guidance,
+        diffusion_objective=diffusion_objective,
     )
 
 

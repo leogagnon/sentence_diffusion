@@ -5,6 +5,8 @@
 #SBATCH --partition=long
 #SBATCH --gres=gpu:l40s:1
 
+export SBATCH_OUTPUT="logs/$1.out"
+
 source ~/sentence_diffusion/venv/bin/activate
 
-python train.py --wandb_it=$1
+python train.py --wandb_id=$1
