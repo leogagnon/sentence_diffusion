@@ -27,6 +27,7 @@ from data.stories import StoriesDatasetConfig, StoriesDataset
 from torch.optim.swa_utils import AveragedModel, get_ema_avg_fn
 from lightning.pytorch.utilities.rank_zero import rank_zero_info
 
+
 @dataclass
 class GaussianDiffusionTaskConfig:
     model: DiTConfig
@@ -239,7 +240,10 @@ class GaussianDiffusionTask(L.LightningModule):
 
     @torch.no_grad()
     def get_mauve_score(self):
-        """Compute MAUVE score on the validation set using the EMA model."""
+        """
+        Compute MAUVE score on the validation set using the EMA model.
+        Temporarily moves the decoder to GPU.
+        """
         self.decoder = self.decoder.cuda()
         if not hasattr(self, "val_feats"):
             val_sentences = []
@@ -249,7 +253,7 @@ class GaussianDiffusionTask(L.LightningModule):
                     None, None, val_sentences, "gpt2-large", 256, 0, "q", 128
                 )
                 self.val_feats = torch.Tensor(feats)
-        
+
         generations = []
         for it in tqdm(range(len(self.val_feats) // 128)):
             z = sample(
@@ -260,17 +264,36 @@ class GaussianDiffusionTask(L.LightningModule):
                 schedule=self.train_schedule,
                 diffusion_objective=self.cfg.diffusion_objective,
             )
-            tokens = self.decoder.generate(z=z, max_length=self.cfg.max_generation_length)
+            tokens = self.decoder.generate(
+                z=z, max_length=self.cfg.max_generation_length
+            )
             generations += self.decoder.tokenizer.batch_decode(
                 tokens, skip_special_tokens=True
             )
-        
-        mauve = compute_mauve(p_text=generations, q_features=self.val_feats, max_text_length=self.cfg.max_generation_length, batch_size=128).mauve
+
+        mauve = compute_mauve(
+            p_text=generations,
+            q_features=self.val_feats,
+            max_text_length=self.cfg.max_generation_length,
+            batch_size=128,
+            device_id=0,
+            featurize_model_name="gpt2-large",
+        ).mauve
         self.decoder = self.decoder.cpu()
 
         return mauve
 
     def on_validation_epoch_end(self):
+        if self.cfg.validation_mauve:
+            mauve_score = self.get_mauve_score()
+            self.log(
+                "val/mauve",
+                mauve_score,
+                prog_bar=True,
+                add_dataloader_idx=False,
+                on_epoch=True,
+                on_step=False,
+            )
         self.ema_model = self.ema_model.cpu()
         self.model = self.model.cuda()
 
