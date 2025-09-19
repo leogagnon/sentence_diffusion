@@ -73,9 +73,10 @@ class DecoderModel(nn.Module):
         """Generate text using autoregressive decoding, potentially conditioned on soft prefix z"""
 
         if z != None:
-            # Compute past_key_values for z
+            # Compute cache for z
             cache = self.backbone(
                 inputs_embeds=z,
+                position_ids=torch.zeros_like(z[:, :, 0], dtype=torch.long),
                 use_cache=True,
             ).past_key_values
             # Position of the BOS token should be 0 (like in training)

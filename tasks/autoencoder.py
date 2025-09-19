@@ -252,12 +252,22 @@ class AETask(L.LightningModule):
             z=z_interp, max_length=self.cfg.max_generation_length
         )
         with self.decoder.backbone.disable_adapter():
+            # Add BOS and EOS tokens
+            bos = torch.full_like(
+                gen_interp_ids[:, [0]],
+                self.decoder.tokenizer.bos_token_id,
+            )
+            eos = torch.full_like(
+                gen_interp_ids[:, [0]],
+                self.decoder.tokenizer.eos_token_id,
+            )
+            gen_interp_ids_ = torch.cat([bos, gen_interp_ids, eos], dim=1)
             # Evaluate perplexity of interpolated samples with pre-trained decoder
-            mask = gen_interp_ids != self.decoder.tokenizer.pad_token_id
-            labels = gen_interp_ids.masked_fill(~mask, -100)
+            mask = gen_interp_ids_ != self.decoder.tokenizer.pad_token_id
+            labels = gen_interp_ids_.masked_fill(~mask, -100)
             ppl_interp = torch.exp(
                 self.decoder.backbone(
-                    input_ids=gen_interp_ids,
+                    input_ids=gen_interp_ids_,
                     labels=labels,
                     attention_mask=mask,
                 ).loss
