@@ -249,10 +249,12 @@ class GaussianDiffusionTask(L.LightningModule):
             val_sentences = []
             for batch in self.val_dataloader():
                 val_sentences += batch["input_str"]
-                feats = get_features_from_input(
-                    None, None, val_sentences, "gpt2-large", 256, 0, "q", 128
-                )
-                self.val_feats = torch.Tensor(feats)
+
+            feats = get_features_from_input(
+                None, None, val_sentences, "gpt2-large", 256, 0, "q", 128
+            )
+
+            self.val_feats = torch.Tensor(feats)
 
         generations = []
         for it in tqdm(range(len(self.val_feats) // 128)):
@@ -264,6 +266,9 @@ class GaussianDiffusionTask(L.LightningModule):
                 schedule=self.train_schedule,
                 diffusion_objective=self.cfg.diffusion_objective,
             )
+            if self.cfg.normalize_latent:
+                z = self.unnormalize_latent(z)
+            z = z.half()
             tokens = self.decoder.generate(
                 z=z, max_length=self.cfg.max_generation_length
             )

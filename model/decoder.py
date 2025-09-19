@@ -73,20 +73,16 @@ class DecoderModel(nn.Module):
         """Generate text using autoregressive decoding, potentially conditioned on soft prefix z"""
 
         if z != None:
-            # Compute paste_key_values for z
-            prefill = self.backbone(
+            # Compute past_key_values for z
+            cache = self.backbone(
                 inputs_embeds=z,
                 use_cache=True,
-            )
-            cache = prefill.past_key_values
-            cache_position = torch.tensor([z.shape[1]])
-            attention_mask = torch.ones(
-                z.shape[0], z.shape[1] + 1, device=z.device, dtype=torch.long
-            )
+            ).past_key_values
+            # Position of the BOS token should be 0 (like in training)
+            cache_position = torch.tensor([0])
         else:
             cache = None
             cache_position = None
-            attention_mask = None
 
         # Autoregressive generation from BOS token with cached z (nucleus sampling)
         bos = torch.full(
@@ -99,7 +95,6 @@ class DecoderModel(nn.Module):
             input_ids=bos,
             past_key_values=cache,
             cache_position=cache_position,
-            attention_mask=attention_mask,
             max_length=max_length,
             do_sample=True,
             top_p=0.92,
