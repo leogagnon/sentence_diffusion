@@ -29,7 +29,6 @@ class DecoderModel(nn.Module):
 
         self.backbone = AutoModelForCausalLM.from_pretrained(
             cfg.name,
-            device_map="auto",
             attn_implementation="flash_attention_2",
             torch_dtype=torch.float16,
         )
@@ -49,20 +48,13 @@ class DecoderModel(nn.Module):
         if z == None:
             return self.backbone(input_ids=input_ids).logits
         else:
-            # set position_ids so that input_ids uses positions 0,..., len(input_ids)-1
-            # and z position_ids are all 0
-            z_pos = torch.zeros_like(z[:, :, 0], dtype=torch.long)
-            input_pos = torch.arange(0, input_ids.shape[1], device=input_ids.device)
-            input_pos = repeat(input_pos, "n -> b n", b=input_ids.shape[0])
-            position_ids = torch.cat([z_pos, input_pos], dim=1)
-
             # compute input embeddings
             input_embeds = self.backbone.get_input_embeddings()(input_ids)
             input_embeds = torch.cat([z, input_embeds], dim=1)
 
             # Forward pass
             output = self.backbone(
-                inputs_embeds=input_embeds, position_ids=position_ids
+                inputs_embeds=input_embeds
             )
             logits = output.logits[:, z.shape[1] :]
 
@@ -76,11 +68,10 @@ class DecoderModel(nn.Module):
             # Compute cache for z
             cache = self.backbone(
                 inputs_embeds=z,
-                position_ids=torch.zeros_like(z[:, :, 0], dtype=torch.long),
                 use_cache=True,
             ).past_key_values
-            # Position of the BOS token should be 0 (like in training)
-            cache_position = torch.tensor([0])
+            # Position of the BOS should be after the prefix
+            cache_position = torch.tensor([z.shape[1]])
         else:
             cache = None
             cache_position = None

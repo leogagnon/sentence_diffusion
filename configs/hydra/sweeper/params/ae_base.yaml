@@ -1,7 +1,7 @@
-task/ae: denoising, naive
+task/ae: dae, dglm
 model_checkpoint: base
 task.ae.train_batch_size: 32
-accumulate_grad_batches: 16
-task.ae.pretrained_decoder_id: oj4gfj5q, 7s8obxmf # gpt2-xl, gpt2-large
+task.ae.encoder.k: 8, 16
+accumulate_grad_batches: 4
 
-sweep_id: ae_base
+sweep_id: ae_base_v2

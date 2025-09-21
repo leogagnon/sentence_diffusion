@@ -110,21 +110,9 @@ def main(cfg: Optional[TrainConfig] = None, run_id: Optional[str] = None):
         cfg.task.ae = OmegaConf.merge(
             OmegaConf.structured(AETaskConfig), run.config["task"]["ae"]
         )
-        
-        if run.config["task"]["finetune"] is not None:
-            cfg.task.finetune = OmegaConf.merge(
-                OmegaConf.structured(FinetuneTaskConfig), run.config["task"]["finetune"]
-            )
     elif cfg.task.ae != None:
         task = AETask(cfg.task.ae)
         cfg.task.ae = task.cfg
-
-        run = wandb.Api().run(
-            f"guillaume-lajoie/sentence_diffusion/{cfg.task.ae.pretrained_decoder_id}"
-        )
-        cfg.task.finetune = OmegaConf.merge(
-            OmegaConf.structured(FinetuneTaskConfig), run.config["task"]["finetune"]
-        )
     elif cfg.task.finetune != None:
         task = FinetuneTask(cfg.task.finetune)
         cfg.task.finetune = task.cfg

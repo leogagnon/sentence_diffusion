@@ -1,0 +1,34 @@
+train_batch_size: 32
+val_batch_size: 128
+lr: 1e-5
+max_generation_length: 150
+val_size: 256
+
+encoder:
+  name: thesephist/contra-bottleneck-t5-xl-wikipedia
+  k: 8
+  prompt_generator_cfg:
+    n_layers: 6
+    n_heads: 12
+  lora_cfg: 
+    r: 128
+    lora_alpha: 32
+    target_modules: ["q", "v", "o", "wi", "wo"]
+    lora_dropout: 0.1
+    bias: "none"
+  
+
+decoder:
+  name: gpt2-xl # 1.5B params
+  lora_cfg: 
+    r: 128
+    lora_alpha: 32
+    target_modules: ["c_attn", "mlp.c_fc", "mlp.c_proj"]
+    lora_dropout: 0.1
+    bias: "none"
+    
+dataset:
+  path: data/
+
+name: dae
+
