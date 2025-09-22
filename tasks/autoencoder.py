@@ -23,6 +23,7 @@ import evaluate
 import os
 import wandb
 from tasks.finetune import FinetuneTask
+import hydra
 
 
 @dataclass
@@ -30,21 +31,20 @@ class AETaskConfig:
     lr: float
     train_batch_size: int
     val_batch_size: int
-    encoder: EncoderConfig
+    encoder: dict
     decoder: DecoderConfig
     max_generation_length: int
     dataset: StoriesDatasetConfig
     val_size: int
+    z_noise_alpha: float
+    z_dropout_p: float
+    has_noising: bool = True
     name: Optional[str] = None
 
 
 class AETask(L.LightningModule):
     """
-    Autoencoder Task. Combines an encoder and a decoder model to form an autoencoder.
-    Trains the autoencoder to reconstruct the input text.
-    Supports variational autoencoding.
-    Evaluates using
-        - Perplexity of interpolated samples in the latent space
+    Autoencoder Task. 
     """
 
     def __init__(self, cfg: Optional[AETaskConfig] = None, **kwargs):
@@ -58,10 +58,11 @@ class AETask(L.LightningModule):
                 )
             )
 
-        # Load decoder and encoder
+        # Load encoder and decoder
+        self.encoder = hydra.utils.instantiate(cfg.encoder)
+        cfg.decoder.prompt_generator_cfg.input_dim = self.encoder.latent_dim
         self.decoder = DecoderModel(cfg.decoder)
-        cfg.encoder.out_proj_dim = self.decoder.backbone.config.hidden_size
-        self.encoder = EncoderModel(cfg.encoder)
+        
         for mod in self.decoder.modules():
             if isinstance(mod, torch.nn.Dropout):
                 mod.p = 0.0
@@ -70,11 +71,12 @@ class AETask(L.LightningModule):
         self.dataset = StoriesDataset(
             cfg.dataset,
             dec_tokenizer=self.decoder.tokenizer,
+            enc_tokenizer=self.encoder.tokenizer,
         )
 
         indices = torch.randperm(len(self.dataset))
-        self.register_buffer("train_indices", indices[: -4096])
-        self.register_buffer("val_indices", indices[-4096 :])
+        self.register_buffer("train_indices", indices[:-4096])
+        self.register_buffer("val_indices", indices[-4096:])
 
         self.cfg = cfg
 
@@ -106,12 +108,26 @@ class AETask(L.LightningModule):
         )
 
     def configure_optimizers(self):
-        optimizer = torch.optim.Adamax(self.parameters(), lr=self.cfg.lr)
+        optimizer = torch.optim.AdamW(self.parameters(), lr=self.cfg.lr)
         return optimizer
 
     def training_step(self, batch, batch_idx):
 
-        z = self.encoder(batch["input_str"])
+        assert self.encoder.training == True
+
+        z = self.encoder(batch["input_ids_enc"], batch["attention_mask_enc"])
+
+        # Add noise and dropout to latent code
+        # This helps make the decoder more robust
+        if self.cfg.has_noising:
+            if self.cfg.z_noise_alpha < 1.0:
+                z = self.cfg.z_noise_alpha * z + (
+                    1 - math.sqrt(self.cfg.z_noise_alpha)
+                ) * torch.randn_like(z)
+
+            if self.cfg.z_dropout_p > 0.0:
+                mask = torch.rand_like(z) < self.cfg.z_dropout_p
+                z = z.masked_fill(mask, 0.0)
 
         # Get embeddings of input_ids
         logits = self.decoder(batch["input_ids_dec"], z)
@@ -138,8 +154,10 @@ class AETask(L.LightningModule):
     @torch.no_grad()
     def validation_step(self, batch, batch_idx):
 
+        assert self.encoder.training == False
+
         # Encode input_ids
-        z = self.encoder(batch["input_str"])
+        z = self.encoder(batch["input_ids_enc"], batch["attention_mask_enc"])
 
         # Reconstruction loss of clean sample
         logits = self.decoder(batch["input_ids_dec"], z)
@@ -156,7 +174,7 @@ class AETask(L.LightningModule):
         self.log("val/reconstruction_loss", recon_loss, on_epoch=True)
 
         # Reconstruction loss of noised sample
-        z_noised = z + (0.7 * torch.randn_like(z))
+        z_noised = 0.90 * z + (1 - math.sqrt(0.90)) * torch.randn_like(z)
         logits = self.decoder(batch["input_ids_dec"], z_noised)
         logits = logits[:, :-1].contiguous()
         recon_loss_noised = torch.nn.functional.cross_entropy(
@@ -164,41 +182,17 @@ class AETask(L.LightningModule):
             targets.view(-1),
             ignore_index=-1,
         )
-        self.log("val/reconstruction_loss_noised", recon_loss_noised, on_epoch=True)
-
-        # Interpolation evaluation
-        group_indices = torch.randperm(z.shape[0]).chunk(2)
-        z_groups = [z[indices] for indices in group_indices]
-        z_interp = 0.5 * z_groups[0] + 0.5 * z_groups[1]
-        gen_interp_ids = self.decoder.generate(
-            z=z_interp, max_length=self.cfg.max_generation_length
-        )
-        with self.decoder.backbone.disable_adapter():
-            # Add BOS and EOS tokens
-            bos = torch.full_like(
-                gen_interp_ids[:, [0]],
-                self.decoder.tokenizer.bos_token_id,
-            )
-            eos = torch.full_like(
-                gen_interp_ids[:, [0]],
-                self.decoder.tokenizer.eos_token_id,
-            )
-            gen_interp_ids_ = torch.cat([bos, gen_interp_ids, eos], dim=1)
-            # Evaluate perplexity of interpolated samples with pre-trained decoder
-            mask = gen_interp_ids_ != self.decoder.tokenizer.pad_token_id
-            labels = gen_interp_ids_.masked_fill(~mask, -100)
-            ppl_interp = torch.exp(
-                self.decoder.backbone(
-                    input_ids=gen_interp_ids_,
-                    labels=labels,
-                    attention_mask=mask,
-                ).loss
-            )
-        self.log("val/ppl_interp", ppl_interp.item(), on_epoch=True)
+        self.log("val/reconstruction_loss_noised", recon_loss_noised, on_epoch=True)        
 
         # Log some generation for the first batch
         if batch_idx == 0:
             # Log generations from interpolated samples
+            group_indices = torch.randperm(z.shape[0]).chunk(2)
+            z_groups = [z[indices] for indices in group_indices]
+            z_interp = 0.5 * z_groups[0] + 0.5 * z_groups[1]
+            gen_interp_ids = self.decoder.generate(
+                z=z_interp, max_length=self.cfg.max_generation_length
+            )
             table = wandb.Table(columns=["S1", "S2", "Interpolated"])
             for s1, s2, s_interp in zip(
                 [batch["input_str"][i] for i in group_indices[0]][:10],

@@ -18,177 +18,141 @@ import math
 import random
 from transformers import T5EncoderModel, T5Tokenizer
 from sentence_transformers import SentenceTransformer
-
-
-def get_sentence_encoder(name: str) -> SentenceTransformer:
-    if name.startswith("thesephist"):
-        # Custom wrapper around thesephist/contra-bottleneck-t5-{name}-wikipedia models
-        return SentenceTransformer(modules=[PretrainedDAE(name=name)])
-    else:
-        # Regular sentence transformer model from HuggingFace
-        return SentenceTransformer(
-            name,
-            model_kwargs={"torch_dtype": "float16"},
-        )
-
-
-from model.gaussian_diffusion import (
-    get_sampling_schedule,
-    right_pad_dims_to,
-    time_to_alpha,
-)
-
-
-@dataclass
-class PromptGeneratorConfig:
-    n_layers: int
-    n_heads: int
+from abc import ABC, abstractmethod
+from contextlib import nullcontext
+from torch.nn import Sequential
 
 
 @dataclass
 class EncoderConfig:
     name: str
-    k: int
-    prompt_generator_cfg: PromptGeneratorConfig
-    out_proj_dim: Optional[int] = None
     lora_cfg: Optional[dict] = None
 
 
-class EncoderModel(nn.Module):
-    def __init__(self, cfg: EncoderConfig):
+class EncoderModel(ABC, nn.Module):
+    @property
+    @abstractmethod
+    def latent_dim(self):
+        pass
+
+    @abstractmethod
+    def forward(self, input_str):
+        pass
+
+
+class SentenceT5Encoder(EncoderModel):
+    def __init__(self, cfg: Optional[EncoderConfig] = None, **kwargs):
         super().__init__()
+
+        if cfg == None:
+            cfg = EncoderConfig(**kwargs)
+        assert cfg.lora_cfg == None, "LoRA not supported for SentenceT5Encoder"
+
+        self.backbone = SentenceTransformer(
+            cfg.name,
+        ).requires_grad_(False)
+        self.tokenizer = self.backbone.tokenizer
+
         self.cfg = cfg
-
-        # Init backbone
-        self.backbone = get_sentence_encoder(cfg.name)
-
-        if self.cfg.lora_cfg != None:
-            self.backbone = get_peft_model(
-                self.backbone,
-                LoraConfig(**self.cfg.lora_cfg),
-            )
-        else:
-            self.backbone.requires_grad_(False)
-            self.backbone.eval()
-
-        assert cfg.out_proj_dim != None
-
-        self.prompt_noise_embed = nn.Sequential(
-            ScaledSinusoidalEmbedding(cfg.out_proj_dim),
-            nn.Linear(cfg.out_proj_dim, cfg.out_proj_dim * 4),
-            nn.GELU(),
-            nn.Linear(cfg.out_proj_dim * 4, cfg.out_proj_dim),
-        )
-
-        self.prompt_gen_projector = nn.Linear(
-            self.backbone.get_sentence_embedding_dimension(),
-            cfg.out_proj_dim * cfg.k,
-            bias=False,
-        )
-
-        self.prompt_gen = AttentionLayers(
-            dim=cfg.out_proj_dim,
-            depth=cfg.prompt_generator_cfg.n_layers,
-            heads=cfg.prompt_generator_cfg.n_heads,
-            causal=False,
-            use_adaptive_rmsnorm=True,
-            ff_swish=True,
-            ff_glu=True,
-        )
-
-        self.aug_noise_schedule = partial(
-            time_to_alpha, alpha_schedule=get_sampling_schedule("cosine"), scale=3.0
-        )
 
     @property
     def latent_dim(self):
         return self.backbone.get_sentence_embedding_dimension()
 
-    def forward(self, input_str):
-
-        # If no LoRA, don't compute gradients through backbone
-        if self.cfg.lora_cfg is None:
-            with torch.no_grad():
-                z = self.backbone.encode(
-                    input_str,
-                    convert_to_tensor=True,
-                    show_progress_bar=False,
-                ).detach()
-        else:
-            z = self.backbone.encode(
-                input_str, convert_to_tensor=True, show_progress_bar=False
-            )
-
-        # Project to prompt space
-        z = self.prompt_gen_projector(z)
-        z = einx.rearrange("b (k d) -> b k d", z, k=self.cfg.k)
-
-        # Sample augmentation noise using a scaled cosine schedule
-        if self.training:
-            times = torch.zeros((z.size(0),), device=z.device).float().uniform_(0, 1.0)
-            alpha = self.aug_noise_schedule(times)
-        else:
-            alpha = torch.full(
-                size=(z.size(0),), fill_value=0.97467943448, device=z.device
-            )
-        alpha = right_pad_dims_to(z, alpha)
-        noise = torch.randn_like(z)
-        z = alpha.sqrt() * z + (1 - alpha).sqrt() * noise
-
-        # Process z with prompt generator (conditioned on noise level)
-        noise_emb = self.prompt_noise_embed(alpha[None] * 1000)
-        noise_emb = einx.rearrange("b d -> b 1 d", noise_emb)
-        z = self.prompt_gen(z, condition=noise_emb)
+    @torch.no_grad()
+    def forward(self, input_ids, attention_mask=None):
+        batch = {
+            "input_ids": input_ids,
+            "attention_mask": attention_mask
+        }
+        z = self.backbone.forward(batch)["sentence_embedding"]
 
         return z
 
 
-class PretrainedDAE(InputModule):
-    """
-    SentenceEmbedding wrapper around thesephist/contra-bottleneck-t5-{name}-wikipedia models.
-    """
+@dataclass
+class DAEEncoderConfig:
+    name: str
+    normalize: bool
+    token_dropout_p: float
+    lora_cfg: Optional[dict] = None
 
-    def __init__(self, name):
+
+class DAEEncoder(EncoderModel):
+    def __init__(self, cfg: Optional[DAEEncoderConfig] = None, **kwargs):
         super().__init__()
-        self.model = AutoModelForCausalLM.from_pretrained(name, trust_remote_code=True)
-        self.model = self.model.half()
-        self.tokenizer = T5Tokenizer.from_pretrained(name)
+        if cfg == None:
+            cfg = DAEEncoderConfig(**kwargs)
+        self.model = AutoModelForCausalLM.from_pretrained(
+            cfg.name, trust_remote_code=True
+        )
+        self.tokenizer = T5Tokenizer.from_pretrained(cfg.name)
 
         # Remove decoder and LM head, we only need the encoder + bottleneck
         del self.model.decoder, self.model.dec_emb, self.model.lm_head
 
-    def tokenize(self, texts):
-        return self.tokenizer.batch_encode_plus(
-            texts, return_tensors="pt", padding=True
-        )
+        if cfg.lora_cfg != None:
+            self.model = get_peft_model(
+                self.model,
+                LoraConfig(**cfg.lora_cfg),
+            )
+        else:
+            self.model.requires_grad_(False)
+            self.model.eval()
 
-    def save(self, path):
-        pass
+        self.cfg = cfg
 
-    def get_sentence_embedding_dimension(self):
+    @property
+    def latent_dim(self):
         return self.model.bottleneck.out_proj.out_features
 
-    def forward(self, features):
-        hidden_states = self.model.encoder(**features).last_hidden_state
-        attention_mask = features["attention_mask"]
+    def forward(self, input_ids, attention_mask=None):
+        with torch.no_grad() if self.cfg.lora_cfg is None else nullcontext():
+            
+            # Pass through T5 encoder
+            batch = {
+                "input_ids": input_ids,
+                "attention_mask": attention_mask
+            }
+            hidden_states = self.model.encoder(**batch).last_hidden_state
 
-        hidden_states = hidden_states.repeat(
-            attention_mask.shape[0] // hidden_states.shape[0], 1, 1
-        )  # during contrastive search, attn mask can have higher batch size than hidden_state
-        mask_expanded = attention_mask.to(dtype=hidden_states.dtype).unsqueeze(-1).expand(hidden_states.shape)
-        mean_pooled_embedding = torch.sum(
-            hidden_states * mask_expanded, 1
-        ) / torch.clamp(mask_expanded.sum(1), min=1e-9)
-        unscaled_latent, attn_weights = self.model.bottleneck(
-            mean_pooled_embedding.unsqueeze(1),
-            hidden_states,
-            hidden_states,
-            need_weights=False,
-            # torch MHA attn_mask has opposite signs to HF T5 masks... sigh
-            attn_mask=attention_mask.to(dtype=hidden_states.dtype)
-            .unsqueeze(1)
-            .repeat_interleave(self.model.num_heads, dim=0),
-        )
-        latent = self.model.bottleneck_scale * F.normalize(unscaled_latent, p=2, dim=2)
+            # Apply token dropout
+            if (self.cfg.token_dropout_p > 0.0) and self.training:
+                mask = (
+                    torch.rand_like(hidden_states[:, :, 0]) < self.cfg.token_dropout_p
+                )
+                mask = einx.rearrange("b n -> b n d", mask, d=hidden_states.shape[-1])
+                hidden_states = hidden_states.masked_fill(mask, 0.0)
 
-        return {"sentence_embedding": latent.squeeze(1)}
+            # Apply MHA bottleneck (cross-attention with mean-pooled query)
+            attention_mask = batch["attention_mask"]
+            hidden_states = hidden_states.repeat(
+                attention_mask.shape[0] // hidden_states.shape[0], 1, 1
+            ) 
+            mask_expanded = (
+                attention_mask.to(dtype=hidden_states.dtype)
+                .unsqueeze(-1)
+                .expand(hidden_states.shape)
+            )
+            mean_pooled_embedding = torch.sum(
+                hidden_states * mask_expanded, 1
+            ) / torch.clamp(mask_expanded.sum(1), min=1e-9)
+            unscaled_latent, attn_weights = self.model.bottleneck(
+                mean_pooled_embedding.unsqueeze(1),
+                hidden_states,
+                hidden_states,
+                need_weights=False,
+                attn_mask=attention_mask.to(dtype=hidden_states.dtype)
+                .unsqueeze(1)
+                .repeat_interleave(self.model.num_heads, dim=0),
+            )
+
+            # Optionally normalize latent code
+            if self.cfg.normalize:
+                latent = self.model.bottleneck_scale * F.normalize(
+                    unscaled_latent, p=2, dim=2
+                )
+            else:
+                latent = unscaled_latent
+
+            return latent.squeeze(1)

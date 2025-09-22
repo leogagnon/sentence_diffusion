@@ -1,0 +1,10 @@
+task/ae: st5
+model_checkpoint: base
+task.ae.train_batch_size: 32
+accumulate_grad_batches: 8
+task.ae.decoder.prompt_generator_cfg.k: 8
+
+task.ae.has_noising: True, False
+tase.ae.decoder.prompt_generator_cfg.n_layers: 4,8
+
+sweep_id: st5_base_v2

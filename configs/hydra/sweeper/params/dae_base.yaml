@@ -1,0 +1,10 @@
+task/ae: dae
+model_checkpoint: base
+task.ae.train_batch_size: 32
+accumulate_grad_batches: 8
+task.ae.decoder.prompt_generator_cfg.k: 8
+
+task.ae.encoder.normalize: True, False
+task.ae.has_noising: True, False
+
+sweep_id: dae_base_v2

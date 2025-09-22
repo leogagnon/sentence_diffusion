@@ -1,18 +1,23 @@
 train_batch_size: 32
 val_batch_size: 128
-lr: 1e-5
+lr: 1e-4
 max_generation_length: 150
 val_size: 256
+z_noise_alpha: 0.8
+z_dropout_p: 0.2
+has_noising: True
 
 encoder:
-  name: sentence-transformers/sentence-t5-xl # 1.5B params
-  k: 8
+  _target_: model.encoder.SentenceT5Encoder
+  name: sentence-transformers/sentence-t5-large # 1.5B params
+
+decoder:
+  name: gpt2-large # 1.5B params
   prompt_generator_cfg:
     n_layers: 6
     n_heads: 12
-
-decoder:
-  name: gpt2-xl # 1.5B params
+    input_dim: null # to be set dynamically
+    k: 8
   lora_cfg: 
     r: 128
     lora_alpha: 32
@@ -23,5 +28,5 @@ decoder:
 dataset:
   path: data/
 
-name: dglm
+name: st5
 

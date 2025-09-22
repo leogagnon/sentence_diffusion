@@ -1,25 +1,31 @@
 train_batch_size: 32
 val_batch_size: 128
-lr: 1e-5
+lr: 1e-4
 max_generation_length: 150
 val_size: 256
+z_noise_alpha: 0.8
+z_dropout_p: 0.2
+has_noising: True
 
 encoder:
-  name: thesephist/contra-bottleneck-t5-xl-wikipedia
-  k: 8
-  prompt_generator_cfg:
-    n_layers: 6
-    n_heads: 12
+  _target_: model.encoder.DAEEncoder
+  name: thesephist/contra-bottleneck-t5-large-wikipedia
+  normalize: False
+  token_dropout_p: 0.3
   lora_cfg: 
     r: 128
     lora_alpha: 32
     target_modules: ["q", "v", "o", "wi", "wo"]
     lora_dropout: 0.1
     bias: "none"
-  
 
 decoder:
-  name: gpt2-xl # 1.5B params
+  name: gpt2-large # 1.5B params
+  prompt_generator_cfg:
+    n_layers: 6
+    n_heads: 12
+    input_dim: null # to be set dynamically
+    k: 8
   lora_cfg: 
     r: 128
     lora_alpha: 32
@@ -30,5 +36,5 @@ decoder:
 dataset:
   path: data/
 
-name: dae
+name: st5
 
