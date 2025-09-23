@@ -3,7 +3,7 @@
 #SBATCH --cpus-per-task=1
 #SBATCH --mem=64G
 #SBATCH --partition=long
-#SBATCH --gres=gpu:a100l:1
+#SBATCH --gres=gpu:l40s:1
 
 export SBATCH_OUTPUT="logs/$1.out"
 

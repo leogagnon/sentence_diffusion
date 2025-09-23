@@ -105,9 +105,11 @@ class DecoderModel(nn.Module):
             ).past_key_values
             # Position of the BOS should be after the prefix (like in training)
             cache_position = torch.tensor([prompt.shape[1]], device=z.device)
+            attention_mask = torch.ones((z.shape[0], prompt.shape[1] + 1), device=z.device)
         else:
             cache = None
             cache_position = None
+            attention_mask = None
 
         # Autoregressive generation from BOS token with cached z (nucleus sampling)
         bos = torch.full(
@@ -120,6 +122,7 @@ class DecoderModel(nn.Module):
             input_ids=bos,
             past_key_values=cache,
             cache_position=cache_position,
+            attention_mask=attention_mask,
             max_length=max_length,
             do_sample=True,
             top_p=0.92,
