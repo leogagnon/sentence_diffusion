@@ -14,6 +14,7 @@ from x_transformers import Encoder
 from x_transformers.x_transformers import AttentionLayers, ScaledSinusoidalEmbedding
 import torch
 from typing import Optional
+from einops.layers.torch import Rearrange
 
 
 @dataclass
@@ -21,7 +22,7 @@ class PromptGeneratorConfig:
     n_layers: int
     n_heads: int
     k: int
-    input_dim: Optional[int] = None # has to be set
+    input_dim: Optional[int] = None  # has to be set
 
 
 @dataclass
@@ -39,11 +40,7 @@ class DecoderModel(nn.Module):
         self.cfg = cfg
 
         # Init causal LM backbone
-        self.backbone = AutoModelForCausalLM.from_pretrained(
-            cfg.name,
-            attn_implementation="flash_attention_2",
-            torch_dtype=torch.float16,
-        )
+        self.backbone = AutoModelForCausalLM.from_pretrained(cfg.name)
         if self.cfg.lora_cfg != None:
             self.backbone = get_peft_model(
                 self.backbone,
@@ -58,34 +55,30 @@ class DecoderModel(nn.Module):
                 len(self.tokenizer), mean_resizing=True
             )
 
-        # Init prompt generator
-        hidden_size = self.backbone.config.hidden_size
-        self.input_proj = nn.Linear(
-            cfg.prompt_generator_cfg.input_dim,
-            hidden_size * cfg.prompt_generator_cfg.k,
-            bias=False,
+        # Init prompt generator (project up, chunk, project up again, process with transformer)
+        pre_proj_dim = 128
+        self.prompt_generator = nn.Sequential(
+            nn.Linear(
+                cfg.prompt_generator_cfg.input_dim,
+                cfg.prompt_generator_cfg.k * pre_proj_dim,
+                bias=False,
+            ),
+            Rearrange("b (l d) -> b l d", l=cfg.prompt_generator_cfg.k, d=pre_proj_dim),
+            nn.Linear(pre_proj_dim, self.backbone.config.hidden_size, bias=False),
+            AttentionLayers(
+                dim=self.backbone.config.hidden_size,
+                depth=cfg.prompt_generator_cfg.n_layers,
+                heads=cfg.prompt_generator_cfg.n_heads,
+                causal=False,
+            ),
         )
-
-        self.prompt_generator = AttentionLayers(
-            dim=hidden_size,
-            depth=cfg.prompt_generator_cfg.n_layers,
-            heads=cfg.prompt_generator_cfg.n_heads,
-            causal=False,
-        )
-
-    def generate_prompt(self, z):
-
-        z = self.input_proj(z)
-        z = einx.rearrange("b (k d) -> b k d", z, k=self.cfg.prompt_generator_cfg.k)
-
-        return self.prompt_generator(z)
 
     def forward(self, input_ids, z: Optional[torch.Tensor] = None):
         if z == None:
             return self.backbone(input_ids=input_ids).logits
         else:
             # Compute input embeddings
-            prompt = self.generate_prompt(z)
+            prompt = self.prompt_generator(z)
             input_embeds = self.backbone.get_input_embeddings()(input_ids)
             input_embeds = torch.cat([prompt, input_embeds], dim=1)
 
@@ -105,13 +98,13 @@ class DecoderModel(nn.Module):
 
         if z != None:
             # Compute cache for z
-            prompt = self.generate_prompt(z)
+            prompt = self.prompt_generator(z)
             cache = self.backbone(
                 inputs_embeds=prompt,
                 use_cache=True,
             ).past_key_values
             # Position of the BOS should be after the prefix (like in training)
-            cache_position = torch.tensor([z.shape[1]])
+            cache_position = torch.tensor([prompt.shape[1]], device=z.device)
         else:
             cache = None
             cache_position = None

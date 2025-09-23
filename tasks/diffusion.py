@@ -90,7 +90,6 @@ class GaussianDiffusionTask(L.LightningModule):
             ),
             strict=False,
         )
-
         self.train_indices = ae_task.train_indices
         self.val_indices = ae_task.val_indices
         self.dataset = ae_task.dataset

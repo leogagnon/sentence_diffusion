@@ -137,7 +137,7 @@ def main(cfg: Optional[TrainConfig] = None, run_id: Optional[str] = None):
         max_epochs=cfg.max_epochs,
         log_every_n_steps=50,
         accumulate_grad_batches=cfg.accumulate_grad_batches,
-        precision="16-mixed",
+        precision="bf16-mixed",
     )
     trainer.fit(
         model=task,

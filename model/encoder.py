@@ -69,14 +69,19 @@ class SentenceT5Encoder(EncoderModel):
 
         return z
 
+@dataclass
+class CompressorConfig:
+    n_layers: int
+    n_heads: int
+    dim: int
 
 @dataclass
 class DAEEncoderConfig:
     name: str
     normalize: bool
     token_dropout_p: float
+    compressor_cfg: Optional[CompressorConfig] = None
     lora_cfg: Optional[dict] = None
-
 
 class DAEEncoder(EncoderModel):
     def __init__(self, cfg: Optional[DAEEncoderConfig] = None, **kwargs):
@@ -91,6 +96,23 @@ class DAEEncoder(EncoderModel):
         # Remove decoder and LM head, we only need the encoder + bottleneck
         del self.model.decoder, self.model.dec_emb, self.model.lm_head
 
+        if cfg.compressor_cfg != None:
+            del self.model.bottleneck
+            self.compressor_proj = nn.Linear(
+                self.model.encoder.config.d_model, cfg.compressor_cfg.dim, bias=False
+            )
+            self.compressor = AttentionLayers(
+                dim=cfg.compressor_cfg.dim,
+                depth=cfg.compressor_cfg.n_layers,
+                heads=cfg.compressor_cfg.n_heads,
+                cross_attend=True,
+                causal=False,
+            )
+            self.placeholder = nn.Parameter(
+                torch.randn(1, cfg.compressor_cfg.dim), requires_grad=True
+            )
+
+
         if cfg.lora_cfg != None:
             self.model = get_peft_model(
                 self.model,
@@ -104,7 +126,10 @@ class DAEEncoder(EncoderModel):
 
     @property
     def latent_dim(self):
-        return self.model.bottleneck.out_proj.out_features
+        if self.cfg.compressor_cfg != None:
+            return self.cfg.compressor_cfg.dim
+        else:
+            return self.model.bottleneck.out_proj.out_features
 
     def forward(self, input_ids, attention_mask=None):
         with torch.no_grad() if self.cfg.lora_cfg is None else nullcontext():
@@ -115,6 +140,7 @@ class DAEEncoder(EncoderModel):
                 "attention_mask": attention_mask
             }
             hidden_states = self.model.encoder(**batch).last_hidden_state
+            attention_mask = batch["attention_mask"]
 
             # Apply token dropout
             if (self.cfg.token_dropout_p > 0.0) and self.training:
@@ -124,35 +150,40 @@ class DAEEncoder(EncoderModel):
                 mask = einx.rearrange("b n -> b n d", mask, d=hidden_states.shape[-1])
                 hidden_states = hidden_states.masked_fill(mask, 0.0)
 
-            # Apply MHA bottleneck (cross-attention with mean-pooled query)
-            attention_mask = batch["attention_mask"]
-            hidden_states = hidden_states.repeat(
-                attention_mask.shape[0] // hidden_states.shape[0], 1, 1
-            ) 
-            mask_expanded = (
-                attention_mask.to(dtype=hidden_states.dtype)
-                .unsqueeze(-1)
-                .expand(hidden_states.shape)
-            )
-            mean_pooled_embedding = torch.sum(
-                hidden_states * mask_expanded, 1
-            ) / torch.clamp(mask_expanded.sum(1), min=1e-9)
-            unscaled_latent, attn_weights = self.model.bottleneck(
-                mean_pooled_embedding.unsqueeze(1),
-                hidden_states,
-                hidden_states,
-                need_weights=False,
-                attn_mask=attention_mask.to(dtype=hidden_states.dtype)
-                .unsqueeze(1)
-                .repeat_interleave(self.model.num_heads, dim=0),
-            )
-
-            # Optionally normalize latent code
-            if self.cfg.normalize:
-                latent = self.model.bottleneck_scale * F.normalize(
-                    unscaled_latent, p=2, dim=2
-                )
+            if self.cfg.compressor_cfg != None:
+                # Apply cross-attention bottleneck with learned placeholders as queries
+                hidden_states = self.compressor_proj(hidden_states)
+                placeholders = einx.rearrange("1 d -> b 1 d", self.placeholder, b=hidden_states.shape[0])
+                latent = self.compressor(placeholders, context=hidden_states, context_mask=attention_mask)
             else:
-                latent = unscaled_latent
+                # Apply MHA bottleneck (cross-attention with mean-pooled query)
+                hidden_states = hidden_states.repeat(
+                    attention_mask.shape[0] // hidden_states.shape[0], 1, 1
+                ) 
+                mask_expanded = (
+                    attention_mask.to(dtype=hidden_states.dtype)
+                    .unsqueeze(-1)
+                    .expand(hidden_states.shape)
+                )
+                mean_pooled_embedding = torch.sum(
+                    hidden_states * mask_expanded, 1
+                ) / torch.clamp(mask_expanded.sum(1), min=1e-9)
+                unscaled_latent, attn_weights = self.model.bottleneck(
+                    mean_pooled_embedding.unsqueeze(1),
+                    hidden_states,
+                    hidden_states,
+                    need_weights=False,
+                    attn_mask=attention_mask.to(dtype=hidden_states.dtype)
+                    .unsqueeze(1)
+                    .repeat_interleave(self.model.num_heads, dim=0),
+                )
+
+                # Optionally normalize latent code
+                if self.cfg.normalize:
+                    latent = self.model.bottleneck_scale * F.normalize(
+                        unscaled_latent, p=2, dim=2
+                    )
+                else:
+                    latent = unscaled_latent
 
             return latent.squeeze(1)

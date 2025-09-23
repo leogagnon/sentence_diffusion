@@ -12,6 +12,10 @@ encoder:
   name: thesephist/contra-bottleneck-t5-large-wikipedia
   normalize: True
   token_dropout_p: 0.3
+  compressor_cfg:
+    n_layers: 1
+    n_heads: 8
+    dim: 6144
   lora_cfg: 
     r: 128
     lora_alpha: 32
@@ -36,5 +40,5 @@ decoder:
 dataset:
   path: data/
 
-name: st5
+name: dae_compressor
 

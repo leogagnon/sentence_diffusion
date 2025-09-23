@@ -1,8 +1,8 @@
-train_batch_size: 32
-val_batch_size: 128
+train_batch_size: 16
+val_batch_size: 64
 lr: 1e-4
-max_generation_length: 150
-val_size: 256
+max_generation_length: 100
+val_size: 512
 z_noise_alpha: 0.8
 z_dropout_p: 0.2
 has_noising: True

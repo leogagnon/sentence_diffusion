@@ -130,11 +130,11 @@ class AETask(L.LightningModule):
                 z = z.masked_fill(mask, 0.0)
 
         # Get embeddings of input_ids
-        logits = self.decoder(batch["input_ids_dec"], z)
+        logits = self.decoder(input_ids=batch["input_ids_dec"], z=z)
 
         # Ignore padding tokens
         targets = batch["input_ids_dec"].masked_fill(
-            batch["attention_mask_dec"] == 0, -1
+            batch["attention_mask_dec"] == 0, -100
         )
 
         logits = logits[:, :-1].contiguous()
@@ -144,7 +144,7 @@ class AETask(L.LightningModule):
         recon_loss = torch.nn.functional.cross_entropy(
             logits.view(-1, logits.size(-1)),
             targets.view(-1),
-            ignore_index=-1,
+            ignore_index=-100,
         )
 
         self.log("train/reconstruction_loss", recon_loss, on_epoch=False, on_step=True)

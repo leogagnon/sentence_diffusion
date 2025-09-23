@@ -29,28 +29,28 @@ from transformers.modeling_outputs import BaseModelOutput
 from transformers.models.bart.modeling_bart import BartForConditionalGeneration
 from x_transformers.x_transformers import (
     AbsolutePositionalEmbedding,
+    AttentionLayers,
     Encoder,
     ScaledSinusoidalEmbedding,
     init_zero_,
 )
+from torch.nn import Sequential
 
 
 @dataclass
 class DiTConfig:
     n_layers: int
     n_heads: int
+    n_embd: int
+    seq_len: int
+    latent_dim: Optional[Tuple[int]] = None
 
-    latent_shape: Optional[Tuple[int]] = None # not actually optional, will should be set automatically if None 
-
-    n_embd: Optional[int] = None # if None, set to latent_shape[-1]
     dropout: float = 0.0
     seq_conditional: bool = False
     seq_conditional_dim: Optional[int] = None
     class_conditional: bool = False
     num_classes: int = 0
     cond_modulation: Optional[bool] = False
-
-    # DDPM features
     seq_unconditional_prob: Optional[float] = 0.1
     class_unconditional_prob: Optional[float] = 0.1
     self_condition: Optional[bool] = False
@@ -68,14 +68,9 @@ class DiT(nn.Module):
 
         self.cfg = cfg
 
-        assert isinstance(cfg.latent_shape, Iterable) and (len(cfg.latent_shape) == 2)
-        if self.cfg.n_embd == None:
-            self.cfg.n_embd = cfg.latent_shape[1]
-
-        # Init model
+        # Time embedding stuff
         sinu_pos_emb = ScaledSinusoidalEmbedding(self.cfg.n_embd)
         fourier_dim = self.cfg.n_embd
-
         time_emb_dim = self.cfg.n_embd * 4
         self.time_mlp = nn.Sequential(
             sinu_pos_emb,
@@ -83,13 +78,13 @@ class DiT(nn.Module):
             nn.GELU(),
             nn.Linear(time_emb_dim, time_emb_dim),
         )
-        self.time_pos_embed_mlp = nn.Sequential(
-            nn.GELU(), nn.Linear(time_emb_dim, self.cfg.n_embd)
-        )
 
+        # Positional embedding
         self.pos_emb = AbsolutePositionalEmbedding(self.cfg.n_embd, self.cfg.n_embd)
 
-        self.latent_encoder = Encoder(
+        # Actual Transformer
+        self.latent_encoder = AttentionLayers(
+            causal=False,
             dim=self.cfg.n_embd,
             depth=cfg.n_layers,
             heads=cfg.n_heads,
@@ -97,18 +92,17 @@ class DiT(nn.Module):
             ff_dropout=cfg.dropout,
             rel_pos_bias=False,
             ff_glu=True,
+            ff_swish=True,
             cross_attend=cfg.seq_conditional,
             # DiT adalnzero stuff
-            use_adaptive_layernorm=True,
+            use_adaptive_rmsnorm=True,
             use_adaptive_layerscale=True,
             dim_condition=time_emb_dim,
             adaptive_condition_mlp=True,
         )
 
+        # Conditionning stuff
         if cfg.class_conditional:
-            assert (
-                False
-            ), "Careful, never tested the class conditional setting for real."
             assert cfg.num_classes > 0
             self.class_embedding = nn.Sequential(
                 nn.Embedding(cfg.num_classes + 1, self.cfg.n_embd),
@@ -117,33 +111,42 @@ class DiT(nn.Module):
             self.class_unconditional_bernoulli = torch.distributions.Bernoulli(
                 probs=cfg.class_unconditional_prob
             )
+
         if cfg.seq_conditional:
             assert cfg.seq_conditional_dim != None
             self.null_embedding_cond = nn.Embedding(1, self.cfg.n_embd)
             self.cond_proj = nn.Linear(cfg.seq_conditional_dim, self.cfg.n_embd)
 
+            if cfg.cond_modulation:
+                self.adalnzero_cond_proj = nn.Sequential(
+                    nn.Linear(cfg.seq_conditional_dim, time_emb_dim),
+                    nn.GELU(),
+                    nn.Linear(time_emb_dim, time_emb_dim),
+                )
+                self.adalnzero_null_embedding = nn.Embedding(1, time_emb_dim)
+
+        # Input/output projections
+        assert cfg.latent_dim % 8 == 0, "Latent dimension must be divisible by 8"
+        pre_proj_dim = cfg.n_embd // 8
         if cfg.self_condition:
-            self.input_proj = nn.Linear(cfg.latent_shape[1] * 2, self.cfg.n_embd)
-            self.init_self_cond = nn.Parameter(torch.randn(1, cfg.latent_shape[1]))
+            input_dim = cfg.latent_dim * 2
+            self.init_self_cond = nn.Parameter(torch.randn(1, cfg.latent_dim))
             nn.init.normal_(self.init_self_cond, std=0.02)
         else:
-            self.input_proj = nn.Linear(cfg.latent_shape[1], self.cfg.n_embd)
+            input_dim = cfg.latent_dim
 
-        self.norm = nn.LayerNorm(self.cfg.n_embd)
-        self.output_proj = nn.Linear(
-            self.cfg.n_embd,
-            cfg.latent_shape[1],
+        self.input_proj = nn.Sequential(
+            nn.Linear(input_dim, cfg.seq_len * pre_proj_dim, bias=False),
+            Rearrange("b (l d) -> b l d", l=cfg.seq_len, d=pre_proj_dim),
+            nn.Linear(pre_proj_dim, cfg.n_embd, bias=False),
+        )
+        self.output_proj = nn.Sequential(
+            nn.Linear(cfg.n_embd, pre_proj_dim, bias=False),
+            Rearrange("b l d -> b (l d)"),
+            nn.Linear(cfg.seq_len * pre_proj_dim, input_dim, bias=False),
         )
 
-        if cfg.cond_modulation:
-            assert cfg.seq_conditional
-            self.adalnzero_cond_proj = nn.Sequential(
-                nn.Linear(cfg.seq_conditional_dim, time_emb_dim),
-                nn.GELU(),
-                nn.Linear(time_emb_dim, time_emb_dim),
-            )
-            self.adalnzero_null_embedding = nn.Embedding(1, time_emb_dim)
-
+        # Zero-out output projection
         init_zero_(self.output_proj)
 
     def forward(
@@ -157,18 +160,7 @@ class DiT(nn.Module):
         cond_mask=None,
     ):
 
-        time_emb = self.time_mlp(time[None] * 1000)
-
-        time_emb = rearrange(time_emb, "b d -> b 1 d")
-
-        if self.cfg.class_conditional:
-            assert class_id != None
-            class_emb = self.class_embedding(class_id)
-            class_emb = rearrange(class_emb, "b d -> b 1 d")
-            time_emb = time_emb + class_emb
-
-        pos_emb = self.pos_emb(x)
-
+        # Maybe concatenate self-conditionning
         if self.cfg.self_condition:
             if x_self_cond != None:
                 x = torch.cat((x, x_self_cond), dim=-1)
@@ -178,68 +170,17 @@ class DiT(nn.Module):
                 )
                 x = torch.cat((x, repeated_x_self_cond), dim=-1)
 
-        x_input = self.input_proj(x)
-        tx_input = x_input + pos_emb + self.time_pos_embed_mlp(time_emb)
+        # Project latent to (seq_len * n_embd) and add positional embeddings
+        x = self.input_proj(x)
+        x = x + self.pos_emb(x)
 
-        # Process conditionning
-        if self.cfg.seq_conditional:
-            context, context_mask = [], []
-            if (cond is None) & (cond_input_ids is None):
-                # If the model is conditional but no conditionning is passed, give <null_embedding_cond>
-                null_context = repeat(
-                    self.null_embedding_cond.weight, "1 d -> b 1 d", b=x.shape[0]
-                )
-                context.append(null_context)
-                context_mask.append(
-                    torch.tensor(
-                        [[True] for _ in range(x.shape[0])],
-                        dtype=bool,
-                        device=x.device,
-                    )
-                )
+        # Build the time embedding
+        time_emb = self.time_mlp(time[None] * 1000)
+        time_emb = rearrange(time_emb, "b d -> b 1 d")
 
-                if self.cfg.cond_modulation:
-                    condition = time_emb + repeat(
-                        self.adalnzero_null_embedding.weight,
-                        "1 d -> b 1 d",
-                        b=x.shape[0],
-                    )
-                else:
-                    condition = time_emb
+        # Pass through DiT
+        x = self.latent_encoder(x, condition=time_emb)
 
-            else:
-
-                context.append(self.cond_proj(cond))
-                context_mask.append(cond_mask)
-
-                # If conditionning the model on <cond> through adalnzero
-                if self.cfg.cond_modulation:
-                    pooled_cond = torch.where(
-                        repeat(cond_mask, "b l -> b l d", d=cond.shape[-1]),
-                        cond,
-                        0,
-                    )
-                    pooled_cond = pooled_cond / einops.repeat(
-                        cond_mask.sum(1), "b -> b () ()"
-                    )
-                    pooled_cond = pooled_cond.sum(1, keepdims=True)
-                    condition = time_emb + self.adalnzero_cond_proj(pooled_cond)
-                else:
-                    condition = time_emb
-
-            context = torch.cat(context, dim=1)
-            context_mask = torch.cat(context_mask, dim=1)
-
-            x = self.latent_encoder(
-                tx_input,
-                context=context,
-                context_mask=context_mask,
-                condition=condition,
-            )
-        else:
-            x = self.latent_encoder(tx_input, condition=time_emb)
-
-        x = self.norm(x)
         x = self.output_proj(x)
 
         return x
@@ -610,7 +551,7 @@ def sample(
     return sample_fn(
         model=model,
         shape=(batch_size,) + tuple(model.cfg.latent_shape),
-        class_id=class_id, 
+        class_id=class_id,
         cond=cond,
         cond_input_ids=cond_input_ids,
         cond_mask=cond_mask,
@@ -688,6 +629,7 @@ def get_sampling_schedule(name):
         return sigmoid_schedule
     else:
         raise ValueError(f"invalid noise schedule {name}")
+
 
 def loss_fn(name):
     if name == "l1":
