@@ -10,8 +10,13 @@ has_noising: True
 encoder:
   _target_: model.encoder.DAEEncoder
   name: thesephist/contra-bottleneck-t5-large-wikipedia
-  normalize: True
+  normalize: False
   token_dropout_p: 0.3
+  compressor_cfg:
+    n_layers: 4
+    n_heads: 8
+    dim: 1280
+    k: 16
   lora_cfg: 
     r: 128
     lora_alpha: 32
@@ -21,11 +26,7 @@ encoder:
 
 decoder:
   name: gpt2-large # 1.5B params
-  prompt_generator_cfg:
-    n_layers: 6
-    n_heads: 12
-    input_dim: null # to be set dynamically
-    k: 16
+  prompt_generator_cfg: null
   lora_cfg: 
     r: 128
     lora_alpha: 32
@@ -36,5 +37,5 @@ decoder:
 dataset:
   path: data/
 
-name: dae_base
+name: dae_compressor
 

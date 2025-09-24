@@ -3,9 +3,7 @@ val_batch_size: 64
 lr: 1e-4
 max_generation_length: 100
 val_size: 512
-z_noise_alpha: 0.8
-z_dropout_p: 0.2
-has_noising: True
+z_noise_type: schedule
 
 encoder:
   _target_: model.encoder.SentenceT5Encoder
@@ -16,8 +14,9 @@ decoder:
   prompt_generator_cfg:
     n_layers: 6
     n_heads: 12
-    input_dim: null # to be set dynamically
     k: 8
+    noise_conditioning: true
+    default_alpha: 0.95  # delta^2=0.05 like in DGLM
   lora_cfg: 
     r: 128
     lora_alpha: 32

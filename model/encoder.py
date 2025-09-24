@@ -74,6 +74,7 @@ class CompressorConfig:
     n_layers: int
     n_heads: int
     dim: int
+    k: int = 1
 
 @dataclass
 class DAEEncoderConfig:
@@ -109,18 +110,18 @@ class DAEEncoder(EncoderModel):
                 causal=False,
             )
             self.placeholder = nn.Parameter(
-                torch.randn(1, cfg.compressor_cfg.dim), requires_grad=True
+                torch.randn(cfg.compressor_cfg.k, cfg.compressor_cfg.dim), requires_grad=True
             )
 
 
         if cfg.lora_cfg != None:
-            self.model = get_peft_model(
-                self.model,
+            self.model.encoder = get_peft_model(
+                self.model.encoder,
                 LoraConfig(**cfg.lora_cfg),
             )
         else:
-            self.model.requires_grad_(False)
-            self.model.eval()
+            self.model.encoder.requires_grad_(False)
+            self.model.encoder.eval()
 
         self.cfg = cfg
 
@@ -132,7 +133,7 @@ class DAEEncoder(EncoderModel):
             return self.model.bottleneck.out_proj.out_features
 
     def forward(self, input_ids, attention_mask=None):
-        with torch.no_grad() if self.cfg.lora_cfg is None else nullcontext():
+        with torch.no_grad() if (self.cfg.lora_cfg is None) else nullcontext():
             
             # Pass through T5 encoder
             batch = {
@@ -153,7 +154,7 @@ class DAEEncoder(EncoderModel):
             if self.cfg.compressor_cfg != None:
                 # Apply cross-attention bottleneck with learned placeholders as queries
                 hidden_states = self.compressor_proj(hidden_states)
-                placeholders = einx.rearrange("1 d -> b 1 d", self.placeholder, b=hidden_states.shape[0])
+                placeholders = einx.rearrange("k d -> b k d", self.placeholder, b=hidden_states.shape[0])
                 latent = self.compressor(placeholders, context=hidden_states, context_mask=attention_mask)
             else:
                 # Apply MHA bottleneck (cross-attention with mean-pooled query)
@@ -168,7 +169,7 @@ class DAEEncoder(EncoderModel):
                 mean_pooled_embedding = torch.sum(
                     hidden_states * mask_expanded, 1
                 ) / torch.clamp(mask_expanded.sum(1), min=1e-9)
-                unscaled_latent, attn_weights = self.model.bottleneck(
+                latent, attn_weights = self.model.bottleneck(
                     mean_pooled_embedding.unsqueeze(1),
                     hidden_states,
                     hidden_states,
@@ -178,12 +179,15 @@ class DAEEncoder(EncoderModel):
                     .repeat_interleave(self.model.num_heads, dim=0),
                 )
 
-                # Optionally normalize latent code
-                if self.cfg.normalize:
-                    latent = self.model.bottleneck_scale * F.normalize(
-                        unscaled_latent, p=2, dim=2
-                    )
-                else:
-                    latent = unscaled_latent
+            # Optionally normalize latent code
+            if self.cfg.normalize:
+                latent = F.normalize(
+                    latent, p=2, dim=2
+                )
+            else:
+                latent = latent
+        
+            if latent.shape[1] == 1:
+                latent = latent.squeeze(1)
 
-            return latent.squeeze(1)
+            return latent

@@ -14,7 +14,7 @@ from torch.utils.data.dataset import Subset
 from transformers import AutoTokenizer
 from transformers.models.auto.modeling_auto import AutoModelForCausalLM
 from peft import get_peft_model
-from model.gaussian_diffusion import DiTConfig, DiT
+from model.gaussian_diffusion import DiTConfig, DiT, right_pad_dims_to
 from data.stories import StoriesDatasetConfig, StoriesDataset
 from hydra.utils import instantiate
 from model.encoder import EncoderConfig, EncoderModel
@@ -24,6 +24,7 @@ import os
 import wandb
 from tasks.finetune import FinetuneTask
 import hydra
+from model.gaussian_diffusion import time_to_alpha, cosine_schedule
 
 
 @dataclass
@@ -36,15 +37,17 @@ class AETaskConfig:
     max_generation_length: int
     dataset: StoriesDatasetConfig
     val_size: int
-    z_noise_alpha: float
-    z_dropout_p: float
-    has_noising: bool = True
+
+    z_noise_type: str  # fixed, schedule
+    z_noise_alpha: float = 0.90
+    z_dropout_p: float = 0.0
+
     name: Optional[str] = None
 
 
 class AETask(L.LightningModule):
     """
-    Autoencoder Task. 
+    Autoencoder Task.
     """
 
     def __init__(self, cfg: Optional[AETaskConfig] = None, **kwargs):
@@ -60,9 +63,9 @@ class AETask(L.LightningModule):
 
         # Load encoder and decoder
         self.encoder = hydra.utils.instantiate(cfg.encoder)
-        cfg.decoder.prompt_generator_cfg.input_dim = self.encoder.latent_dim
+        cfg.decoder.input_dim = self.encoder.latent_dim
         self.decoder = DecoderModel(cfg.decoder)
-        
+
         for mod in self.decoder.modules():
             if isinstance(mod, torch.nn.Dropout):
                 mod.p = 0.0
@@ -83,6 +86,17 @@ class AETask(L.LightningModule):
         self.save_hyperparameters(
             OmegaConf.to_container(OmegaConf.structured(cfg)), logger=False
         )
+
+    def sample_alpha(self, z):
+        if self.cfg.z_noise_type == "fixed":
+            return torch.full(
+                size=(z.size(0),), fill_value=self.cfg.z_noise_alpha, device=z.device
+            )
+        elif self.cfg.z_noise_type == "schedule":
+            t = torch.zeros((z.size(0),), device=z.device).float().uniform_(0, 1.0)
+            return time_to_alpha(t=t, alpha_schedule=cosine_schedule, scale=3.0)
+        else:
+            raise ValueError(f"Unknown z_noise_type {self.cfg.z_noise_type}")
 
     def setup(self, **kwargs):
         """Setup the data"""
@@ -117,20 +131,20 @@ class AETask(L.LightningModule):
 
         z = self.encoder(batch["input_ids_enc"], batch["attention_mask_enc"])
 
-        # Add noise and dropout to latent code
-        # This helps make the decoder more robust
-        if self.cfg.has_noising:
-            if self.cfg.z_noise_alpha < 1.0:
-                z = self.cfg.z_noise_alpha * z + (
-                    1 - math.sqrt(self.cfg.z_noise_alpha)
-                ) * torch.randn_like(z)
+        # Add noise
+        alpha = None
+        if self.cfg.z_noise_type != None:
+            alpha = self.sample_alpha(z)
+            alpha = right_pad_dims_to(z, alpha)
+            z = alpha.sqrt() * z + (1 - alpha).sqrt() * torch.randn_like(z)
 
-            if self.cfg.z_dropout_p > 0.0:
-                mask = torch.rand_like(z) < self.cfg.z_dropout_p
-                z = z.masked_fill(mask, 0.0)
+        # Apply z dropout
+        if self.cfg.z_dropout_p > 0.0:
+            mask = torch.rand_like(z) < self.cfg.z_dropout_p
+            z = z.masked_fill(mask, 0.0)
 
         # Get embeddings of input_ids
-        logits = self.decoder(input_ids=batch["input_ids_dec"], z=z)
+        logits = self.decoder(input_ids=batch["input_ids_dec"], z=z, alpha=alpha)
 
         # Ignore padding tokens
         targets = batch["input_ids_dec"].masked_fill(
@@ -159,6 +173,10 @@ class AETask(L.LightningModule):
         # Encode input_ids
         z = self.encoder(batch["input_ids_enc"], batch["attention_mask_enc"])
 
+        self.log(
+            "val/latent_norm", z.norm(p=2, dim=-1).mean().detach().item(), on_epoch=True
+        )
+
         # Reconstruction loss of clean sample
         logits = self.decoder(batch["input_ids_dec"], z)
         targets = batch["input_ids_dec"].masked_fill(
@@ -174,15 +192,15 @@ class AETask(L.LightningModule):
         self.log("val/reconstruction_loss", recon_loss, on_epoch=True)
 
         # Reconstruction loss of noised sample
-        z_noised = 0.90 * z + (1 - math.sqrt(0.90)) * torch.randn_like(z)
-        logits = self.decoder(batch["input_ids_dec"], z_noised)
+        z_noised = math.sqrt(0.95) * z + math.sqrt(1 - 0.95) * torch.randn_like(z)
+        logits = self.decoder(batch["input_ids_dec"], z=z_noised)
         logits = logits[:, :-1].contiguous()
         recon_loss_noised = torch.nn.functional.cross_entropy(
             logits.view(-1, logits.size(-1)),
             targets.view(-1),
             ignore_index=-1,
         )
-        self.log("val/reconstruction_loss_noised", recon_loss_noised, on_epoch=True)        
+        self.log("val/reconstruction_loss_noised", recon_loss_noised, on_epoch=True)
 
         # Log some generation for the first batch
         if batch_idx == 0:

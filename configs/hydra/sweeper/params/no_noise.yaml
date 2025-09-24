@@ -1,11 +1,9 @@
-task/ae: dae
+task/ae: st5, dae, dae_compressor
 model_checkpoint: base
 task.ae.train_batch_size: 16
 task.ae.val_batch_size: 64
 accumulate_grad_batches: 16
 task.ae.decoder.prompt_generator_cfg.k: 16
+task.ae.has_noising: False
 
-task.ae.encoder.normalize: True, False
-task.ae.has_noising: True, False
-
-sweep_id: dae_base_v3
+sweep_id: no_noise
