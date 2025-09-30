@@ -18,6 +18,10 @@ encoder:
     n_layers: 1
     n_heads: 12
     k: 1
+  sem_cfg:
+    L: 128
+    V: 512
+    temp: 1.0
   lora_cfg: 
     r: 128
     lora_alpha: 32
@@ -31,15 +35,16 @@ decoder:
     n_layers: 5
     n_heads: 12
     k: 16
-    noise_conditioning: False
   lora_cfg: 
     r: 128
     lora_alpha: 32
     target_modules: ["c_attn", "mlp.c_fc", "mlp.c_proj"]
     lora_dropout: 0.1
-    bias: "none"  
+    bias: "none"
 
-name: dae_compressor
+name: dae_sem
 
 defaults:
   - dataset: wiki
+
+

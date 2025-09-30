@@ -42,6 +42,8 @@ class TrainConfig:
     early_stopping: Optional[dict] = None
     gradient_clip_val: float = 1.0
     name: Optional[str] = None
+    precision: str = "bf16-mixed" 
+    limit_val_batches: Optional[int] = None
 
 
 cs = ConfigStore.instance()
@@ -137,7 +139,8 @@ def main(cfg: Optional[TrainConfig] = None, run_id: Optional[str] = None):
         max_epochs=cfg.max_epochs,
         log_every_n_steps=50,
         accumulate_grad_batches=cfg.accumulate_grad_batches,
-        precision="bf16-mixed",
+        precision=cfg.precision,
+        limit_val_batches=cfg.limit_val_batches if cfg.limit_val_batches else 1.0,
     )
     trainer.fit(
         model=task,

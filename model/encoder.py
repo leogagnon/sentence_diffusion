@@ -61,133 +61,205 @@ class SentenceT5Encoder(EncoderModel):
 
     @torch.no_grad()
     def forward(self, input_ids, attention_mask=None):
-        batch = {
-            "input_ids": input_ids,
-            "attention_mask": attention_mask
-        }
+        batch = {"input_ids": input_ids, "attention_mask": attention_mask}
         z = self.backbone.forward(batch)["sentence_embedding"]
 
         return z
+
+
+class QwenEncoder(EncoderModel):
+    def __init__(self, cfg: Optional[EncoderConfig] = None, **kwargs):
+        super().__init__()
+
+        if cfg == None:
+            cfg = EncoderConfig(**kwargs)
+
+        self.backbone = AutoModel.from_pretrained(cfg.name)
+        if cfg.lora_cfg != None:
+            self.backbone = get_peft_model(
+                self.backbone,
+                LoraConfig(**cfg.lora_cfg),
+            )
+        else:
+            self.backbone.requires_grad_(False)
+            self.backbone.eval()
+
+        self.tokenizer = AutoTokenizer.from_pretrained(
+            cfg.name, padding_side="left"
+        )
+
+        self.cfg = cfg
+
+
+    @property
+    def latent_dim(self):
+        return self.backbone.config.hidden_size
+
+    def forward(self, input_ids, attention_mask=None):
+        # Encode input text into hidden states
+        with torch.no_grad() if (self.cfg.lora_cfg is None) else nullcontext():
+            batch = {"input_ids": input_ids, "attention_mask": attention_mask}
+            hidden_states = self.backbone(**batch).last_hidden_state
+            attention_mask = batch["attention_mask"]
+
+        # Take the last token's hidden state (assuming left padding)
+        return hidden_states[:, -1] 
+
+
+@dataclass
+class SEMHeadConfig:
+    L: int
+    V: int
+    temp: float
+    input_dim: Optional[int] = None
+
+
+class SEMHead(nn.Module):
+    def __init__(self, cfg: SEMHeadConfig):
+        super().__init__()
+        assert cfg.input_dim is not None, "input_dim has to be set"
+        self.proj_in = nn.Linear(cfg.input_dim, cfg.L * cfg.V)
+        self.norm = nn.LayerNorm(cfg.L * cfg.V, eps=1e-6)
+        self.proj_out = nn.Linear(cfg.L * cfg.V, cfg.input_dim)
+        self.cfg = cfg
+
+    def forward(self, x):
+        # x: (B, D)
+        x = self.proj_in(x)
+        x = self.norm(x)
+        x = einx.rearrange("b (l v) -> b l v", x, l=self.cfg.L, v=self.cfg.V)
+        x = torch.softmax(x / self.cfg.temp, dim=-1)
+        x = einx.rearrange("b l v -> b (l v)", x)
+        x = self.proj_out(x)
+
+        return x
+
 
 @dataclass
 class CompressorConfig:
     n_layers: int
     n_heads: int
-    dim: int
     k: int = 1
+
 
 @dataclass
 class DAEEncoderConfig:
     name: str
     normalize: bool
-    token_dropout_p: float
+    dropout_p: float
+    out_dim: int
+    input_dropout: bool = False
     compressor_cfg: Optional[CompressorConfig] = None
     lora_cfg: Optional[dict] = None
+    sem_cfg: Optional[SEMHeadConfig] = None
+
 
 class DAEEncoder(EncoderModel):
     def __init__(self, cfg: Optional[DAEEncoderConfig] = None, **kwargs):
         super().__init__()
         if cfg == None:
             cfg = DAEEncoderConfig(**kwargs)
-        self.model = AutoModelForCausalLM.from_pretrained(
+        self.backbone = AutoModelForCausalLM.from_pretrained(
             cfg.name, trust_remote_code=True
-        )
+        ).encoder
         self.tokenizer = T5Tokenizer.from_pretrained(cfg.name)
 
-        # Remove decoder and LM head, we only need the encoder + bottleneck
-        del self.model.decoder, self.model.dec_emb, self.model.lm_head
+        self.out_proj = nn.Linear(self.backbone.config.d_model, cfg.out_dim, bias=False)
 
         if cfg.compressor_cfg != None:
-            del self.model.bottleneck
-            self.compressor_proj = nn.Linear(
-                self.model.encoder.config.d_model, cfg.compressor_cfg.dim, bias=False
-            )
             self.compressor = AttentionLayers(
-                dim=cfg.compressor_cfg.dim,
+                dim=self.backbone.config.d_model,
                 depth=cfg.compressor_cfg.n_layers,
                 heads=cfg.compressor_cfg.n_heads,
                 cross_attend=True,
                 causal=False,
             )
-            self.placeholder = nn.Parameter(
-                torch.randn(cfg.compressor_cfg.k, cfg.compressor_cfg.dim), requires_grad=True
-            )
-
 
         if cfg.lora_cfg != None:
-            self.model.encoder = get_peft_model(
-                self.model.encoder,
+            self.backbone = get_peft_model(
+                self.backbone,
                 LoraConfig(**cfg.lora_cfg),
             )
         else:
-            self.model.encoder.requires_grad_(False)
-            self.model.encoder.eval()
+            self.backbone.requires_grad_(False)
+            self.backbone.eval()
+
+        if cfg.sem_cfg != None:
+            if cfg.compressor_cfg != None:
+                assert (
+                    cfg.compressor_cfg.k == 1
+                ), "SEM only compatible with k=1 compressor for now"
+
+            cfg.sem_cfg.input_dim = cfg.out_dim
+            self.sem = SEMHead(cfg.sem_cfg)
 
         self.cfg = cfg
 
     @property
     def latent_dim(self):
-        if self.cfg.compressor_cfg != None:
-            return self.cfg.compressor_cfg.dim
-        else:
-            return self.model.bottleneck.out_proj.out_features
+        return self.cfg.out_dim
 
     def forward(self, input_ids, attention_mask=None):
+        # Encode input text into hidden states
         with torch.no_grad() if (self.cfg.lora_cfg is None) else nullcontext():
-            
-            # Pass through T5 encoder
-            batch = {
-                "input_ids": input_ids,
-                "attention_mask": attention_mask
-            }
-            hidden_states = self.model.encoder(**batch).last_hidden_state
+
+            if self.cfg.input_dropout and (self.cfg.dropout_p > 0.0) and self.training:
+                mask = (
+                    torch.rand_like(input_ids, dtype=torch.float) < self.cfg.dropout_p
+                )
+                input_ids = input_ids.masked_fill(mask, self.tokenizer.unk_token_id)
+
+            batch = {"input_ids": input_ids, "attention_mask": attention_mask}
+            hidden_states = self.backbone(**batch).last_hidden_state
             attention_mask = batch["attention_mask"]
 
             # Apply token dropout
-            if (self.cfg.token_dropout_p > 0.0) and self.training:
-                mask = (
-                    torch.rand_like(hidden_states[:, :, 0]) < self.cfg.token_dropout_p
-                )
+            if (self.cfg.input_dropout == False) & (
+                self.cfg.dropout_p > 0.0
+            ) and self.training:
+                mask = torch.rand_like(hidden_states[:, :, 0]) < self.cfg.dropout_p
                 mask = einx.rearrange("b n -> b n d", mask, d=hidden_states.shape[-1])
                 hidden_states = hidden_states.masked_fill(mask, 0.0)
 
-            if self.cfg.compressor_cfg != None:
-                # Apply cross-attention bottleneck with learned placeholders as queries
-                hidden_states = self.compressor_proj(hidden_states)
-                placeholders = einx.rearrange("k d -> b k d", self.placeholder, b=hidden_states.shape[0])
-                latent = self.compressor(placeholders, context=hidden_states, context_mask=attention_mask)
-            else:
-                # Apply MHA bottleneck (cross-attention with mean-pooled query)
-                hidden_states = hidden_states.repeat(
-                    attention_mask.shape[0] // hidden_states.shape[0], 1, 1
-                ) 
-                mask_expanded = (
-                    attention_mask.to(dtype=hidden_states.dtype)
-                    .unsqueeze(-1)
-                    .expand(hidden_states.shape)
-                )
-                mean_pooled_embedding = torch.sum(
-                    hidden_states * mask_expanded, 1
-                ) / torch.clamp(mask_expanded.sum(1), min=1e-9)
-                latent, attn_weights = self.model.bottleneck(
-                    mean_pooled_embedding.unsqueeze(1),
-                    hidden_states,
-                    hidden_states,
-                    need_weights=False,
-                    attn_mask=attention_mask.to(dtype=hidden_states.dtype)
-                    .unsqueeze(1)
-                    .repeat_interleave(self.model.num_heads, dim=0),
-                )
+        # Compute mean-pooled embedding
+        hidden_states = hidden_states.repeat(
+            attention_mask.shape[0] // hidden_states.shape[0], 1, 1
+        )
+        mask_expanded = (
+            attention_mask.to(dtype=hidden_states.dtype)
+            .unsqueeze(-1)
+            .expand(hidden_states.shape)
+        )
+        mean_pooled_embedding = torch.sum(
+            hidden_states * mask_expanded, 1
+        ) / torch.clamp(mask_expanded.sum(1), min=1e-9)
+        mean_pooled_embedding = mean_pooled_embedding.unsqueeze(1)
 
-            # Optionally normalize latent code
-            if self.cfg.normalize:
-                latent = F.normalize(
-                    latent, p=2, dim=2
-                )
-            else:
-                latent = latent
-        
-            if latent.shape[1] == 1:
-                latent = latent.squeeze(1)
+        # Maybe cross-attend with hidden states to get latent code
+        if self.cfg.compressor_cfg != None:
+            latent = self.compressor(
+                mean_pooled_embedding,
+                context=hidden_states,
+                context_mask=attention_mask,
+            )
+        else:
+            latent = mean_pooled_embedding
 
-            return latent
+        # Project to output dimension
+        latent = self.out_proj(latent)
+
+        if self.cfg.sem_cfg != None:
+            assert self.cfg.normalize == False, "SEM not compatible with normalization"
+
+            latent = self.sem(latent.squeeze(1)).unsqueeze(1)
+
+        # Optionally normalize latent code
+        if self.cfg.normalize:
+            latent = F.normalize(latent, p=2, dim=2)
+        else:
+            latent = latent
+
+        if latent.shape[1] == 1:
+            latent = latent.squeeze(1)
+
+        return latent

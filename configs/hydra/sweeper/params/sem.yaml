@@ -1,0 +1,11 @@
+task/ae: dae_sem
+model_checkpoint: base
+task.ae.train_batch_size: 16
+task.ae.val_batch_size: 64
+accumulate_grad_batches: 16
+task.ae.z_noise_type: fixed,
+task.ae.z_noise_alpha: 0.7
+task.ae.z_dropout_p: 0.05, 0.2
+
+
+sweep_id: sem_v1

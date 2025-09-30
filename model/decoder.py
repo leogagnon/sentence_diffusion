@@ -1,5 +1,6 @@
 from abc import ABC, abstractmethod
 from functools import partial
+import math
 import os
 import einx
 from peft.mapping_func import get_peft_model
@@ -25,7 +26,7 @@ class PromptGeneratorConfig:
     n_layers: int
     n_heads: int
     k: int
-    noise_conditioning: bool
+    noise_conditioning: bool = False
     default_alpha: float = 0.95  # delta^2=0.05 like in DGLM
 
 
@@ -51,6 +52,9 @@ class DecoderModel(nn.Module):
                 self.backbone,
                 LoraConfig(**self.cfg.lora_cfg),
             )
+        else:
+            self.backbone.requires_grad_(False)
+            self.backbone.eval()
 
         # Init tokenizer and add pad token if missing
         self.tokenizer = AutoTokenizer.from_pretrained(cfg.name)
@@ -82,21 +86,15 @@ class DecoderModel(nn.Module):
                     heads=cfg.prompt_generator_cfg.n_heads,
                     causal=False,
                     use_adaptive_rmsnorm=True,
+                    use_adaptive_layerscale=True,
                     ff_swish=True,
                     ff_glu=True,
+                    dim_condition=self.backbone.config.hidden_size * 4,
+                    adaptive_condition_mlp=True,
+                    attn_qk_norm=True,
+                    attn_qk_norm_dim_scale=True,
                 )
-                self.prompt_generator["noise_embd"] = nn.Sequential(
-                    ScaledSinusoidalEmbedding(self.backbone.config.hidden_size),
-                    nn.Linear(
-                        self.backbone.config.hidden_size,
-                        self.backbone.config.hidden_size * 4,
-                    ),
-                    nn.GELU(),
-                    nn.Linear(
-                        self.backbone.config.hidden_size * 4,
-                        self.backbone.config.hidden_size,
-                    ),
-                )
+                self.prompt_generator["noise_embd"] = ScaledSinusoidalEmbedding(self.backbone.config.hidden_size)
             else:
                 self.prompt_generator["encoder"] = Encoder(
                     dim=self.backbone.config.hidden_size,
@@ -127,7 +125,7 @@ class DecoderModel(nn.Module):
             if alpha is None:
                 # If no alpha is given, use default value (e.g. at inference)
                 alpha = torch.full(
-                    (z.shape[0],),
+                    (z.shape[0], 1),
                     self.cfg.prompt_generator_cfg.default_alpha,
                     device=z.device,
                 )

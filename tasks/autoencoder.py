@@ -35,10 +35,10 @@ class AETaskConfig:
     encoder: dict
     decoder: DecoderConfig
     max_generation_length: int
-    dataset: StoriesDatasetConfig
+    dataset: dict
     val_size: int
 
-    z_noise_type: str  # fixed, schedule
+    z_noise_type: str = "none"  # fixed, schedule, none
     z_noise_alpha: float = 0.90
     z_dropout_p: float = 0.0
 
@@ -71,15 +71,11 @@ class AETask(L.LightningModule):
                 mod.p = 0.0
 
         # Setup dataset
-        self.dataset = StoriesDataset(
-            cfg.dataset,
-            dec_tokenizer=self.decoder.tokenizer,
-            enc_tokenizer=self.encoder.tokenizer,
-        )
+        self.dataset = hydra.utils.instantiate(cfg.dataset)
 
         indices = torch.randperm(len(self.dataset))
-        self.register_buffer("train_indices", indices[:-4096])
-        self.register_buffer("val_indices", indices[-4096:])
+        self.register_buffer("train_indices", indices[: -cfg.val_size])
+        self.register_buffer("val_indices", indices[-cfg.val_size :])
 
         self.cfg = cfg
 
@@ -101,29 +97,43 @@ class AETask(L.LightningModule):
     def setup(self, **kwargs):
         """Setup the data"""
         self.train_data = Subset(self.dataset, indices=self.train_indices)
-        self.val_data = Subset(
-            self.dataset, indices=self.val_indices[: self.cfg.val_size]
-        )
+        self.val_data = Subset(self.dataset, indices=self.val_indices)
 
     def train_dataloader(self):
         return DataLoader(
             self.train_data,
             batch_size=self.cfg.train_batch_size,
+            num_workers=len(os.sched_getaffinity(0)),
+            pin_memory=True,
+            persistent_workers=True,
             shuffle=True,
-            collate_fn=lambda x: x,
+            collate_fn=self.dataset.get_collate_and_tokenize_fn(
+                enc_tokenizer=self.encoder.tokenizer,
+                dec_tokenizer=self.decoder.tokenizer,
+            ),
         )
 
     def val_dataloader(self):
         return DataLoader(
             self.val_data,
             batch_size=self.cfg.val_batch_size,
+            num_workers=len(os.sched_getaffinity(0)),
+            pin_memory=True,
+            persistent_workers=False,
             shuffle=False,
-            collate_fn=lambda x: x,
+            collate_fn=self.dataset.get_collate_and_tokenize_fn(
+                enc_tokenizer=self.encoder.tokenizer,
+                dec_tokenizer=self.decoder.tokenizer,
+            ),
         )
 
     def configure_optimizers(self):
         optimizer = torch.optim.AdamW(self.parameters(), lr=self.cfg.lr)
         return optimizer
+
+    def on_train_batch_end(self, outputs, batch, batch_idx):
+        if self.global_step % 50 == 0:
+            torch.cuda.empty_cache()
 
     def training_step(self, batch, batch_idx):
 
@@ -133,7 +143,7 @@ class AETask(L.LightningModule):
 
         # Add noise
         alpha = None
-        if self.cfg.z_noise_type != None:
+        if self.cfg.z_noise_type != "none":
             alpha = self.sample_alpha(z)
             alpha = right_pad_dims_to(z, alpha)
             z = alpha.sqrt() * z + (1 - alpha).sqrt() * torch.randn_like(z)

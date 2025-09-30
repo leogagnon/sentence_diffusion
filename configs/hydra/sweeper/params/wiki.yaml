@@ -1,0 +1,9 @@
+task/ae: dae_compressor, dae_compressor_norm, dae_long_context, dae_pool, dae_pool_norm, dae_sem, st5, qwen
+model_checkpoint: base
+task.ae.train_batch_size: 16
+task.ae.val_batch_size: 64
+accumulate_grad_batches: 16
+precision: bf16-mixed
+limit_val_batches: 4
+
+sweep_id: wiki_v0

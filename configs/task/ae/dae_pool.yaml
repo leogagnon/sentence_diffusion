@@ -1,22 +1,19 @@
 train_batch_size: 16
-val_batch_size: 64
+val_batch_size: 32
 lr: 1e-4
-max_generation_length: 100
-val_size: 512
-z_noise_alpha: 0.8
+max_generation_length: 128
+val_size: 16384
+z_noise_type: fixed
+z_noise_alpha: 0.9
 z_dropout_p: 0.2
-has_noising: True
 
 encoder:
   _target_: model.encoder.DAEEncoder
-  name: thesephist/contra-bottleneck-t5-large-wikipedia
+  name: thesephist/contra-bottleneck-t5-xl-wikipedia
   normalize: False
-  token_dropout_p: 0.3
-  compressor_cfg:
-    n_layers: 4
-    n_heads: 8
-    dim: 1280
-    k: 16
+  dropout_p: 0.3
+  input_dropout: True
+  out_dim: 768
   lora_cfg: 
     r: 128
     lora_alpha: 32
@@ -26,16 +23,18 @@ encoder:
 
 decoder:
   name: gpt2-large # 1.5B params
-  prompt_generator_cfg: null
+  prompt_generator_cfg:
+    n_layers: 6
+    n_heads: 12
+    k: 16
   lora_cfg: 
     r: 128
     lora_alpha: 32
     target_modules: ["c_attn", "mlp.c_fc", "mlp.c_proj"]
     lora_dropout: 0.1
-    bias: "none"
-    
-dataset:
-  path: data/
+    bias: "none"  
 
-name: dae_compressor
+name: dae_pool
 
+defaults:
+  - dataset: wiki

@@ -10,7 +10,7 @@ z_dropout_p: 0.2
 encoder:
   _target_: model.encoder.DAEEncoder
   name: thesephist/contra-bottleneck-t5-xl-wikipedia
-  normalize: False
+  normalize: True
   dropout_p: 0.3
   input_dropout: True
   out_dim: 768

@@ -7,6 +7,7 @@ task.ae.decoder.prompt_generator_cfg.k: 16
 
 task.ae.encoder.normalize: False
 task.ae.z_noise_type: fixed, none
-task.ae.encoder.input_dropout: True, False
+task.ae.encoder.input_dropout: False
+task.ae.encoder.compressor_cfg.dim: 8192, 16384
 
-sweep_id: dae_compressor_v4
+sweep_id: dae_big
