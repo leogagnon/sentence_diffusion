@@ -141,7 +141,7 @@ def main(cfg: Optional[TrainConfig] = None, run_id: Optional[str] = None):
         log_every_n_steps=50,
         accumulate_grad_batches=cfg.accumulate_grad_batches,
         precision=cfg.precision,
-        limit_val_batches=cfg.limit_val_batches if cfg.limit_val_batches else 1.0,
+        limit_val_batches=cfg.limit_val_batches if cfg.limit_val_batches else 1.0
     )
     trainer.fit(
         model=task,

@@ -131,10 +131,6 @@ class AETask(L.LightningModule):
         optimizer = torch.optim.AdamW(self.parameters(), lr=self.cfg.lr)
         return optimizer
 
-    def on_train_batch_end(self, outputs, batch, batch_idx):
-        if self.global_step % 50 == 0:
-            torch.cuda.empty_cache()
-
     def training_step(self, batch, batch_idx):
 
         assert self.encoder.training == True

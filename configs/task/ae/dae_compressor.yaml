@@ -1,19 +1,19 @@
-train_batch_size: 16
+train_batch_size: 32
 val_batch_size: 32
 lr: 1e-4
 max_generation_length: 128
 val_size: 16384
 z_noise_type: fixed
-z_noise_alpha: 0.9
-z_dropout_p: 0.2
+z_noise_alpha: 0.95
+z_dropout_p: 0.0
 
 encoder:
   _target_: model.encoder.DAEEncoder
-  name: thesephist/contra-bottleneck-t5-xl-wikipedia
+  name: thesephist/contra-bottleneck-t5-large-wikipedia
   normalize: False
   dropout_p: 0.3
   input_dropout: True
-  out_dim: 768
+  out_dim: 1024
   compressor_cfg:
     n_layers: 1
     n_heads: 12
@@ -31,7 +31,6 @@ decoder:
     n_layers: 5
     n_heads: 12
     k: 16
-    noise_conditioning: False
   lora_cfg: 
     r: 128
     lora_alpha: 32

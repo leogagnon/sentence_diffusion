@@ -1,15 +1,16 @@
-train_batch_size: 16
+train_batch_size: 32
 val_batch_size: 32
 lr: 1e-4
 max_generation_length: 128
 val_size: 16384
 z_noise_type: fixed
-z_noise_alpha: 0.9
+z_noise_alpha: 0.95
 z_dropout_p: 0.0
 
 encoder:
-  _target_: model.encoder.QwenEncoder
+  _target_: model.encoder.STEncoder
   name: Qwen/Qwen3-Embedding-0.6B # 1.5B params
+  normalize: false
 
 decoder:
   name: gpt2-large # 1.5B params

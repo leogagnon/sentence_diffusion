@@ -22,6 +22,8 @@ from abc import ABC, abstractmethod
 from contextlib import nullcontext
 from torch.nn import Sequential
 import sentence_transformers
+from lightning.pytorch.utilities.rank_zero import rank_zero_info
+from einops import rearrange
 
 
 @dataclass
@@ -40,18 +42,22 @@ class EncoderModel(ABC, nn.Module):
     def forward(self, input_str):
         pass
 
+@dataclass
+class STEncoderConfig:
+    name: str
+    normalize: bool
+    lora_cfg: Optional[dict] = None
 
 class STEncoder(EncoderModel):
-    def __init__(self, cfg: Optional[EncoderConfig] = None, **kwargs):
+    def __init__(self, cfg: Optional[STEncoderConfig] = None, **kwargs):
         super().__init__()
 
         if cfg == None:
-            cfg = EncoderConfig(**kwargs)
-        assert cfg.lora_cfg == None, "LoRA not supported for SentenceT5Encoder"
+            cfg = STEncoderConfig(**kwargs)
 
         backbone = sentence_transformers.SentenceTransformer(
             cfg.name,
-        ).requires_grad_(False)
+        )
         self.transformer = backbone[0]
         self.pooling = backbone[1]
         self.normalization = backbone[2]
@@ -61,62 +67,35 @@ class STEncoder(EncoderModel):
         assert isinstance(self.normalization, sentence_transformers.models.Normalize), "Expected Normalize as third module"
 
         self.tokenizer = backbone.tokenizer
+        self._latent_dim = backbone.get_sentence_embedding_dimension()
+
+        if cfg.lora_cfg == None:
+            self.requires_grad_(False)
+            self.transformer.auto_model = self.transformer.auto_model.to(torch.bfloat16)
+            try:
+                self.transformer.auto_model.set_attn_implementation(
+                    "flash_attention_2"
+                )
+            except:
+                rank_zero_info("Tried to use flash attention in encoder, but it is not available.")
 
         self.cfg = cfg
 
     @property
     def latent_dim(self):
-        return self.backbone.get_sentence_embedding_dimension()
+        return self._latent_dim
 
     @torch.no_grad()
-    def forward(self, input_ids, attention_mask=None, normalize=True):
+    def forward(self, input_ids, attention_mask=None, normalize: Optional[bool] = None):
         batch = {"input_ids": input_ids, "attention_mask": attention_mask}
-        batch = self.backbone[0](batch) # pass through transformer
-        batch = self.backbone[1](batch) # pass through pooling
+        batch = self.transformer(batch) 
+        batch = self.pooling(batch) 
+
+        normalize = self.cfg.normalize if normalize is None else normalize
         if normalize:
-            batch = self.backbone[2](batch) # pass through normalization
+            batch = self.normalization(batch)
 
-        return batch['sentence_embedding']
-
-
-class QwenEncoder(EncoderModel):
-    def __init__(self, cfg: Optional[EncoderConfig] = None, **kwargs):
-        super().__init__()
-
-        if cfg == None:
-            cfg = EncoderConfig(**kwargs)
-
-        self.backbone = AutoModel.from_pretrained(cfg.name)
-        if cfg.lora_cfg != None:
-            self.backbone = get_peft_model(
-                self.backbone,
-                LoraConfig(**cfg.lora_cfg),
-            )
-        else:
-            self.backbone.requires_grad_(False)
-            self.backbone.eval()
-
-        self.tokenizer = AutoTokenizer.from_pretrained(
-            cfg.name, padding_side="left"
-        )
-
-        self.cfg = cfg
-
-
-    @property
-    def latent_dim(self):
-        return self.backbone.config.hidden_size
-
-    def forward(self, input_ids, attention_mask=None, normalize=False):
-        assert normalize == False, "Normalization not supported for QwenEncoder"
-        # Encode input text into hidden states
-        with torch.no_grad() if (self.cfg.lora_cfg is None) else nullcontext():
-            batch = {"input_ids": input_ids, "attention_mask": attention_mask}
-            hidden_states = self.backbone(**batch).last_hidden_state
-            attention_mask = batch["attention_mask"]
-
-        # Take the last token's hidden state (assuming left padding)
-        return hidden_states[:, -1] 
+        return batch["sentence_embedding"]
 
 
 @dataclass
@@ -199,6 +178,12 @@ class DAEEncoder(EncoderModel):
         else:
             self.backbone.requires_grad_(False)
             self.backbone.eval()
+
+        if cfg.compressor_cfg != None:
+            if cfg.compressor_cfg.k > 1:
+                assert (
+                    cfg.normalize == False
+                ), "Normalization not compatible with k>1 compressor for now"
 
         if cfg.sem_cfg != None:
             if cfg.compressor_cfg != None:
