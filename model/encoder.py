@@ -21,6 +21,7 @@ from sentence_transformers import SentenceTransformer
 from abc import ABC, abstractmethod
 from contextlib import nullcontext
 from torch.nn import Sequential
+import sentence_transformers
 
 
 @dataclass
@@ -48,10 +49,18 @@ class STEncoder(EncoderModel):
             cfg = EncoderConfig(**kwargs)
         assert cfg.lora_cfg == None, "LoRA not supported for SentenceT5Encoder"
 
-        self.backbone = SentenceTransformer(
+        backbone = sentence_transformers.SentenceTransformer(
             cfg.name,
         ).requires_grad_(False)
-        self.tokenizer = self.backbone.tokenizer
+        self.transformer = backbone[0]
+        self.pooling = backbone[1]
+        self.normalization = backbone[2]
+
+        assert isinstance(self.transformer, sentence_transformers.models.Transformer), "Expected Transformer as first module"
+        assert isinstance(self.pooling, sentence_transformers.models.Pooling), "Expected Pooling as second module"
+        assert isinstance(self.normalization, sentence_transformers.models.Normalize), "Expected Normalize as third module"
+
+        self.tokenizer = backbone.tokenizer
 
         self.cfg = cfg
 
