@@ -1,5 +1,6 @@
 from functools import partial
 import os
+import hydra
 import lightning as L
 from omegaconf import OmegaConf
 from dataclasses import dataclass
@@ -29,7 +30,7 @@ class FinetuneTaskConfig:
     batch_size: int
     decoder: DecoderConfig
     max_generation_length: int
-    dataset: StoriesDatasetConfig
+    dataset: dict
     val_size: int
 
 class FinetuneTask(L.LightningModule):
@@ -50,10 +51,7 @@ class FinetuneTask(L.LightningModule):
 
         self.decoder = DecoderModel(cfg.decoder)
 
-        self.dataset = StoriesDataset(
-            cfg.dataset,
-            dec_tokenizer=self.decoder.tokenizer,
-        )
+        self.dataset = hydra.utils.instantiate(cfg.dataset)
         # Randomly choose split into train and val
         indices = torch.randperm(len(self.dataset))
         self.register_buffer("train_indices", indices[: -cfg.val_size])
@@ -77,16 +75,26 @@ class FinetuneTask(L.LightningModule):
         return DataLoader(
             self.train_data,
             batch_size=self.cfg.batch_size,
+            num_workers=len(os.sched_getaffinity(0)),
+            pin_memory=True,
+            persistent_workers=True,
             shuffle=True,
-            collate_fn=lambda x: x,
+            collate_fn=self.dataset.get_collate_and_tokenize_fn(
+                dec_tokenizer=self.decoder.tokenizer,
+            ),
         )
 
     def val_dataloader(self):
         return DataLoader(
             self.val_data,
             batch_size=self.cfg.batch_size,
-            collate_fn=lambda x: x,
+            num_workers=len(os.sched_getaffinity(0)),
+            pin_memory=True,
+            persistent_workers=False,
             shuffle=False,
+            collate_fn=self.dataset.get_collate_and_tokenize_fn(
+                dec_tokenizer=self.decoder.tokenizer,
+            ),
         )
 
     def training_step(self, batch, batch_idx=None):

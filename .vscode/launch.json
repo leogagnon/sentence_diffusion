@@ -12,7 +12,7 @@
             "program": "train.py",
             "console": "integratedTerminal",
             "justMyCode": false,
-            "args": ["task/ae=dae_compressor"],
+            "args": ["task/diffusion=base"],
         }
     ]
 }

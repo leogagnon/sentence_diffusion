@@ -18,7 +18,7 @@ from lightning.pytorch.utilities.rank_zero import rank_zero_info
 os.environ["LATENT_CONTROL_CKPT_DIR"] = (
     "/network/scratch/l/leo.gagnon/sentence_diffusion/logs/checkpoints"
 )
-torch.set_float32_matmul_precision('medium')
+torch.set_float32_matmul_precision("medium")
 
 
 @dataclass
@@ -34,7 +34,7 @@ class TrainConfig:
     seed: int
     log_dir: str
     max_epochs: int
-    accumulate_grad_batches: int 
+    accumulate_grad_batches: int
     val_check_interval: int
     logger: dict
     sweep_id: Optional[str] = None
@@ -42,7 +42,7 @@ class TrainConfig:
     early_stopping: Optional[dict] = None
     gradient_clip_val: float = 1.0
     name: Optional[str] = None
-    precision: str = "bf16-mixed" 
+    precision: str = "bf16-mixed"
     limit_val_batches: Optional[int] = None
 
 
@@ -126,14 +126,15 @@ def main(cfg: Optional[TrainConfig] = None, run_id: Optional[str] = None):
         logger.experiment.config.update(
             OmegaConf.to_container(OmegaConf.structured(cfg)), allow_val_change=True
         )
-        
+
     # Instantiate the trainer
     trainer = L.Trainer(
         logger=logger,
         accelerator="gpu",
         enable_checkpointing=True if cfg.model_checkpoint else False,
         callbacks=callbacks,
-        val_check_interval=cfg.val_check_interval * cfg.accumulate_grad_batches,  # to account for accumulation
+        val_check_interval=cfg.val_check_interval
+        * cfg.accumulate_grad_batches,  # to account for accumulation
         gradient_clip_val=cfg.gradient_clip_val,
         num_sanity_val_steps=0,
         max_epochs=cfg.max_epochs,
@@ -145,7 +146,7 @@ def main(cfg: Optional[TrainConfig] = None, run_id: Optional[str] = None):
     trainer.fit(
         model=task,
         ckpt_path=(
-            os.path.join(cfg.model_checkpoint["dirpath"], "last.ckpt")
+            os.path.realpath(os.path.join(cfg.model_checkpoint["dirpath"], "last.ckpt"))
             if run_id != None
             else None
         ),

@@ -1,0 +1,10 @@
+task/ae: dae_pool_norm_nodrop_large, dae_pool_nodrop_large
+model_checkpoint: base
+task.ae.train_batch_size: 16
+task.ae.val_batch_size: 64
+accumulate_grad_batches: 16
+precision: bf16-mixed
+limit_val_batches: 4
+val_check_interval: 256
+
+sweep_id: wiki_v0

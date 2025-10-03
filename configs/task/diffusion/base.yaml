@@ -1,11 +1,12 @@
 model:     
   n_layers: 16
-  n_heads: 8
+  n_heads: 12
   n_embd: 768
+  seq_len: 64
 
 batch_size: 128
 lr: 1e-4
-pretrained_ae_id: 983t3fhv
+pretrained_ae_id: r08t35ja # qrdraeyp #
 
 loss: l2
 sampling_timesteps: 50

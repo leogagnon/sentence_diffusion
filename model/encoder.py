@@ -40,7 +40,7 @@ class EncoderModel(ABC, nn.Module):
         pass
 
 
-class SentenceT5Encoder(EncoderModel):
+class STEncoder(EncoderModel):
     def __init__(self, cfg: Optional[EncoderConfig] = None, **kwargs):
         super().__init__()
 
@@ -60,11 +60,14 @@ class SentenceT5Encoder(EncoderModel):
         return self.backbone.get_sentence_embedding_dimension()
 
     @torch.no_grad()
-    def forward(self, input_ids, attention_mask=None):
+    def forward(self, input_ids, attention_mask=None, normalize=True):
         batch = {"input_ids": input_ids, "attention_mask": attention_mask}
-        z = self.backbone.forward(batch)["sentence_embedding"]
+        batch = self.backbone[0](batch) # pass through transformer
+        batch = self.backbone[1](batch) # pass through pooling
+        if normalize:
+            batch = self.backbone[2](batch) # pass through normalization
 
-        return z
+        return batch['sentence_embedding']
 
 
 class QwenEncoder(EncoderModel):
@@ -95,7 +98,8 @@ class QwenEncoder(EncoderModel):
     def latent_dim(self):
         return self.backbone.config.hidden_size
 
-    def forward(self, input_ids, attention_mask=None):
+    def forward(self, input_ids, attention_mask=None, normalize=False):
+        assert normalize == False, "Normalization not supported for QwenEncoder"
         # Encode input text into hidden states
         with torch.no_grad() if (self.cfg.lora_cfg is None) else nullcontext():
             batch = {"input_ids": input_ids, "attention_mask": attention_mask}
@@ -174,6 +178,9 @@ class DAEEncoder(EncoderModel):
                 cross_attend=True,
                 causal=False,
             )
+            self.placeholder_tokens = nn.Parameter(
+                torch.randn(cfg.compressor_cfg.k, self.backbone.config.d_model)
+            )
 
         if cfg.lora_cfg != None:
             self.backbone = get_peft_model(
@@ -221,29 +228,30 @@ class DAEEncoder(EncoderModel):
                 mask = einx.rearrange("b n -> b n d", mask, d=hidden_states.shape[-1])
                 hidden_states = hidden_states.masked_fill(mask, 0.0)
 
-        # Compute mean-pooled embedding
-        hidden_states = hidden_states.repeat(
-            attention_mask.shape[0] // hidden_states.shape[0], 1, 1
-        )
-        mask_expanded = (
-            attention_mask.to(dtype=hidden_states.dtype)
-            .unsqueeze(-1)
-            .expand(hidden_states.shape)
-        )
-        mean_pooled_embedding = torch.sum(
-            hidden_states * mask_expanded, 1
-        ) / torch.clamp(mask_expanded.sum(1), min=1e-9)
-        mean_pooled_embedding = mean_pooled_embedding.unsqueeze(1)
-
-        # Maybe cross-attend with hidden states to get latent code
         if self.cfg.compressor_cfg != None:
+            # Cross-attend with placeholder tokens
+            ph = einx.rearrange(
+                "k d -> b k d", self.placeholder_tokens, b=hidden_states.shape[0]
+            )
             latent = self.compressor(
-                mean_pooled_embedding,
+                ph,
                 context=hidden_states,
                 context_mask=attention_mask,
             )
         else:
-            latent = mean_pooled_embedding
+            # ; or compute mean-pooled embedding
+            hidden_states = hidden_states.repeat(
+                attention_mask.shape[0] // hidden_states.shape[0], 1, 1
+            )
+            mask_expanded = (
+                attention_mask.to(dtype=hidden_states.dtype)
+                .unsqueeze(-1)
+                .expand(hidden_states.shape)
+            )
+            mean_pooled_embedding = torch.sum(
+                hidden_states * mask_expanded, 1
+            ) / torch.clamp(mask_expanded.sum(1), min=1e-9)
+            latent = mean_pooled_embedding.unsqueeze(1)
 
         # Project to output dimension
         latent = self.out_proj(latent)

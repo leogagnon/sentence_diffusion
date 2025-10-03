@@ -1,5 +1,5 @@
 lr: 1e-4
-batch_size: 64
+batch_size: 32
 decoder:
   name: gpt2-large # 774M params
   lora_cfg: 
@@ -10,7 +10,8 @@ decoder:
     bias: "none"
 
 max_generation_length: 150
-dataset:
-  path: data/
 
-val_size: 1024
+val_size: 16384
+
+defaults:
+  - dataset: wiki

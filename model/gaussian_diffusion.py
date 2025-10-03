@@ -43,7 +43,7 @@ class DiTConfig:
     n_heads: int
     n_embd: int
     seq_len: int
-    latent_dim: Optional[Tuple[int]] = None
+    latent_dim: Optional[int] = None
 
     dropout: float = 0.0
     seq_conditional: bool = False
@@ -68,21 +68,13 @@ class DiT(nn.Module):
 
         self.cfg = cfg
 
-        # Time embedding stuff
-        sinu_pos_emb = ScaledSinusoidalEmbedding(self.cfg.n_embd)
-        fourier_dim = self.cfg.n_embd
-        time_emb_dim = self.cfg.n_embd * 4
-        self.time_mlp = nn.Sequential(
-            sinu_pos_emb,
-            nn.Linear(fourier_dim, time_emb_dim),
-            nn.GELU(),
-            nn.Linear(time_emb_dim, time_emb_dim),
-        )
+        # Sinusoidal time embedding
+        self.time_mlp =  ScaledSinusoidalEmbedding(self.cfg.n_embd)
 
-        # Positional embedding
+        # Absolute positional embedding
         self.pos_emb = AbsolutePositionalEmbedding(self.cfg.n_embd, self.cfg.n_embd)
 
-        # Actual Transformer
+        # Actual DiT
         self.latent_encoder = AttentionLayers(
             causal=False,
             dim=self.cfg.n_embd,
@@ -97,35 +89,33 @@ class DiT(nn.Module):
             # DiT adalnzero stuff
             use_adaptive_rmsnorm=True,
             use_adaptive_layerscale=True,
-            dim_condition=time_emb_dim,
+            dim_condition=self.cfg.n_embd,
+            adaptive_condition_mlp_expansion=4,
             adaptive_condition_mlp=True,
         )
 
-        # Conditionning stuff
+        # Class conditionning setup
         if cfg.class_conditional:
             assert cfg.num_classes > 0
             self.class_embedding = nn.Sequential(
                 nn.Embedding(cfg.num_classes + 1, self.cfg.n_embd),
-                nn.Linear(self.cfg.n_embd, time_emb_dim),
+                nn.Linear(self.cfg.n_embd, self.cfg.n_embd),
             )
             self.class_unconditional_bernoulli = torch.distributions.Bernoulli(
                 probs=cfg.class_unconditional_prob
             )
 
+        # Sequence conditionning setup
         if cfg.seq_conditional:
             assert cfg.seq_conditional_dim != None
             self.null_embedding_cond = nn.Embedding(1, self.cfg.n_embd)
             self.cond_proj = nn.Linear(cfg.seq_conditional_dim, self.cfg.n_embd)
 
             if cfg.cond_modulation:
-                self.adalnzero_cond_proj = nn.Sequential(
-                    nn.Linear(cfg.seq_conditional_dim, time_emb_dim),
-                    nn.GELU(),
-                    nn.Linear(time_emb_dim, time_emb_dim),
-                )
-                self.adalnzero_null_embedding = nn.Embedding(1, time_emb_dim)
+                self.adalnzero_cond_proj = nn.Linear(cfg.seq_conditional_dim, self.cfg.n_embd)
+                self.adalnzero_null_embedding = nn.Embedding(1, self.cfg.n_embd)
 
-        # Input/output projections
+        # Input/output projections (input_dim -> [seq_len * pre_proj_dim] -> [seq_len * n_embd])
         assert cfg.latent_dim % 8 == 0, "Latent dimension must be divisible by 8"
         pre_proj_dim = cfg.n_embd // 8
         if cfg.self_condition:
@@ -147,7 +137,7 @@ class DiT(nn.Module):
         )
 
         # Zero-out output projection
-        init_zero_(self.output_proj)
+        init_zero_(self.output_proj[2])
 
     def forward(
         self,
@@ -550,7 +540,7 @@ def sample(
         raise ValueError(f"invalid sampler {sampler}")
     return sample_fn(
         model=model,
-        shape=(batch_size,) + tuple(model.cfg.latent_shape),
+        shape=(batch_size, model.cfg.seq_len, model.cfg.latent_dim),
         class_id=class_id,
         cond=cond,
         cond_input_ids=cond_input_ids,
@@ -658,7 +648,7 @@ def compute_diffusion_loss(
     if cond_ignore_mask != None:
         cond_mask = torch.logical_not(cond_ignore_mask)
 
-    bs, l, d = (*latent.shape,)
+    bs = latent.shape[0]
     device = latent.device
 
     times = torch.zeros((bs,), device=device).float().uniform_(0, 1.0)
@@ -726,10 +716,6 @@ def compute_diffusion_loss(
         assert exists(predictions.pred_v)
         pred = predictions.pred_v
 
-    loss = loss_fn(loss_name)(pred, target, reduction="none")
-    loss = rearrange(
-        [reduce(loss[i], "l d -> 1", "mean") for i in range(latent.shape[0])],
-        "b 1 -> b 1",
-    )
+    loss = loss_fn(loss_name)(pred, target, reduction="mean")
 
-    return loss.mean()
+    return loss

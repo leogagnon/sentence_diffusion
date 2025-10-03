@@ -3,20 +3,22 @@ val_batch_size: 32
 lr: 1e-4
 max_generation_length: 128
 val_size: 16384
-z_noise_type: fixed
+z_noise_type: schedule
 z_noise_alpha: 0.9
-z_dropout_p: 0.0
+z_dropout_p: 0.2
 
 encoder:
-  _target_: model.encoder.QwenEncoder
-  name: Qwen/Qwen3-Embedding-0.6B # 1.5B params
+  _target_: model.encoder.STEncoder
+  name: Qwen/Qwen3-Embedding-0.6B # 0.6B params
 
 decoder:
-  name: gpt2-large # 1.5B params
+  name: gpt2-large # 0.8B params
   prompt_generator_cfg:
     n_layers: 6
     n_heads: 12
     k: 8
+    noise_conditioning: True
+    default_alpha: 0.95  # delta^2=0.05 like in DGLM
   lora_cfg: 
     r: 64
     lora_alpha: 16

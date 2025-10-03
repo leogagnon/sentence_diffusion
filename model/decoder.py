@@ -33,7 +33,7 @@ class PromptGeneratorConfig:
 @dataclass
 class DecoderConfig:
     name: str
-    input_dim: Optional[int] = None  # has to be set
+    input_dim: Optional[int] = None 
     prompt_generator_cfg: Optional[PromptGeneratorConfig] = None
     lora_cfg: Optional[dict] = None
 
@@ -89,8 +89,9 @@ class DecoderModel(nn.Module):
                     use_adaptive_layerscale=True,
                     ff_swish=True,
                     ff_glu=True,
-                    dim_condition=self.backbone.config.hidden_size * 4,
+                    dim_condition=self.backbone.config.hidden_size,
                     adaptive_condition_mlp=True,
+                    adaptive_condition_mlp_expansion=4,
                     attn_qk_norm=True,
                     attn_qk_norm_dim_scale=True,
                 )
@@ -101,10 +102,13 @@ class DecoderModel(nn.Module):
                     depth=cfg.prompt_generator_cfg.n_layers,
                     heads=cfg.prompt_generator_cfg.n_heads,
                 )
-        else:
+        elif cfg.input_dim != None:
             self.in_proj = nn.Linear(
                 cfg.input_dim, self.backbone.config.hidden_size, bias=False
             )
+        else:
+            # This means there is no z; the model is just a standard unconditional decoder
+            pass
 
     def z_to_prompt(self, z: torch.Tensor, alpha: Optional[torch.Tensor] = None):
         if self.cfg.prompt_generator_cfg == None:

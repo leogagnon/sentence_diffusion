@@ -36,6 +36,8 @@ class GaussianDiffusionTaskConfig:
     pretrained_ae_id: str
     name: Optional[str] = None
 
+    diffuse_prenorm: bool = True
+
     loss: str = "l2"
     sampling_timesteps: int = 50
     train_schedule: str = "cosine"
@@ -93,28 +95,46 @@ class GaussianDiffusionTask(L.LightningModule):
         self.train_indices = ae_task.train_indices
         self.val_indices = ae_task.val_indices
         self.dataset = ae_task.dataset
-        self.encoder = ae_task.encoder.eval().requires_grad_(False)
-        self.decoder = ae_task.decoder.eval().requires_grad_(False)
 
-        # Init latent normalization if needed
-        if cfg.normalize_latent:
-            self.register_buffer(
-                "latent_mean", torch.zeros(size=self.encoder.latent_shape).float()
+        # Load and process encoder (eval, no gradients, bfloat16, flash attention)
+        self.encoder = ae_task.encoder.to(torch.bfloat16).eval().requires_grad_(False)
+        try:
+            self.encoder.backbone.set_attn_implementation("flash_attention_2")
+        except:
+            self.encoder.backbone[0].auto_model.set_attn_implementation(
+                "flash_attention_2"
             )
-            self.latent_mean: torch.FloatTensor
-            self.register_buffer(
-                "latent_scale", torch.ones(size=self.encoder.latent_shape).float()
-            )
-            self.latent_scale: torch.FloatTensor
+
+        # Load and process decoder (merge adapter, eval, no gradients, bfloat16, flash attention)
+        self.decoder = ae_task.decoder.eval().requires_grad_(False)
+        self.decoder.backbone = self.decoder.backbone.merge_and_unload().to(
+            torch.bfloat16
+        )
+        self.decoder.backbone.set_attn_implementation("flash_attention_2")
 
         # Init diffusion model
-        cfg.model.latent_shape = self.encoder.latent_shape
+        cfg.model.latent_dim = (
+            self.encoder.latent_dim
+        )  # Set latent_dim based on encoder
         self.model = DiT(cfg.model)
         self.ema_model = (
             AveragedModel(self.model, avg_fn=get_ema_avg_fn())
             .eval()
             .requires_grad_(False)
         )
+
+        # Init latent normalization if needed
+        if cfg.normalize_latent:
+            self.register_buffer(
+                "latent_mean",
+                torch.zeros(size=(cfg.model.seq_len, cfg.model.latent_dim)).float(),
+            )
+            self.latent_mean: torch.FloatTensor
+            self.register_buffer(
+                "latent_scale",
+                torch.ones(size=(cfg.model.seq_len, cfg.model.latent_dim)).float(),
+            )
+            self.latent_scale: torch.FloatTensor
 
         self.cfg = cfg
         # Important for checkpoints
@@ -150,15 +170,19 @@ class GaussianDiffusionTask(L.LightningModule):
             self.train_data,
             batch_size=self.cfg.batch_size,
             shuffle=True,
-            collate_fn=lambda x: x,
+            collate_fn=self.dataset.get_collate_and_tokenize_fn(
+                enc_tokenizer=self.encoder.tokenizer,
+            ),
         )
 
     def val_dataloader(self):
         return DataLoader(
             self.val_data,
             batch_size=self.cfg.batch_size,
-            collate_fn=lambda x: x,
             shuffle=False,
+            collate_fn=self.dataset.get_collate_and_tokenize_fn(
+                enc_tokenizer=self.encoder.tokenizer,
+            ),
         )
 
     def on_fit_start(self):
@@ -177,7 +201,9 @@ class GaussianDiffusionTask(L.LightningModule):
                             torch.randperm(len(self.train_data))[:20000],
                         ),
                         batch_size=self.cfg.batch_size,
-                        collate_fn=lambda x: x,
+                        collate_fn=self.dataset.get_collate_and_tokenize_fn(
+                            enc_tokenizer=self.encoder.tokenizer,
+                        ),
                         shuffle=False,
                     ),
                     desc="Computing latent mean and scale on 20000 training samples...",
@@ -186,6 +212,7 @@ class GaussianDiffusionTask(L.LightningModule):
                         self.encoder(
                             batch["input_ids_enc"].cuda(),
                             attention_mask=batch["attention_mask_enc"].cuda(),
+                            normalize=False if self.cfg.diffuse_prenorm else True,
                         )
                     )
 
@@ -203,7 +230,9 @@ class GaussianDiffusionTask(L.LightningModule):
         with torch.no_grad():
             assert self.encoder.training == False
             latent = self.encoder(
-                batch["input_ids_enc"], attention_mask=batch["attention_mask_enc"]
+                batch["input_ids_enc"],
+                attention_mask=batch["attention_mask_enc"],
+                normalize=False if self.cfg.diffuse_prenorm else True,
             )
             if self.cfg.normalize_latent:
                 latent = self.normalize_latent(latent)
@@ -310,7 +339,9 @@ class GaussianDiffusionTask(L.LightningModule):
             )
         # Compute latents
         latent = self.encoder(
-            batch["input_ids_enc"], attention_mask=batch["attention_mask_enc"]
+            batch["input_ids_enc"],
+            attention_mask=batch["attention_mask_enc"],
+            normalize=False if self.cfg.diffuse_prenorm else True,
         )
         if self.cfg.normalize_latent:
             latent = self.normalize_latent(latent)
