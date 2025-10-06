@@ -1,7 +1,0 @@
-task/ae: dae, dglm
-model_checkpoint: base
-task.ae.train_batch_size: 32
-task.ae.encoder.k: 8, 16
-accumulate_grad_batches: 4
-
-sweep_id: ae_base_v2

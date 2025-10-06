@@ -43,6 +43,7 @@ class AETaskConfig:
     z_dropout_p: float = 0.0
 
     name: Optional[str] = None
+    encoder_prompt: Optional[str] = None
 
 
 class AETask(L.LightningModule):
@@ -110,6 +111,7 @@ class AETask(L.LightningModule):
             collate_fn=self.dataset.get_collate_and_tokenize_fn(
                 enc_tokenizer=self.encoder.tokenizer,
                 dec_tokenizer=self.decoder.tokenizer,
+                prompt=self.cfg.encoder_prompt,
             ),
         )
 
@@ -124,6 +126,7 @@ class AETask(L.LightningModule):
             collate_fn=self.dataset.get_collate_and_tokenize_fn(
                 enc_tokenizer=self.encoder.tokenizer,
                 dec_tokenizer=self.decoder.tokenizer,
+                prompt=self.cfg.encoder_prompt,
             ),
         )
 

@@ -13,7 +13,7 @@ from tasks.autoencoder import AETask, AETaskConfig
 from tasks.diffusion import GaussianDiffusionTask, GaussianDiffusionTaskConfig
 from tasks.finetune import FinetuneTask, FinetuneTaskConfig
 from lightning.pytorch.callbacks import EarlyStopping
-from lightning.pytorch.utilities.rank_zero import rank_zero_info
+from lightning.pytorch.utilities.rank_zero import rank_zero_info, rank_zero_only
 
 os.environ["LATENT_CONTROL_CKPT_DIR"] = (
     "/network/scratch/l/leo.gagnon/sentence_diffusion/logs/checkpoints"
@@ -73,11 +73,11 @@ def main(cfg: Optional[TrainConfig] = None, run_id: Optional[str] = None):
         if "USER" in os.environ:
             tags += [os.environ["USER"]]
         cfg.logger.tags = tags
+    
+    L.seed_everything(cfg.seed)
 
     logger = hydra.utils.instantiate(cfg.logger)
     wandb_id = logger.experiment.path.split("/")[-1]
-
-    L.seed_everything(cfg.seed)
 
     # Setup checkpoint (with wandb ID as <dirpath>)
     callbacks = []
@@ -141,7 +141,9 @@ def main(cfg: Optional[TrainConfig] = None, run_id: Optional[str] = None):
         log_every_n_steps=50,
         accumulate_grad_batches=cfg.accumulate_grad_batches,
         precision=cfg.precision,
-        limit_val_batches=cfg.limit_val_batches if cfg.limit_val_batches else 1.0
+        limit_val_batches=cfg.limit_val_batches if cfg.limit_val_batches else 1.0,
+        devices=1,
+       #strategy="ddp_find_unused_parameters_true"
     )
     trainer.fit(
         model=task,

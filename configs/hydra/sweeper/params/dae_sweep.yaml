@@ -1,7 +1,0 @@
-task/ae: denoising_1, denoising_2, denoising_3, denoising_4, denoising_5, denoising_6
-model_checkpoint: base
-task.ae.train_batch_size: 32
-accumulate_grad_batches: 16
-task.ae.pretrained_decoder_id: 7s8obxmf # gpt2-xl, gpt2-large
-
-sweep_id: dae_sweep

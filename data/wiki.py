@@ -19,8 +19,11 @@ class WikipediaDataset(Dataset):
         )['train']
         self.cfg = cfg 
 
-    def get_collate_and_tokenize_fn(self, dec_tokenizer = None, enc_tokenizer = None):
+    def get_collate_and_tokenize_fn(self, dec_tokenizer = None, enc_tokenizer = None, prompt=None):
         def collate_fn(texts):
+
+            if prompt is not None:
+                texts = [(prompt+text) for text in texts]
             out = {"input_str": texts}
 
             if enc_tokenizer is not None:

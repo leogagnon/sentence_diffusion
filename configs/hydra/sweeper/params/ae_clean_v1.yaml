@@ -1,10 +1,12 @@
-task/ae: qwen
+task/ae: qwen_dae
 model_checkpoint: base
 task.ae.train_batch_size: 32
-task.ae.val_batch_size: 64
+task.ae.val_batch_size: 32
 accumulate_grad_batches: 8
-precision: bf16-mixed, bf16-true
+precision: bf16-mixed
 limit_val_batches: 4
 val_check_interval: 256
 
-sweep_id: qwen_xl
+task.ae.encoder.normalize: false
+
+sweep_id: ae_clean

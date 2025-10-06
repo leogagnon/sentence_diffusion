@@ -1,8 +1,0 @@
-task/ae: st5, dae, dae_compressor
-model_checkpoint: base
-task.ae.train_batch_size: 16
-task.ae.val_batch_size: 64
-accumulate_grad_batches: 16
-task.ae.decoder.prompt_generator_cfg.k: 16
-
-sweep_id: sanity_0

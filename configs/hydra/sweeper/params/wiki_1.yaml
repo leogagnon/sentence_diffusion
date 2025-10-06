@@ -1,4 +1,4 @@
-task/ae: qwen_norm, qwen_norm_drop, dae_long_context, dae_pool_norm_nodrop
+task/ae: qwen_norm, qwen_norm_drop, dae_long_context, dae_pool_norm_nodrop, dae_pool_norm_nodrop_large, dae_pool_nodrop_large, qwen
 model_checkpoint: base
 task.ae.train_batch_size: 16
 task.ae.val_batch_size: 64

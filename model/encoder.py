@@ -25,6 +25,20 @@ import sentence_transformers
 from lightning.pytorch.utilities.rank_zero import rank_zero_info
 from einops import rearrange
 
+def random_substitution(input_ids, sub_p, vocab_size):
+
+        probability = torch.full_like(
+            input_ids,
+            fill_value=sub_p,
+            dtype=torch.float32,
+        )
+        masked_indices = torch.bernoulli(probability).bool()
+        random_words = torch.randint_like(input_ids, low=0, high=vocab_size, dtype=torch.int64)
+
+        input_ids[masked_indices] = random_words[masked_indices]
+
+        return input_ids
+
 
 @dataclass
 class EncoderConfig:
@@ -38,6 +52,11 @@ class EncoderModel(ABC, nn.Module):
     def latent_dim(self):
         pass
 
+    @property
+    @abstractmethod
+    def latent_len(self):
+        pass
+
     @abstractmethod
     def forward(self, input_str):
         pass
@@ -47,6 +66,7 @@ class STEncoderConfig:
     name: str
     normalize: bool
     lora_cfg: Optional[dict] = None
+    dropout_p: float = 0.0
 
 class STEncoder(EncoderModel):
     def __init__(self, cfg: Optional[STEncoderConfig] = None, **kwargs):
@@ -70,7 +90,7 @@ class STEncoder(EncoderModel):
         self._latent_dim = backbone.get_sentence_embedding_dimension()
 
         if cfg.lora_cfg == None:
-            self.requires_grad_(False)
+            self.transformer.requires_grad_(False)
             self.transformer.auto_model = self.transformer.auto_model.to(torch.bfloat16)
             try:
                 self.transformer.auto_model.set_attn_implementation(
@@ -78,15 +98,29 @@ class STEncoder(EncoderModel):
                 )
             except:
                 rank_zero_info("Tried to use flash attention in encoder, but it is not available.")
+        else:
+            self.transformer.requires_grad_(True)
+            self.transformer = get_peft_model(
+                self.transformer,
+                LoraConfig(**cfg.lora_cfg),
+            )
 
         self.cfg = cfg
 
     @property
     def latent_dim(self):
         return self._latent_dim
+    
+    @property
+    def latent_len(self):
+        return 1
 
     @torch.no_grad()
     def forward(self, input_ids, attention_mask=None, normalize: Optional[bool] = None):
+        if (self.cfg.dropout_p > 0.0) and self.training:
+            input_ids = random_substitution(
+                input_ids, self.cfg.dropout_p, self.tokenizer.vocab_size
+            )
         batch = {"input_ids": input_ids, "attention_mask": attention_mask}
         batch = self.transformer(batch) 
         batch = self.pooling(batch) 
@@ -95,7 +129,7 @@ class STEncoder(EncoderModel):
         if normalize:
             batch = self.normalization(batch)
 
-        return batch["sentence_embedding"]
+        return batch["sentence_embedding"][:, None]
 
 
 @dataclass
@@ -199,6 +233,10 @@ class DAEEncoder(EncoderModel):
     @property
     def latent_dim(self):
         return self.cfg.out_dim
+    
+    @property
+    def latent_len(self):
+        return self.cfg.compressor_cfg.k if self.cfg.compressor_cfg is not None else 1
 
     def forward(self, input_ids, attention_mask=None):
         # Encode input text into hidden states
@@ -260,8 +298,5 @@ class DAEEncoder(EncoderModel):
             latent = F.normalize(latent, p=2, dim=2)
         else:
             latent = latent
-
-        if latent.shape[1] == 1:
-            latent = latent.squeeze(1)
 
         return latent

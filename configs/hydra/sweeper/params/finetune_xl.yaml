@@ -1,7 +1,0 @@
-task/finetune: base
-model_checkpoint: base
-early_stopping: base
-early_stopping.monitor: val/loss
-task.finetune.decoder.name: gpt2-xl
-task.finetune.batch_size: 32
-accumulate_grad_batches: 16

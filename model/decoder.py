@@ -119,7 +119,7 @@ class DecoderModel(nn.Module):
         prompt = self.prompt_generator["z_to_chunk"](z)
         prompt = rearrange(
             prompt,
-            "b (k d) -> b k d",
+            "b 1 (k d) -> b k d",
             k=self.cfg.prompt_generator_cfg.k,
         )
         prompt = self.prompt_generator["chunk_to_embd"](prompt)
@@ -129,11 +129,13 @@ class DecoderModel(nn.Module):
             if alpha is None:
                 # If no alpha is given, use default value (e.g. at inference)
                 alpha = torch.full(
-                    (z.shape[0], 1),
+                    (z.shape[0], 1, 1),
                     self.cfg.prompt_generator_cfg.default_alpha,
                     device=z.device,
                 )
-            noise_embd = self.prompt_generator["noise_embd"](alpha[None] * 1000)
+            else:
+                assert alpha.ndim == 3
+            noise_embd = self.prompt_generator["noise_embd"](alpha * 1000)
             noise_embd = rearrange(noise_embd, "b d -> b 1 d")
             prompt = self.prompt_generator["encoder"](prompt, condition=noise_embd)
         else:

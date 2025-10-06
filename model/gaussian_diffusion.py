@@ -44,6 +44,7 @@ class DiTConfig:
     n_embd: int
     seq_len: int
     latent_dim: Optional[int] = None
+    latent_len: Optional[int] = None
 
     dropout: float = 0.0
     seq_conditional: bool = False
@@ -69,7 +70,7 @@ class DiT(nn.Module):
         self.cfg = cfg
 
         # Sinusoidal time embedding
-        self.time_mlp =  ScaledSinusoidalEmbedding(self.cfg.n_embd)
+        self.time_mlp = ScaledSinusoidalEmbedding(self.cfg.n_embd)
 
         # Absolute positional embedding
         self.pos_emb = AbsolutePositionalEmbedding(self.cfg.n_embd, self.cfg.n_embd)
@@ -112,12 +113,13 @@ class DiT(nn.Module):
             self.cond_proj = nn.Linear(cfg.seq_conditional_dim, self.cfg.n_embd)
 
             if cfg.cond_modulation:
-                self.adalnzero_cond_proj = nn.Linear(cfg.seq_conditional_dim, self.cfg.n_embd)
+                self.adalnzero_cond_proj = nn.Linear(
+                    cfg.seq_conditional_dim, self.cfg.n_embd
+                )
                 self.adalnzero_null_embedding = nn.Embedding(1, self.cfg.n_embd)
 
         # Input/output projections (input_dim -> [seq_len * pre_proj_dim] -> [seq_len * n_embd])
         assert cfg.latent_dim % 8 == 0, "Latent dimension must be divisible by 8"
-        pre_proj_dim = cfg.n_embd // 8
         if cfg.self_condition:
             input_dim = cfg.latent_dim * 2
             self.init_self_cond = nn.Parameter(torch.randn(1, cfg.latent_dim))
@@ -125,19 +127,34 @@ class DiT(nn.Module):
         else:
             input_dim = cfg.latent_dim
 
-        self.input_proj = nn.Sequential(
-            nn.Linear(input_dim, cfg.seq_len * pre_proj_dim, bias=False),
-            Rearrange("b (l d) -> b l d", l=cfg.seq_len, d=pre_proj_dim),
-            nn.Linear(pre_proj_dim, cfg.n_embd, bias=False),
-        )
-        self.output_proj = nn.Sequential(
-            nn.Linear(cfg.n_embd, pre_proj_dim, bias=False),
-            Rearrange("b l d -> b (l d)"),
-            nn.Linear(cfg.seq_len * pre_proj_dim, input_dim, bias=False),
-        )
-
-        # Zero-out output projection
-        init_zero_(self.output_proj[2])
+        if cfg.latent_len == 1:
+            pre_proj_dim = 96
+            self.input_proj = nn.Sequential(
+                nn.Linear(input_dim, cfg.seq_len * pre_proj_dim, bias=False),
+                Rearrange("b 1 (l d) -> b l d", l=cfg.seq_len, d=pre_proj_dim),
+                nn.Linear(pre_proj_dim, cfg.n_embd, bias=False),
+            )
+            self.output_proj = nn.Sequential(
+                nn.Linear(cfg.n_embd, pre_proj_dim, bias=False),
+                Rearrange("b l d -> b 1 (l d)"),
+                nn.Linear(cfg.seq_len * pre_proj_dim, input_dim, bias=False),
+            )
+            init_zero_(self.output_proj[2])
+        else:
+            assert (
+                cfg.seq_len % cfg.latent_len == 0
+            ), "seq_len must be divisible by latent_len"
+            dim_mult = cfg.seq_len // cfg.latent_len
+            pre_proj_dim = cfg.latent_dim // dim_mult
+            self.input_proj = nn.Sequential(
+                Rearrange("b l (m d) -> b (l m) d", m=dim_mult, d=pre_proj_dim),
+                nn.Linear(pre_proj_dim, cfg.n_embd, bias=False),
+            )
+            self.output_proj = nn.Sequential(
+                nn.Linear(cfg.n_embd, pre_proj_dim, bias=False),
+                Rearrange("b (l m) d -> b l (m d)", l=cfg.latent_len, m=dim_mult),
+            )
+            init_zero_(self.output_proj[0])
 
     def forward(
         self,
@@ -716,6 +733,7 @@ def compute_diffusion_loss(
         assert exists(predictions.pred_v)
         pred = predictions.pred_v
 
-    loss = loss_fn(loss_name)(pred, target, reduction="mean")
+    loss = loss_fn(loss_name)(pred, target, reduction="none")
+    loss = loss.mean(dim=-1).mean() # first average over latent length
 
     return loss
