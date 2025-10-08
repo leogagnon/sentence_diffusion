@@ -37,6 +37,7 @@ class TrainConfig:
     accumulate_grad_batches: int
     val_check_interval: int
     logger: dict
+    ddp: bool = False
     sweep_id: Optional[str] = None
     model_checkpoint: Optional[dict] = None
     early_stopping: Optional[dict] = None
@@ -77,11 +78,18 @@ def main(cfg: Optional[TrainConfig] = None, run_id: Optional[str] = None):
     L.seed_everything(cfg.seed)
 
     logger = hydra.utils.instantiate(cfg.logger)
-    wandb_id = logger.experiment.path.split("/")[-1]
+
+    if rank_zero_only.rank == 0:
+        wandb_id = logger.experiment.path.split("/")[-1]
+    else:
+        # For non-zero ranks (ddp), the logger is a dummy so we set a fake wandb_id
+        # It won't be used anyway
+        wandb_id = 'test'
+
 
     # Setup checkpoint (with wandb ID as <dirpath>)
     callbacks = []
-    if cfg.model_checkpoint:
+    if (cfg.model_checkpoint != None):
         cfg.model_checkpoint.dirpath = os.path.join(
             cfg.log_dir, "checkpoints", wandb_id
         )
@@ -122,7 +130,7 @@ def main(cfg: Optional[TrainConfig] = None, run_id: Optional[str] = None):
         raise ValueError("No task specified in config")
 
     # Give the whole TrainConfig to wandb
-    if cfg.logger:
+    if cfg.logger and (rank_zero_only.rank == 0):
         logger.experiment.config.update(
             OmegaConf.to_container(OmegaConf.structured(cfg)), allow_val_change=True
         )
@@ -133,8 +141,7 @@ def main(cfg: Optional[TrainConfig] = None, run_id: Optional[str] = None):
         accelerator="gpu",
         enable_checkpointing=True if cfg.model_checkpoint else False,
         callbacks=callbacks,
-        val_check_interval=cfg.val_check_interval
-        * cfg.accumulate_grad_batches,  # to account for accumulation
+        val_check_interval=cfg.val_check_interval * cfg.accumulate_grad_batches,  # to account for accumulation
         gradient_clip_val=cfg.gradient_clip_val,
         num_sanity_val_steps=0,
         max_epochs=cfg.max_epochs,
@@ -142,8 +149,9 @@ def main(cfg: Optional[TrainConfig] = None, run_id: Optional[str] = None):
         accumulate_grad_batches=cfg.accumulate_grad_batches,
         precision=cfg.precision,
         limit_val_batches=cfg.limit_val_batches if cfg.limit_val_batches else 1.0,
-        devices=1,
-       #strategy="ddp_find_unused_parameters_true"
+        devices=-1,
+        strategy="ddp_find_unused_parameters_true" if cfg.ddp else "auto",
+        num_nodes=1
     )
     trainer.fit(
         model=task,

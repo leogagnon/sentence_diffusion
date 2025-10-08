@@ -1,0 +1,7 @@
+task/finetune: xl
+model_checkpoint: base
+accumulate_grad_batches: 2
+task.finetune.batch_size: 32
+
+ddp: true
+sweep_id: finetune

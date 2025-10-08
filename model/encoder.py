@@ -12,6 +12,7 @@ from torch.nn import functional as F
 from transformers.models.auto.modeling_auto import AutoModelForCausalLM, AutoModel
 from transformers.models.auto.tokenization_auto import AutoTokenizer
 import torch
+from transformers.models.m2m_100.modeling_m2m_100 import M2M100Encoder
 from x_transformers.x_transformers import AttentionLayers, ScaledSinusoidalEmbedding
 import einx
 import math
@@ -24,6 +25,19 @@ from torch.nn import Sequential
 import sentence_transformers
 from lightning.pytorch.utilities.rank_zero import rank_zero_info
 from einops import rearrange
+
+class SONARTransformer(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.auto_model = M2M100Encoder.from_pretrained("cointegrated/SONAR_200_text_encoder")
+    
+    def get_sentence_embedding_dimension(self):
+        return self.auto_model.config.hidden_size
+    
+    def forward(self, features, **kwargs):
+        token_embeddings = self.auto_model(**features).last_hidden_state
+        features.update({'token_embeddings': token_embeddings})
+        return features
 
 def random_substitution(input_ids, sub_p, vocab_size):
 
@@ -75,19 +89,35 @@ class STEncoder(EncoderModel):
         if cfg == None:
             cfg = STEncoderConfig(**kwargs)
 
-        backbone = sentence_transformers.SentenceTransformer(
-            cfg.name,
-        )
-        self.transformer = backbone[0]
-        self.pooling = backbone[1]
-        self.normalization = backbone[2]
+        
+        if 'SONAR' in cfg.name:
+            self.transformer = SONARTransformer()
+            self.pooling = sentence_transformers.models.Pooling(
+                self.transformer.get_sentence_embedding_dimension(),
+                pooling_mode="mean"
+            )
+            self.tokenizer = AutoTokenizer.from_pretrained("cointegrated/SONAR_200_text_encoder")
+            self.tokenizer.src_lang = "eng_Latn"
+            self._latent_dim = self.transformer.get_sentence_embedding_dimension()
+        else:
+            backbone = sentence_transformers.SentenceTransformer(
+                            cfg.name,
+                        )
+        
+            self.transformer = backbone[0]
+            assert isinstance(self.transformer, sentence_transformers.models.Transformer), "Expected Transformer as first module"
+            
+            self.pooling = backbone[1]
+            assert isinstance(self.pooling, sentence_transformers.models.Pooling), "Expected Pooling as second module"
+        
+            if len(backbone) == 3:
+                self.normalization = backbone[2]
+                assert isinstance(self.normalization, sentence_transformers.models.Normalize), "Expected Normalize as third module"
+            else:
+                assert cfg.normalize == False, "Normalization module not found in model, but cfg.normalize is True"
 
-        assert isinstance(self.transformer, sentence_transformers.models.Transformer), "Expected Transformer as first module"
-        assert isinstance(self.pooling, sentence_transformers.models.Pooling), "Expected Pooling as second module"
-        assert isinstance(self.normalization, sentence_transformers.models.Normalize), "Expected Normalize as third module"
-
-        self.tokenizer = backbone.tokenizer
-        self._latent_dim = backbone.get_sentence_embedding_dimension()
+            self.tokenizer = backbone.tokenizer
+            self._latent_dim = backbone.get_sentence_embedding_dimension()
 
         if cfg.lora_cfg == None:
             self.transformer.requires_grad_(False)
@@ -115,21 +145,21 @@ class STEncoder(EncoderModel):
     def latent_len(self):
         return 1
 
-    @torch.no_grad()
     def forward(self, input_ids, attention_mask=None, normalize: Optional[bool] = None):
-        if (self.cfg.dropout_p > 0.0) and self.training:
-            input_ids = random_substitution(
-                input_ids, self.cfg.dropout_p, self.tokenizer.vocab_size
-            )
-        batch = {"input_ids": input_ids, "attention_mask": attention_mask}
-        batch = self.transformer(batch) 
-        batch = self.pooling(batch) 
+        with torch.no_grad() if (self.cfg.lora_cfg is None) else nullcontext():
+            if (self.cfg.dropout_p > 0.0) and self.training:
+                input_ids = random_substitution(
+                    input_ids, self.cfg.dropout_p, self.tokenizer.vocab_size
+                )
+            batch = {"input_ids": input_ids, "attention_mask": attention_mask}
+            batch = self.transformer(batch) 
+            batch = self.pooling(batch) 
 
-        normalize = self.cfg.normalize if normalize is None else normalize
-        if normalize:
-            batch = self.normalization(batch)
+            normalize = self.cfg.normalize if normalize is None else normalize
+            if normalize:
+                batch = self.normalization(batch)
 
-        return batch["sentence_embedding"][:, None]
+            return batch["sentence_embedding"][:, None]
 
 
 @dataclass

@@ -243,8 +243,8 @@ def predict_v_from_start_and_eps(z_t, t, x, noise, schedule):
     return v
 
 
-def get_sampling_timesteps(batch, *, sampling_timesteps, device, invert=False):
-    times = torch.linspace(1.0, 0.0, sampling_timesteps + 1, device=device)
+def get_sampling_timesteps(batch, *, sampling_timesteps, device, dtype=None, invert=False):
+    times = torch.linspace(1.0, 0.0, sampling_timesteps + 1, device=device, dtype=dtype)
     if invert:
         times = times.flip(dims=(0,))
     times = repeat(times, "t -> b t", b=batch)
@@ -327,16 +327,17 @@ def ddim_sample(
     invert=False,
     z_t=None,
 ):
-    batch, device = shape[0], next(model.parameters()).device
+    param = next(model.parameters())
+    batch, device, dtype = shape[0], param.device, param.dtype
 
     time_pairs = get_sampling_timesteps(
-        batch, sampling_timesteps=sampling_timesteps, device=device, invert=invert
+        batch, sampling_timesteps=sampling_timesteps, device=device, invert=invert, dtype=dtype
     )
     if invert:
         assert exists(z_t)
 
     if not exists(z_t):
-        z_t = torch.randn(shape, device=device)
+        z_t = torch.randn(shape, device=device, dtype=dtype)
 
     x_start = None
 
@@ -396,14 +397,15 @@ def ddpm_sample(
     invert=False,
     z_t=None,
 ):
-    batch, device = shape[0], next(model.parameters()).device
+    param = next(model.parameters())
+    batch, device, dtype = shape[0], param.device, param.dtype
 
     time_pairs = get_sampling_timesteps(
-        batch, sampling_timesteps=sampling_timesteps, device=device
+        batch, sampling_timesteps=sampling_timesteps, device=device, dtype=dtype
     )
 
     if not exists(z_t):
-        z_t = torch.randn(shape, device=device)
+        z_t = torch.randn(shape, device=device, dtype=dtype)
 
     x_start = None
 
@@ -467,14 +469,15 @@ def dpmpp_sample(
     invert=False,
     z_t=None,
 ):
-    batch, device = shape[0], next(model.parameters()).device
+    param = next(model.parameters())
+    batch, device, dtype = shape[0], param.device, param.dtype
 
     time_pairs = get_sampling_timesteps(
-        batch, sampling_timesteps=sampling_timesteps, device=device
+        batch, sampling_timesteps=sampling_timesteps, device=device, dtype=dtype
     )
 
     if not exists(z_t):
-        z_t = torch.randn(shape, device=device)
+        z_t = torch.randn(shape, device=device, dtype=dtype)
 
     x_start = None
     old_pred_x = []
@@ -557,7 +560,7 @@ def sample(
         raise ValueError(f"invalid sampler {sampler}")
     return sample_fn(
         model=model,
-        shape=(batch_size, model.cfg.seq_len, model.cfg.latent_dim),
+        shape=(batch_size, model.cfg.latent_len, model.cfg.latent_dim),
         class_id=class_id,
         cond=cond,
         cond_input_ids=cond_input_ids,

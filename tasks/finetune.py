@@ -53,9 +53,12 @@ class FinetuneTask(L.LightningModule):
 
         self.dataset = hydra.utils.instantiate(cfg.dataset)
         # Randomly choose split into train and val
-        indices = torch.randperm(len(self.dataset))
-        self.register_buffer("train_indices", indices[: -cfg.val_size])
-        self.register_buffer("val_indices", indices[-cfg.val_size :])
+        indices = torch.randperm(len(self.dataset), generator=torch.Generator().manual_seed(42))
+        #self.register_buffer("train_indices", indices[: -cfg.val_size])
+        #self.register_buffer("val_indices", indices[-cfg.val_size :])
+
+        self.train_indices = indices[: -cfg.val_size]
+        self.val_indices = indices[-cfg.val_size :]
 
         self.cfg = cfg
         # Important for checkpoints
@@ -78,7 +81,7 @@ class FinetuneTask(L.LightningModule):
             num_workers=len(os.sched_getaffinity(0)),
             pin_memory=True,
             persistent_workers=True,
-            shuffle=True,
+            shuffle=False,
             collate_fn=self.dataset.get_collate_and_tokenize_fn(
                 dec_tokenizer=self.decoder.tokenizer,
             ),
@@ -118,7 +121,8 @@ class FinetuneTask(L.LightningModule):
             add_dataloader_idx=False,
             batch_size=logits.shape[0],
             on_step=True,
-            on_epoch=False
+            on_epoch=False,
+            sync_dist=True,
         )
 
         return loss
@@ -144,7 +148,8 @@ class FinetuneTask(L.LightningModule):
             add_dataloader_idx=False,
             batch_size=logits.shape[0],
             on_step=False,
-            on_epoch=True
+            on_epoch=True,
+            sync_dist=True,
         )
 
         return loss

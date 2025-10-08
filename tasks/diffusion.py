@@ -106,9 +106,8 @@ class GaussianDiffusionTask(L.LightningModule):
 
         # Load and process decoder (merge adapter, eval, no gradients, bfloat16, flash attention)
         self.decoder = ae_task.decoder.eval().requires_grad_(False)
-        self.decoder.backbone = self.decoder.backbone.merge_and_unload().to(
-            torch.bfloat16
-        )
+        self.decoder.backbone = self.decoder.backbone.merge_and_unload()
+        self.decoder = self.decoder.to(torch.bfloat16)
         self.decoder.backbone.set_attn_implementation("flash_attention_2")
 
         # Init diffusion model
@@ -139,12 +138,6 @@ class GaussianDiffusionTask(L.LightningModule):
         self.save_hyperparameters(
             OmegaConf.to_container(OmegaConf.structured(cfg)), logger=False
         )
-
-    def to(self, *args, **kwargs):
-        # Override so that decoder and ema_model stay on CPU by default
-        self.model.to(*args, **kwargs)
-        self.encoder.to(*args, **kwargs)
-        return self
 
     def setup(self, stage: Optional[str] = None):
         self.train_data = Subset(self.dataset, indices=self.train_indices)

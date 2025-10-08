@@ -1,9 +1,11 @@
 #!/bin/bash
-#SBATCH --time=6:00:00
-#SBATCH --cpus-per-task=1
-#SBATCH --mem=256G
-#SBATCH --partition=long-cpu
+#SBATCH --time=8:00:00
+#SBATCH --cpus-per-task=2
+#SBATCH --gres=gpu:a100l:2
+#SBATCH --ntasks-per-node=1
+#SBATCH --mem=32G
+#SBATCH --partition=long
 
 source ~/sentence_diffusion/venv/bin/activate
 
-python filter_wiki_paragraphs.py
+srun python train.py task/ae=sonar

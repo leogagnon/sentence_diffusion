@@ -1,15 +1,17 @@
 defaults:
   - submitit_slurm
 
-mem_gb: 64
-gres: gpu:l40s:1
-tasks_per_node: 1
+mem_gb: 32
+gres: gpu:a100l:4
+tasks_per_node: 4
 array_parallelism: 32
-cpus_per_task: 4
-timeout_min: 1440 # 24 hours
+nodes: 1 
+cpus_per_task: 2
+timeout_min: 360 # 6 hours
 partition: long
 additional_parameters:
   no-requeue: true
 
 setup:
+  - "export NCCL_DEBUG=INFO"
   - "source ~/sentence_diffusion/venv/bin/activate"

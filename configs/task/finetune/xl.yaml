@@ -1,5 +1,5 @@
 lr: 1e-4
-batch_size: 16
+batch_size: 64
 decoder:
   name: gpt2-xl # 1.5B params
   lora_cfg: 
@@ -9,9 +9,9 @@ decoder:
     lora_dropout: 0.1
     bias: "none"
 
-max_generation_length: 128
-dataset:
-  path: data/
+max_generation_length: 150
 
 val_size: 16384
 
+defaults:
+  - dataset: wiki

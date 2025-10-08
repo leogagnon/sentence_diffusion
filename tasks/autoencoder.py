@@ -25,7 +25,7 @@ import wandb
 from tasks.finetune import FinetuneTask
 import hydra
 from model.gaussian_diffusion import time_to_alpha, cosine_schedule
-
+from lightning.pytorch.utilities.rank_zero import rank_zero_info, rank_zero_only
 
 @dataclass
 class AETaskConfig:
@@ -170,7 +170,7 @@ class AETask(L.LightningModule):
             ignore_index=-100,
         )
 
-        self.log("train/reconstruction_loss", recon_loss, on_epoch=False, on_step=True)
+        self.log("train/reconstruction_loss", recon_loss, on_epoch=False, on_step=True, sync_dist=True)
 
         return recon_loss
 
@@ -183,7 +183,7 @@ class AETask(L.LightningModule):
         z = self.encoder(batch["input_ids_enc"], batch["attention_mask_enc"])
 
         self.log(
-            "val/latent_norm", z.norm(p=2, dim=-1).mean().detach().item(), on_epoch=True
+            "val/latent_norm", z.norm(p=2, dim=-1).mean().detach().item(), on_epoch=True, sync_dist=True
         )
 
         # Reconstruction loss of clean sample
@@ -198,7 +198,7 @@ class AETask(L.LightningModule):
             targets.view(-1),
             ignore_index=-1,
         )
-        self.log("val/reconstruction_loss", recon_loss, on_epoch=True)
+        self.log("val/reconstruction_loss", recon_loss, on_epoch=True, sync_dist=True)
 
         # Reconstruction loss of noised sample
         z_noised = math.sqrt(0.95) * z + math.sqrt(1 - 0.95) * torch.randn_like(z)
@@ -209,10 +209,10 @@ class AETask(L.LightningModule):
             targets.view(-1),
             ignore_index=-1,
         )
-        self.log("val/reconstruction_loss_noised", recon_loss_noised, on_epoch=True)
+        self.log("val/reconstruction_loss_noised", recon_loss_noised, on_epoch=True, sync_dist=True)
 
         # Log some generation for the first batch
-        if batch_idx == 0:
+        if (batch_idx == 0) and (rank_zero_only.rank == 0):
             # Log generations from interpolated samples
             group_indices = torch.randperm(z.shape[0]).chunk(2)
             z_groups = [z[indices] for indices in group_indices]

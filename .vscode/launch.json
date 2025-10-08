@@ -12,7 +12,7 @@
             "program": "train.py",
             "console": "integratedTerminal",
             "justMyCode": false,
-            "args": ["task/ae=e5"],
+            "args": ["task/ae=qwen_dae"],
         }
     ]
 }

@@ -1,6 +1,5 @@
 _target_: lightning.pytorch.callbacks.ModelCheckpoint
 dirpath: null # To be set using the Wandb run id
-filename: "{epoch:03d},{step:03d}"
 auto_insert_metric_name: True
 monitor: step
 mode: max

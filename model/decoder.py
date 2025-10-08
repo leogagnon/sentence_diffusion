@@ -169,6 +169,7 @@ class DecoderModel(nn.Module):
         max_length: int,
         z: Optional[torch.Tensor] = None,
         alpha: Optional[torch.Tensor] = None,
+        batch_size: Optional[int] = None
     ):
         """Generate text using autoregressive decoding, potentially conditioned on soft prefix z"""
 
@@ -184,16 +185,22 @@ class DecoderModel(nn.Module):
             attention_mask = torch.ones(
                 (prompt.shape[0], prompt.shape[1] + 1), device=z.device
             )
+            device=z.device
+            batch_size = z.shape[0]
+            if batch_size is not None:
+                assert batch_size == z.shape[0]
         else:
             cache = None
             cache_position = None
             attention_mask = None
+            device = next(self.backbone.parameters()).device
+            assert batch_size is not None, "Must provide batch_size if no z is given"
 
         # Autoregressive generation from BOS token with cached z (nucleus sampling)
         bos = torch.full(
-            (z.shape[0], 1),
+            (batch_size, 1),
             self.tokenizer.bos_token_id,
-            device=z.device,
+            device=device,
             dtype=torch.long,
         )
         output = self.backbone.generate(
