@@ -27,6 +27,12 @@ from model.gaussian_diffusion import time_to_alpha, cosine_schedule
 from lightning.pytorch.utilities.rank_zero import rank_zero_info, rank_zero_only
 
 
+def reparameterize(mean, logvar):
+    std = torch.exp(0.5 * logvar)
+    eps = torch.randn_like(std)
+    return eps.mul(std).add_(mean)
+
+
 @dataclass
 class AETaskConfig:
     lr: float
@@ -40,8 +46,9 @@ class AETaskConfig:
     data_seed: int = 42
 
     z_noise_type: str = "none"  # fixed, schedule, none
-    z_noise_alpha: float = 0.90
+    z_noise_alpha: float = 0.999
     z_dropout_p: float = 0.0
+    kl_beta: float = 1e-5
 
     name: Optional[str] = None
     encoder_prompt: Optional[str] = None
@@ -67,6 +74,11 @@ class AETask(L.LightningModule):
         if cfg.encoder != None:
             self.encoder = hydra.utils.instantiate(cfg.encoder)
             cfg.decoder.input_dim = self.encoder.latent_dim
+
+        if cfg.z_noise_type == "variational":
+            assert (
+                self.encoder.cfg.variational == True
+            ), "Encoder must be variational if z_noise_type is variational"
 
         self.decoder = DecoderModel(cfg.decoder)
 
@@ -142,16 +154,21 @@ class AETask(L.LightningModule):
         if self.cfg.encoder != None:
             z = self.encoder(batch["input_ids_enc"], batch["attention_mask_enc"])
 
-            # Add scale-invariance noise to z
-            if self.cfg.z_noise_type != "none":
+            if self.cfg.z_noise_type == "variational":
+                # Variational AE style reparameterization
+                mean, logvar = z
+                z = reparameterize(mean, logvar)
+            elif self.cfg.z_noise_type != "none":
+                # Add scale-invariant noise to z
+                # Keeps norm of z roughly the same and SNR controlled by alpha
                 alpha = self.sample_alpha(z)
                 alpha = right_pad_dims_to(z, alpha)
 
                 z_flat = z.view(z.shape[0], -1)
-                norm = z_flat.norm(dim=1, keepdim=True).detach()           
-                w = (norm / (z_flat.shape[1]**0.5)).clamp_min(1e-6)
+                norm = z_flat.norm(dim=1, keepdim=True).detach()
+                w = (norm / (z_flat.shape[1] ** 0.5)).clamp_min(1e-6)
                 w = right_pad_dims_to(z, w)
-                
+
                 z = alpha.sqrt() * z + (1 - alpha).sqrt() * w * torch.randn_like(z)
 
             # Apply z dropout
@@ -181,6 +198,18 @@ class AETask(L.LightningModule):
             on_step=True,
             sync_dist=True,
         )
+
+        # If variational, add KL loss
+        if self.cfg.z_noise_type == "variational":
+            kl_loss = -0.5 * torch.sum(1 + logvar - mean.pow(2) - logvar.exp())
+            recon_loss += self.cfg.kl_beta * kl_loss
+            self.log(
+                "train/KL_loss",
+                kl_loss,
+                on_epoch=False,
+                on_step=True,
+                sync_dist=True,
+            )
 
         return recon_loss
 

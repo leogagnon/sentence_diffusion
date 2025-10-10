@@ -118,7 +118,7 @@ class STEncoderConfig:
     dropout_p: float = 0.0
     compressor_cfg: Optional[CompressorConfig] = None
     sem_cfg: Optional[SEMHeadConfig] = None
-
+    variational: bool = False 
 
 class STEncoder(EncoderModel):
     def __init__(self, cfg: Optional[STEncoderConfig] = None, **kwargs):
@@ -173,6 +173,12 @@ class STEncoder(EncoderModel):
 
             cfg.sem_cfg.input_dim = self.latent_dim
             self.sem = SEMHead(cfg.sem_cfg)
+        
+        if cfg.variational:
+            assert cfg.normalize == False, "Normalization not compatible with variational AE"
+            assert cfg.compressor_cfg == None, "Compressor not compatible with variational AE"
+            self.out_mean = nn.Linear(self.latent_dim, self.latent_dim)
+            self.out_logvar = nn.Linear(self.latent_dim, self.latent_dim)
 
         if cfg.lora_cfg == None:
             # Make the transformer non-trainable but faster!
@@ -234,6 +240,15 @@ class STEncoder(EncoderModel):
                 sentence_embedding = self.sem(sentence_embedding)
 
             sentence_embedding = sentence_embedding[:, None]  
+
+            # Maybe apply VAE heads
+            if self.cfg.variational:
+                if self.training:
+                    mean = self.out_mean(sentence_embedding)
+                    logvar = self.out_logvar(sentence_embedding)
+                    return mean, logvar
+                else:
+                    return self.out_mean(sentence_embedding)
         else: 
             # Cross-attention bottleneck
             ph = einx.rearrange(
@@ -243,7 +258,7 @@ class STEncoder(EncoderModel):
                 ph,
                 context=batch["token_embeddings"],
                 context_mask=batch["attention_mask"],
-            ) 
+            )
 
         return sentence_embedding
 

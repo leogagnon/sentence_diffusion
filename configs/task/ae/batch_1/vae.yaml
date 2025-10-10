@@ -2,9 +2,8 @@ batch_size: 16
 lr: 1e-4
 max_generation_length: 150
 val_size: 16384
-z_noise_type: fixed
-z_noise_alpha: 0.999
-z_dropout_p: 0.0
+z_noise_type: variational
+kl_beta: 1e-5
 
 encoder:
   _target_: model.encoder.STEncoder
@@ -16,14 +15,15 @@ encoder:
     target_modules: ["o_proj", "down_proj", "v_proj", "up_proj", "gate_proj", "k_proj"]
     lora_dropout: 0.1
     bias: "none"
-  compressor_cfg:
-    n_layers: 6
-    n_heads: 12
-    k: 16
   dropout_p: 0.3
+  variational: true
 
 decoder:
   name: gpt2-large # 1.5B params
+  prompt_generator_cfg:
+    n_layers: 6
+    n_heads: 12
+    k: 8
   lora_cfg: 
     r: 128
     lora_alpha: 32
@@ -31,7 +31,7 @@ decoder:
     lora_dropout: 0.1
     bias: "none"
 
-name: dae_wide
+name: vae
 
 defaults:
   - dataset: wiki

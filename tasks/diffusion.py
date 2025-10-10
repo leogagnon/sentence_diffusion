@@ -35,6 +35,7 @@ class GaussianDiffusionTaskConfig:
     lr: float
     pretrained_ae_id: str
     name: Optional[str] = None
+    data_seed: int = 42
 
     loss: str = "l2"
     sampling_timesteps: int = 50
@@ -110,7 +111,7 @@ class GaussianDiffusionTask(L.LightningModule):
         self.decoder = self.decoder.to(torch.bfloat16)
         self.decoder.backbone.set_attn_implementation("flash_attention_2")
 
-        # Init diffusion model
+        # Init diffusion model (and EMA model)
         cfg.model.latent_dim = self.encoder.latent_dim
         cfg.model.latent_len = self.encoder.latent_len
         self.model = DiT(cfg.model)
@@ -138,6 +139,13 @@ class GaussianDiffusionTask(L.LightningModule):
         self.save_hyperparameters(
             OmegaConf.to_container(OmegaConf.structured(cfg)), logger=False
         )
+
+    def train(self, mode: bool = True):
+        super().train(mode)
+        # Make sure encoder and decoder and EMA are always in eval mode
+        self.encoder.eval()
+        self.decoder.eval()
+        self.ema_model.eval()
 
     def setup(self, stage: Optional[str] = None):
         self.train_data = Subset(self.dataset, indices=self.train_indices)
@@ -189,13 +197,19 @@ class GaussianDiffusionTask(L.LightningModule):
                     DataLoader(
                         Subset(
                             self.train_data,
-                            torch.randperm(len(self.train_data))[:20000],
+                            torch.randperm(
+                                len(self.train_data),
+                                generator=torch.Generator().manual_seed(
+                                    self.cfg.data_seed
+                                ),
+                            )[:20000],
                         ),
                         batch_size=self.cfg.batch_size,
                         collate_fn=self.dataset.get_collate_and_tokenize_fn(
                             enc_tokenizer=self.encoder.tokenizer,
                         ),
                         shuffle=False,
+                        generator=torch.Generator().manual_seed(self.cfg.data_seed),
                     ),
                     desc="Computing latent mean and scale on 20000 training samples...",
                 ):
@@ -220,7 +234,6 @@ class GaussianDiffusionTask(L.LightningModule):
 
         # Compute latents
         with torch.no_grad():
-            assert self.encoder.training == False
             latent = self.encoder(
                 batch["input_ids_enc"],
                 attention_mask=batch["attention_mask_enc"],
@@ -244,92 +257,14 @@ class GaussianDiffusionTask(L.LightningModule):
             batch_size=latent.shape[0],
             on_step=True,
             on_epoch=False,
-            sync_dist=True
+            sync_dist=True,
         )
 
         return loss
-
-    def on_train_batch_end(self, outputs, batch, batch_idx):
-        # Update EMA model every step
-        if batch_idx % self.trainer.accumulate_grad_batches == 0:
-            self.ema_model.update_parameters(self.model)
-
-    def on_validation_epoch_start(self):
-        self.ema_model = self.ema_model.cuda()
-        self.model = self.model.cpu()
-
-    @torch.no_grad()
-    def get_mauve_score(self):
-        """
-        Compute MAUVE score on the validation set using the EMA model.
-        Temporarily moves the decoder to GPU.
-        """
-        self.decoder = self.decoder.cuda()
-        if not hasattr(self, "val_feats"):
-            val_sentences = []
-            for batch in self.val_dataloader():
-                val_sentences += batch["input_str"]
-
-            feats = get_features_from_input(
-                None, None, val_sentences, "gpt2-large", 256, 0, "q", 128
-            )
-
-            self.val_feats = torch.Tensor(feats)
-
-        generations = []
-        for it in tqdm(range(len(self.val_feats) // 128)):
-            z = sample(
-                model=self.ema_model.module,
-                batch_size=128,
-                sampling_timesteps=self.cfg.sampling_timesteps,
-                sampler=self.cfg.sampler,
-                schedule=self.train_schedule,
-                diffusion_objective=self.cfg.diffusion_objective,
-            )
-            if self.cfg.normalize_latent:
-                z = self.unnormalize_latent(z)
-            z = z.half()
-            tokens = self.decoder.generate(
-                z=z, max_length=self.cfg.max_generation_length
-            )
-            generations += self.decoder.tokenizer.batch_decode(
-                tokens, skip_special_tokens=True
-            )
-
-        mauve = compute_mauve(
-            p_text=generations,
-            q_features=self.val_feats,
-            max_text_length=self.cfg.max_generation_length,
-            batch_size=128,
-            device_id=0,
-            featurize_model_name="gpt2-large",
-        ).mauve
-        self.decoder = self.decoder.cpu()
-
-        return mauve
-
-    def on_validation_epoch_end(self):
-        if self.cfg.validation_mauve:
-            mauve_score = self.get_mauve_score()
-            self.log(
-                "val/mauve",
-                mauve_score,
-                prog_bar=True,
-                add_dataloader_idx=False,
-                on_epoch=True,
-                on_step=False,
-                sync_dist=True
-            )
-        self.ema_model = self.ema_model.cpu()
-        self.model = self.model.cuda()
-
+    
     @torch.no_grad()
     def validation_step(self, batch, batch_idx=None):
-        if self.ema_model.module.training:
-            self.ema_model = self.ema_model.eval()
-            rank_zero_info(
-                "The EMA model was in training mode, setting it to eval mode."
-            )
+    
         # Compute latents
         latent = self.encoder(
             batch["input_ids_enc"],
@@ -354,7 +289,31 @@ class GaussianDiffusionTask(L.LightningModule):
             batch_size=latent.shape[0],
             on_epoch=True,
             on_step=False,
-            sync_dist=True
+            sync_dist=True,
         )
 
         return loss
+
+    def on_train_batch_end(self, outputs, batch, batch_idx):
+        # Update EMA model every step
+        if batch_idx % self.trainer.accumulate_grad_batches == 0:
+            self.ema_model.update_parameters(self.model)
+
+    def on_validation_epoch_start(self):
+        self.ema_model = self.ema_model.cuda()
+        self.model = self.model.cpu()
+
+    def on_validation_epoch_end(self):
+        if self.cfg.validation_mauve:
+            mauve_score = self.get_mauve_score()
+            self.log(
+                "val/mauve",
+                mauve_score,
+                prog_bar=True,
+                add_dataloader_idx=False,
+                on_epoch=True,
+                on_step=False,
+                sync_dist=True,
+            )
+        self.ema_model = self.ema_model.cpu()
+        self.model = self.model.cuda()
