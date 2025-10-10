@@ -11,7 +11,6 @@ from lightning.pytorch.loggers import WandbLogger
 from omegaconf import MISSING, DictConfig, OmegaConf, SCMode
 from tasks.autoencoder import AETask, AETaskConfig
 from tasks.diffusion import GaussianDiffusionTask, GaussianDiffusionTaskConfig
-from tasks.finetune import FinetuneTask, FinetuneTaskConfig
 from lightning.pytorch.callbacks import EarlyStopping
 from lightning.pytorch.utilities.rank_zero import rank_zero_info, rank_zero_only
 
@@ -25,7 +24,6 @@ torch.set_float32_matmul_precision("medium")
 class TaskConfig:
     ae: Optional[AETaskConfig] = None
     diffusion: Optional[GaussianDiffusionTaskConfig] = None
-    finetune: Optional[FinetuneTaskConfig] = None
 
 
 @dataclass
@@ -34,14 +32,14 @@ class TrainConfig:
     seed: int
     log_dir: str
     max_epochs: int
-    accumulate_grad_batches: int
     val_check_interval: int
     logger: dict
-    ddp: bool = False
+    strategy: str = "auto"
     sweep_id: Optional[str] = None
+    effective_batch_size: Optional[int] = None  # if None, no accumulation 
     model_checkpoint: Optional[dict] = None
     early_stopping: Optional[dict] = None
-    gradient_clip_val: float = 1.0
+    gradient_clip_val: Optional[float] = None
     name: Optional[str] = None
     precision: str = "bf16-mixed"
     limit_val_batches: Optional[int] = None
@@ -67,6 +65,7 @@ def main(cfg: Optional[TrainConfig] = None, run_id: Optional[str] = None):
 
         # Set the logger ID to the provided run_id (to resume the run)
         cfg.logger.id = wandb_id
+        logger = hydra.utils.instantiate(cfg.logger)
     else:
         # Setup tags for wandb
         tags = [k for k in cfg.task.keys() if cfg.task[k] != None]
@@ -74,18 +73,13 @@ def main(cfg: Optional[TrainConfig] = None, run_id: Optional[str] = None):
         if "USER" in os.environ:
             tags += [os.environ["USER"]]
         cfg.logger.tags = tags
+        logger = hydra.utils.instantiate(cfg.logger)
+        if rank_zero_only.rank == 0:
+            wandb_id = logger.experiment.path.split("/")[-1]
+        else:
+            wandb_id = "dummy" # will not be used
     
-    L.seed_everything(cfg.seed)
-
-    logger = hydra.utils.instantiate(cfg.logger)
-
-    if rank_zero_only.rank == 0:
-        wandb_id = logger.experiment.path.split("/")[-1]
-    else:
-        # For non-zero ranks (ddp), the logger is a dummy so we set a fake wandb_id
-        # It won't be used anyway
-        wandb_id = 'test'
-
+    L.seed_everything(cfg.seed, workers=True)
 
     # Setup checkpoint (with wandb ID as <dirpath>)
     callbacks = []
@@ -123,9 +117,6 @@ def main(cfg: Optional[TrainConfig] = None, run_id: Optional[str] = None):
     elif cfg.task.ae != None:
         task = AETask(cfg.task.ae)
         cfg.task.ae = task.cfg
-    elif cfg.task.finetune != None:
-        task = FinetuneTask(cfg.task.finetune)
-        cfg.task.finetune = task.cfg
     else:
         raise ValueError("No task specified in config")
 
@@ -135,23 +126,33 @@ def main(cfg: Optional[TrainConfig] = None, run_id: Optional[str] = None):
             OmegaConf.to_container(OmegaConf.structured(cfg)), allow_val_change=True
         )
 
+    # Compute how many batches to accumulate to reach the effective batch size
+    if cfg.effective_batch_size is None:
+        accumulate_grad_batches = 1
+    else:
+        assert (
+            cfg.effective_batch_size % task.cfg.batch_size == 0
+        ), f"Effective batch size ({cfg.effective_batch_size}) must be a multiple of task batch size ({task.cfg.batch_size})"
+        accumulate_grad_batches = cfg.effective_batch_size // task.cfg.batch_size
+
     # Instantiate the trainer
     trainer = L.Trainer(
         logger=logger,
         accelerator="gpu",
         enable_checkpointing=True if cfg.model_checkpoint else False,
         callbacks=callbacks,
-        val_check_interval=cfg.val_check_interval * cfg.accumulate_grad_batches,  # to account for accumulation
+        val_check_interval=cfg.val_check_interval * accumulate_grad_batches,  # to account for accumulation
         gradient_clip_val=cfg.gradient_clip_val,
         num_sanity_val_steps=0,
         max_epochs=cfg.max_epochs,
         log_every_n_steps=50,
-        accumulate_grad_batches=cfg.accumulate_grad_batches,
+        accumulate_grad_batches=accumulate_grad_batches,
         precision=cfg.precision,
         limit_val_batches=cfg.limit_val_batches if cfg.limit_val_batches else 1.0,
         devices=-1,
-        strategy="ddp_find_unused_parameters_true" if cfg.ddp else "auto",
-        num_nodes=1
+        strategy=cfg.strategy,
+        num_nodes=1,
+        deterministic=True
     )
     trainer.fit(
         model=task,

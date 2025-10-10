@@ -26,6 +26,41 @@ import sentence_transformers
 from lightning.pytorch.utilities.rank_zero import rank_zero_info
 from einops import rearrange
 
+@dataclass
+class SEMHeadConfig:
+    L: int
+    V: int
+    temp: float
+    input_dim: Optional[int] = None
+
+
+class SEMHead(nn.Module):
+    def __init__(self, cfg: SEMHeadConfig):
+        super().__init__()
+        assert cfg.input_dim is not None, "input_dim has to be set"
+        self.proj_in = nn.Linear(cfg.input_dim, cfg.L * cfg.V)
+        self.norm = nn.LayerNorm(cfg.L * cfg.V, eps=1e-6)
+        self.proj_out = nn.Linear(cfg.L * cfg.V, cfg.input_dim)
+        self.cfg = cfg
+
+    def forward(self, x):
+        # x: (B, D)
+        x = self.proj_in(x)
+        x = self.norm(x)
+        x = einx.rearrange("b (l v) -> b l v", x, l=self.cfg.L, v=self.cfg.V)
+        x = torch.softmax(x / self.cfg.temp, dim=-1)
+        x = einx.rearrange("b l v -> b (l v)", x)
+        x = self.proj_out(x)
+
+        return x
+
+@dataclass
+class CompressorConfig:
+    n_layers: int
+    n_heads: int
+    k: int = 1
+
+
 class SONARTransformer(nn.Module):
     def __init__(self):
         super().__init__()
@@ -81,6 +116,9 @@ class STEncoderConfig:
     normalize: bool
     lora_cfg: Optional[dict] = None
     dropout_p: float = 0.0
+    compressor_cfg: Optional[CompressorConfig] = None
+    sem_cfg: Optional[SEMHeadConfig] = None
+
 
 class STEncoder(EncoderModel):
     def __init__(self, cfg: Optional[STEncoderConfig] = None, **kwargs):
@@ -89,7 +127,6 @@ class STEncoder(EncoderModel):
         if cfg == None:
             cfg = STEncoderConfig(**kwargs)
 
-        
         if 'SONAR' in cfg.name:
             self.transformer = SONARTransformer()
             self.pooling = sentence_transformers.models.Pooling(
@@ -109,18 +146,36 @@ class STEncoder(EncoderModel):
             
             self.pooling = backbone[1]
             assert isinstance(self.pooling, sentence_transformers.models.Pooling), "Expected Pooling as second module"
-        
-            if len(backbone) == 3:
+
+            if cfg.normalize:
                 self.normalization = backbone[2]
-                assert isinstance(self.normalization, sentence_transformers.models.Normalize), "Expected Normalize as third module"
-            else:
-                assert cfg.normalize == False, "Normalization module not found in model, but cfg.normalize is True"
+                assert isinstance(self.normalization, sentence_transformers.models.Normalize), "Expected Normalize as third module (as cfg.normalize is True)"
 
             self.tokenizer = backbone.tokenizer
-            self._latent_dim = backbone.get_sentence_embedding_dimension()
+            self._latent_dim = self.transformer.auto_model.get_input_embeddings().weight.shape[1]
+
+        if cfg.compressor_cfg != None:
+            # Will replace self.pooling
+            self.compressor = AttentionLayers(
+                    dim=self.latent_dim,
+                    depth=cfg.compressor_cfg.n_layers,
+                    heads=cfg.compressor_cfg.n_heads,
+                    cross_attend=True,
+                    causal=False,
+                )
+            self.placeholder_tokens = nn.Parameter(
+                torch.randn(cfg.compressor_cfg.k, self.latent_dim)
+            )
+
+        if cfg.sem_cfg != None:
+            assert cfg.compressor_cfg == None
+            assert cfg.normalize == False
+
+            cfg.sem_cfg.input_dim = self.latent_dim
+            self.sem = SEMHead(cfg.sem_cfg)
 
         if cfg.lora_cfg == None:
-            self.transformer.requires_grad_(False)
+            # Make the transformer non-trainable but faster!
             self.transformer.auto_model = self.transformer.auto_model.to(torch.bfloat16)
             try:
                 self.transformer.auto_model.set_attn_implementation(
@@ -128,6 +183,8 @@ class STEncoder(EncoderModel):
                 )
             except:
                 rank_zero_info("Tried to use flash attention in encoder, but it is not available.")
+            self.transformer.requires_grad_(False)
+            self.transformer.eval()
         else:
             self.transformer.requires_grad_(True)
             self.transformer = get_peft_model(
@@ -137,65 +194,58 @@ class STEncoder(EncoderModel):
 
         self.cfg = cfg
 
+    def train(self, mode: bool = True):
+        super().train(mode)
+        # Keep the transformer in eval model if not finetuning
+        if self.cfg.lora_cfg == None:
+            self.transformer.eval()
+
     @property
     def latent_dim(self):
         return self._latent_dim
     
     @property
     def latent_len(self):
-        return 1
+        return 1 if self.cfg.compressor_cfg is None else self.cfg.compressor_cfg.k
 
-    def forward(self, input_ids, attention_mask=None, normalize: Optional[bool] = None):
-        with torch.no_grad() if (self.cfg.lora_cfg is None) else nullcontext():
-            if (self.cfg.dropout_p > 0.0) and self.training:
-                input_ids = random_substitution(
-                    input_ids, self.cfg.dropout_p, self.tokenizer.vocab_size
-                )
-            batch = {"input_ids": input_ids, "attention_mask": attention_mask}
-            batch = self.transformer(batch) 
-            batch = self.pooling(batch) 
+    def forward(self, input_ids, attention_mask=None):
+        # Maybe randomly substitute tokens (for DAE training)
+        if (self.cfg.dropout_p > 0.0) and self.training:
+            input_ids = random_substitution(
+                input_ids, self.cfg.dropout_p, self.tokenizer.vocab_size
+            )
 
-            normalize = self.cfg.normalize if normalize is None else normalize
-            if normalize:
-                batch = self.normalization(batch)
+        # Make the batch dict expected by sentence_transformers models
+        batch = {"input_ids": input_ids, "attention_mask": attention_mask}
 
-            return batch["sentence_embedding"][:, None]
+        # Run through transformer
+        batch = self.transformer(batch)
 
+        if self.cfg.compressor_cfg == None:
+            # Pooling bottleneck + normalization/SEM
+            batch = self.pooling(batch)
 
-@dataclass
-class SEMHeadConfig:
-    L: int
-    V: int
-    temp: float
-    input_dim: Optional[int] = None
+            if self.cfg.normalize:
+                sentence_embedding = self.normalization(batch)["sentence_embedding"]
+            else:
+                sentence_embedding = batch["sentence_embedding"]
+            
+            if self.cfg.sem_cfg != None:
+                sentence_embedding = self.sem(sentence_embedding)
 
+            sentence_embedding = sentence_embedding[:, None]  
+        else: 
+            # Cross-attention bottleneck
+            ph = einx.rearrange(
+                "k d -> b k d", self.placeholder_tokens, b=batch["token_embeddings"].shape[0]
+            )
+            sentence_embedding = self.compressor(
+                ph,
+                context=batch["token_embeddings"],
+                context_mask=batch["attention_mask"],
+            ) 
 
-class SEMHead(nn.Module):
-    def __init__(self, cfg: SEMHeadConfig):
-        super().__init__()
-        assert cfg.input_dim is not None, "input_dim has to be set"
-        self.proj_in = nn.Linear(cfg.input_dim, cfg.L * cfg.V)
-        self.norm = nn.LayerNorm(cfg.L * cfg.V, eps=1e-6)
-        self.proj_out = nn.Linear(cfg.L * cfg.V, cfg.input_dim)
-        self.cfg = cfg
-
-    def forward(self, x):
-        # x: (B, D)
-        x = self.proj_in(x)
-        x = self.norm(x)
-        x = einx.rearrange("b (l v) -> b l v", x, l=self.cfg.L, v=self.cfg.V)
-        x = torch.softmax(x / self.cfg.temp, dim=-1)
-        x = einx.rearrange("b l v -> b (l v)", x)
-        x = self.proj_out(x)
-
-        return x
-
-
-@dataclass
-class CompressorConfig:
-    n_layers: int
-    n_heads: int
-    k: int = 1
+        return sentence_embedding
 
 
 @dataclass

@@ -1,0 +1,10 @@
+task/ae: batch_1/frozen_qwen, batch_1/frozen_sonar, batch_1/frozen_st5, batch_1/gpt2_xl, batch_1/gpt2_large, batch_1/dae, batch_1/dae_wide, batch_1/dae_sem
+model_checkpoint: base
+effective_batch_size: 256
+task.ae.batch_size: 16 
+precision: bf16-mixed
+limit_val_batches: 8
+val_check_interval: 256
+
+sweep_id: ae_clean
+

@@ -1,20 +1,19 @@
-train_batch_size: 32
-val_batch_size: 32
+batch_size: 32
 lr: 1e-4
-max_generation_length: 128
+max_generation_length: 150
 val_size: 16384
 z_noise_type: fixed
-z_noise_alpha: 0.95
+z_noise_alpha: 0.999
 z_dropout_p: 0.0
 
 encoder:
   _target_: model.encoder.STEncoder
-  name: Qwen/Qwen3-Embedding-0.6B # 1.5B params
+  name: Qwen/Qwen3-Embedding-0.6B # 0.6B params
   normalize: false
   lora_cfg: 
     r: 128
     lora_alpha: 32
-    target_modules: ["o_proj", "down_proj", "q_proj", "v_proj", "up_proj","gate_proj", "k_proj"]
+    target_modules: ["o_proj", "down_proj", "v_proj", "up_proj", "gate_proj", "k_proj"]
     lora_dropout: 0.1
     bias: "none"
   dropout_p: 0.3
@@ -26,13 +25,13 @@ decoder:
     n_heads: 12
     k: 8
   lora_cfg: 
-    r: 64
-    lora_alpha: 16
-    target_modules: ["c_attn", "mlp.c_fc", "mlp.c_proj"]
+    r: 128
+    lora_alpha: 32
+    target_modules: ["c_attn", "c_fc", "c_proj"]
     lora_dropout: 0.1
     bias: "none"
 
-name: qwen_dae
+name: dae
 
 defaults:
   - dataset: wiki

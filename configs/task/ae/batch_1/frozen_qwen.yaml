@@ -1,16 +1,14 @@
-train_batch_size: 32
-val_batch_size: 32
+batch_size: 32
 lr: 1e-4
-max_generation_length: 128
+max_generation_length: 150
 val_size: 16384
 z_noise_type: fixed
-z_noise_alpha: 0.95
+z_noise_alpha: 0.999
 z_dropout_p: 0.0
-encoder_prompt: "query: "
 
 encoder:
   _target_: model.encoder.STEncoder
-  name: intfloat/multilingual-e5-large # 1.5B params
+  name: Qwen/Qwen3-Embedding-0.6B # 0.6B params
   normalize: false
 
 decoder:
@@ -20,13 +18,13 @@ decoder:
     n_heads: 12
     k: 8
   lora_cfg: 
-    r: 64
-    lora_alpha: 16
-    target_modules: ["c_attn", "mlp.c_fc", "mlp.c_proj"]
+    r: 128
+    lora_alpha: 32
+    target_modules: ["c_attn", "c_fc", "c_proj"]
     lora_dropout: 0.1
     bias: "none"
 
-name: e5
+name: frozen_qwen
 
 defaults:
   - dataset: wiki

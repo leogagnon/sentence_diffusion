@@ -22,21 +22,22 @@ from model.decoder import DecoderConfig, DecoderModel
 import evaluate
 import os
 import wandb
-from tasks.finetune import FinetuneTask
 import hydra
 from model.gaussian_diffusion import time_to_alpha, cosine_schedule
 from lightning.pytorch.utilities.rank_zero import rank_zero_info, rank_zero_only
 
+
 @dataclass
 class AETaskConfig:
     lr: float
-    train_batch_size: int
-    val_batch_size: int
-    encoder: dict
+    batch_size: int
     decoder: DecoderConfig
     max_generation_length: int
     dataset: dict
     val_size: int
+    encoder: Optional[dict] = None
+
+    data_seed: int = 42
 
     z_noise_type: str = "none"  # fixed, schedule, none
     z_noise_alpha: float = 0.90
@@ -63,20 +64,21 @@ class AETask(L.LightningModule):
             )
 
         # Load encoder and decoder
-        self.encoder = hydra.utils.instantiate(cfg.encoder)
-        cfg.decoder.input_dim = self.encoder.latent_dim
-        self.decoder = DecoderModel(cfg.decoder)
+        if cfg.encoder != None:
+            self.encoder = hydra.utils.instantiate(cfg.encoder)
+            cfg.decoder.input_dim = self.encoder.latent_dim
 
-        for mod in self.decoder.modules():
-            if isinstance(mod, torch.nn.Dropout):
-                mod.p = 0.0
+        self.decoder = DecoderModel(cfg.decoder)
 
         # Setup dataset
         self.dataset = hydra.utils.instantiate(cfg.dataset)
 
-        indices = torch.randperm(len(self.dataset))
-        self.register_buffer("train_indices", indices[: -cfg.val_size])
-        self.register_buffer("val_indices", indices[-cfg.val_size :])
+        indices = torch.randperm(
+            len(self.dataset),
+            generator=torch.Generator().manual_seed(cfg.data_seed),
+        )
+        self.train_indices = indices[: -cfg.val_size]
+        self.val_indices = indices[-cfg.val_size :]
 
         self.cfg = cfg
 
@@ -103,13 +105,12 @@ class AETask(L.LightningModule):
     def train_dataloader(self):
         return DataLoader(
             self.train_data,
-            batch_size=self.cfg.train_batch_size,
-            num_workers=len(os.sched_getaffinity(0)),
-            pin_memory=True,
-            persistent_workers=True,
+            batch_size=self.cfg.batch_size,
             shuffle=True,
             collate_fn=self.dataset.get_collate_and_tokenize_fn(
-                enc_tokenizer=self.encoder.tokenizer,
+                enc_tokenizer=(
+                    self.encoder.tokenizer if self.cfg.encoder != None else None
+                ),
                 dec_tokenizer=self.decoder.tokenizer,
                 prompt=self.cfg.encoder_prompt,
             ),
@@ -118,13 +119,12 @@ class AETask(L.LightningModule):
     def val_dataloader(self):
         return DataLoader(
             self.val_data,
-            batch_size=self.cfg.val_batch_size,
-            num_workers=len(os.sched_getaffinity(0)),
-            pin_memory=True,
-            persistent_workers=False,
+            batch_size=self.cfg.batch_size,
             shuffle=False,
             collate_fn=self.dataset.get_collate_and_tokenize_fn(
-                enc_tokenizer=self.encoder.tokenizer,
+                enc_tokenizer=(
+                    self.encoder.tokenizer if self.cfg.encoder != None else None
+                ),
                 dec_tokenizer=self.decoder.tokenizer,
                 prompt=self.cfg.encoder_prompt,
             ),
@@ -136,83 +136,85 @@ class AETask(L.LightningModule):
 
     def training_step(self, batch, batch_idx):
 
-        assert self.encoder.training == True
-
-        z = self.encoder(batch["input_ids_enc"], batch["attention_mask_enc"])
-
-        # Add noise
+        # If there is an encoder, compute z and potentially add noise
+        z = None
         alpha = None
-        if self.cfg.z_noise_type != "none":
-            alpha = self.sample_alpha(z)
-            alpha = right_pad_dims_to(z, alpha)
-            z = alpha.sqrt() * z + (1 - alpha).sqrt() * torch.randn_like(z)
+        if self.cfg.encoder != None:
+            z = self.encoder(batch["input_ids_enc"], batch["attention_mask_enc"])
 
-        # Apply z dropout
-        if self.cfg.z_dropout_p > 0.0:
-            mask = torch.rand_like(z) < self.cfg.z_dropout_p
-            z = z.masked_fill(mask, 0.0)
+            # Add scale-invariance noise to z
+            if self.cfg.z_noise_type != "none":
+                alpha = self.sample_alpha(z)
+                alpha = right_pad_dims_to(z, alpha)
 
-        # Get embeddings of input_ids
+                z_flat = z.view(z.shape[0], -1)
+                norm = z_flat.norm(dim=1, keepdim=True).detach()           
+                w = (norm / (z_flat.shape[1]**0.5)).clamp_min(1e-6)
+                w = right_pad_dims_to(z, w)
+                
+                z = alpha.sqrt() * z + (1 - alpha).sqrt() * w * torch.randn_like(z)
+
+            # Apply z dropout
+            if self.cfg.z_dropout_p > 0.0:
+                mask = torch.rand_like(z) < self.cfg.z_dropout_p
+                z = z.masked_fill(mask, 0.0)
+
+        # Compute decoder likelihood of input_ids
         logits = self.decoder(input_ids=batch["input_ids_dec"], z=z, alpha=alpha)
 
-        # Ignore padding tokens
+        # Compute loss
         targets = batch["input_ids_dec"].masked_fill(
             batch["attention_mask_dec"] == 0, -100
         )
-
         logits = logits[:, :-1].contiguous()
         targets = targets[:, 1:].contiguous()
-
-        # Apply cross-entropy loss
         recon_loss = torch.nn.functional.cross_entropy(
             logits.view(-1, logits.size(-1)),
             targets.view(-1),
             ignore_index=-100,
         )
 
-        self.log("train/reconstruction_loss", recon_loss, on_epoch=False, on_step=True, sync_dist=True)
+        self.log(
+            "train/reconstruction_loss",
+            recon_loss,
+            on_epoch=False,
+            on_step=True,
+            sync_dist=True,
+        )
 
         return recon_loss
 
     @torch.no_grad()
     def validation_step(self, batch, batch_idx):
 
-        assert self.encoder.training == False
+        # If there is an encoder, compute z and potentially add noise
+        z = None
+        if self.cfg.encoder != None:
+            z = self.encoder(batch["input_ids_enc"], batch["attention_mask_enc"])
 
-        # Encode input_ids
-        z = self.encoder(batch["input_ids_enc"], batch["attention_mask_enc"])
+            self.log(
+                "val/latent_norm",
+                z.norm(p=2, dim=-1).mean().detach().item(),
+                on_epoch=True,
+                sync_dist=True,
+            )
 
-        self.log(
-            "val/latent_norm", z.norm(p=2, dim=-1).mean().detach().item(), on_epoch=True, sync_dist=True
-        )
-
-        # Reconstruction loss of clean sample
+        # Compute clean reconstruction loss
         logits = self.decoder(batch["input_ids_dec"], z)
         targets = batch["input_ids_dec"].masked_fill(
-            batch["attention_mask_dec"] == 0, -1
+            batch["attention_mask_dec"] == 0, -100
         )
         logits = logits[:, :-1].contiguous()
         targets = targets[:, 1:].contiguous()
         recon_loss = torch.nn.functional.cross_entropy(
             logits.view(-1, logits.size(-1)),
             targets.view(-1),
-            ignore_index=-1,
+            ignore_index=-100,
         )
         self.log("val/reconstruction_loss", recon_loss, on_epoch=True, sync_dist=True)
 
-        # Reconstruction loss of noised sample
-        z_noised = math.sqrt(0.95) * z + math.sqrt(1 - 0.95) * torch.randn_like(z)
-        logits = self.decoder(batch["input_ids_dec"], z=z_noised)
-        logits = logits[:, :-1].contiguous()
-        recon_loss_noised = torch.nn.functional.cross_entropy(
-            logits.view(-1, logits.size(-1)),
-            targets.view(-1),
-            ignore_index=-1,
-        )
-        self.log("val/reconstruction_loss_noised", recon_loss_noised, on_epoch=True, sync_dist=True)
-
-        # Log some generation for the first batch
-        if (batch_idx == 0) and (rank_zero_only.rank == 0):
+        # Maybe log some generations
+        if (batch_idx == 0) and (rank_zero_only.rank == 0) and (z != None):
             # Log generations from interpolated samples
             group_indices = torch.randperm(z.shape[0]).chunk(2)
             z_groups = [z[indices] for indices in group_indices]
@@ -244,17 +246,3 @@ class AETask(L.LightningModule):
             ):
                 table_clean.add_data(original, reconstructed)
             wandb.log({"val/clean_samples": table_clean})
-
-            # Log generation from noised samples
-            table_noised = wandb.Table(columns=["Original", "Noise+Reconstructed"])
-            for original, reconstructed in zip(
-                batch["input_str"][:10],
-                self.decoder.tokenizer.batch_decode(
-                    self.decoder.generate(
-                        z=z_noised[:10], max_length=self.cfg.max_generation_length
-                    ),
-                    skip_special_tokens=True,
-                ),
-            ):
-                table_noised.add_data(original, reconstructed)
-            wandb.log({"val/noised_samples": table_noised})

@@ -22,13 +22,18 @@ class WikipediaDataset(Dataset):
     def get_collate_and_tokenize_fn(self, dec_tokenizer = None, enc_tokenizer = None, prompt=None):
         def collate_fn(texts):
 
-            if prompt is not None:
-                texts = [(prompt+text) for text in texts]
             out = {"input_str": texts}
 
             if enc_tokenizer is not None:
+                
+                # Maybe add prompt to encoder input
+                if prompt is not None:
+                    texts_enc = [(prompt+text) for text in texts]
+                else:
+                    texts_enc = texts
+
                 batch_enc = enc_tokenizer.batch_encode_plus(
-                    texts,
+                    texts_enc,
                     truncation=True,
                     padding=True,
                     max_length=self.cfg.max_length,
@@ -41,6 +46,8 @@ class WikipediaDataset(Dataset):
                 
             if dec_tokenizer is not None:
                 batch_dec = dec_tokenizer.batch_encode_plus(texts)
+                
+                # Add bos and eos tokens and pad
                 input_ids_dec = pad_sequence(
                     [
                         torch.LongTensor(

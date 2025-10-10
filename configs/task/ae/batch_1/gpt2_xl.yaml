@@ -1,0 +1,21 @@
+batch_size: 32
+lr: 1e-4
+max_generation_length: 150
+val_size: 16384
+z_noise_type: fixed
+z_noise_alpha: 0.999
+z_dropout_p: 0.0
+
+decoder:
+  name: gpt2-xl # 1.5B params
+  lora_cfg: 
+    r: 128
+    lora_alpha: 32
+    target_modules: ["c_attn", "c_fc", "c_proj"]
+    lora_dropout: 0.1
+    bias: "none"
+
+name: gpt2_xl
+
+defaults:
+  - dataset: wiki

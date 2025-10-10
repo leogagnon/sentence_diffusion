@@ -1,8 +1,0 @@
-task/diffusion: base
-model_checkpoint: base
-accumulate_grad_batches: 2
-task.diffusion.pretrained_ae_id: mtyjhkdk, 0lxeltij
-task.diffusion.batch_size: 128
-task.diffusion.normalize_latent: True, False
-
-sweep_id: diffusion_clean_v1

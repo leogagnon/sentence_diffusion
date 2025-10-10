@@ -36,6 +36,7 @@ class DecoderConfig:
     input_dim: Optional[int] = None 
     prompt_generator_cfg: Optional[PromptGeneratorConfig] = None
     lora_cfg: Optional[dict] = None
+    disable_dropout: bool = True
 
 
 class DecoderModel(nn.Module):
@@ -47,6 +48,13 @@ class DecoderModel(nn.Module):
 
         # Init causal LM backbone
         self.backbone = AutoModelForCausalLM.from_pretrained(cfg.name)
+
+        # Disable dropout in the backbone
+        if self.cfg.disable_dropout:
+            for module in self.backbone.modules():
+                if isinstance(module, torch.nn.Dropout):
+                    module.p = 0.0
+        
         if self.cfg.lora_cfg != None:
             self.backbone = get_peft_model(
                 self.backbone,
@@ -109,6 +117,12 @@ class DecoderModel(nn.Module):
         else:
             # This means there is no z; the model is just a standard unconditional decoder
             pass
+
+    def train(self, mode: bool = True):
+        super().train(mode)
+        if self.cfg.lora_cfg == None:
+            # Keep the backbone in eval mode if not finetuning
+            self.backbone.eval()
 
     def z_to_prompt(self, z: torch.Tensor, alpha: Optional[torch.Tensor] = None):
         if self.cfg.prompt_generator_cfg == None:
