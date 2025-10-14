@@ -12,7 +12,7 @@
             "program": "train.py",
             "console": "integratedTerminal",
             "justMyCode": false,
-            "args": ["task/ae=batch_1/vae"],
+            "args": ["task/dlclm=base"],
         }
     ]
 }

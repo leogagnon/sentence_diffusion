@@ -125,7 +125,7 @@ class AETask(L.LightningModule):
                 ),
                 dec_tokenizer=self.decoder.tokenizer,
                 prompt=self.cfg.encoder_prompt,
-            ),
+            )
         )
 
     def val_dataloader(self):

@@ -5,7 +5,7 @@ defaults:
   - hydra: base
   - task/ae: null
   - task/diffusion: null
-  - task/finetune: null
+  - task/dlclm: null
   - model_checkpoint: null
   - early_stopping: null
   - hydra/sweeper/params : null
@@ -13,7 +13,7 @@ defaults:
   
 seed: 1337
 log_dir: /network/scratch/l/leo.gagnon/sentence_diffusion/logs
-max_epochs: 1 # will never be reached
+max_epochs: 5 # will never be reached
 effective_batch_size: 256
 val_check_interval: 128
 sweep_id: null

@@ -6,7 +6,7 @@ model:
 
 batch_size: 128
 lr: 1e-4
-pretrained_ae_id: wto2rxa5 
+pretrained_ae_id: u1sdwz0y 
 
 loss: l2
 sampling_timesteps: 50

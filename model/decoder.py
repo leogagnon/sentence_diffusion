@@ -123,6 +123,7 @@ class DecoderModel(nn.Module):
         if self.cfg.lora_cfg == None:
             # Keep the backbone in eval mode if not finetuning
             self.backbone.eval()
+        return self
 
     def z_to_prompt(self, z: torch.Tensor, alpha: Optional[torch.Tensor] = None):
         if self.cfg.prompt_generator_cfg == None:

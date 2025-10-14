@@ -11,12 +11,10 @@ from lightning.pytorch.loggers import WandbLogger
 from omegaconf import MISSING, DictConfig, OmegaConf, SCMode
 from tasks.autoencoder import AETask, AETaskConfig
 from tasks.diffusion import GaussianDiffusionTask, GaussianDiffusionTaskConfig
+from tasks.dlclm import DLCLMTask, DLCLMTaskConfig
 from lightning.pytorch.callbacks import EarlyStopping
 from lightning.pytorch.utilities.rank_zero import rank_zero_info, rank_zero_only
 
-os.environ["LATENT_CONTROL_CKPT_DIR"] = (
-    "/network/scratch/l/leo.gagnon/sentence_diffusion/logs/checkpoints"
-)
 torch.set_float32_matmul_precision("medium")
 
 
@@ -24,6 +22,7 @@ torch.set_float32_matmul_precision("medium")
 class TaskConfig:
     ae: Optional[AETaskConfig] = None
     diffusion: Optional[GaussianDiffusionTaskConfig] = None
+    dlclm: Optional[DLCLMTaskConfig] = None
 
 
 @dataclass
@@ -36,7 +35,7 @@ class TrainConfig:
     logger: dict
     strategy: str = "auto"
     sweep_id: Optional[str] = None
-    effective_batch_size: Optional[int] = None  # if None, no accumulation 
+    effective_batch_size: Optional[int] = None  # if None, no accumulation
     model_checkpoint: Optional[dict] = None
     early_stopping: Optional[dict] = None
     gradient_clip_val: Optional[float] = None
@@ -77,13 +76,16 @@ def main(cfg: Optional[TrainConfig] = None, run_id: Optional[str] = None):
         if rank_zero_only.rank == 0:
             wandb_id = logger.experiment.path.split("/")[-1]
         else:
-            wandb_id = "dummy" # will not be used
-    
+            wandb_id = "dummy"  # will not be used
+
+    # Environment variable to save/load checkpoints from everywhere
+    os.environ["LATENT_CONTROL_CKPT_DIR"] = os.path.join(cfg.log_dir, "checkpoints")
+
     L.seed_everything(cfg.seed, workers=True)
 
     # Setup checkpoint (with wandb ID as <dirpath>)
     callbacks = []
-    if (cfg.model_checkpoint != None):
+    if cfg.model_checkpoint != None:
         cfg.model_checkpoint.dirpath = os.path.join(
             cfg.log_dir, "checkpoints", wandb_id
         )
@@ -107,9 +109,20 @@ def main(cfg: Optional[TrainConfig] = None, run_id: Optional[str] = None):
         task = GaussianDiffusionTask(cfg.task.diffusion)
         cfg.task.diffusion = task.cfg
 
-        # If the task is diffusion, add the autoencoder config to cfg
+        # Add the autoencoder config to cfg
         run = wandb.Api().run(
             f"guillaume-lajoie/sentence_diffusion/{cfg.task.diffusion.pretrained_ae_id}"
+        )
+        cfg.task.ae = OmegaConf.merge(
+            OmegaConf.structured(AETaskConfig), run.config["task"]["ae"]
+        )
+    elif cfg.task.dlclm != None:
+        task = DLCLMTask(cfg.task.dlclm)
+        cfg.task.dlclm = task.cfg
+
+        # Add the autoencoder config to cfg
+        run = wandb.Api().run(
+            f"guillaume-lajoie/sentence_diffusion/{cfg.task.dlclm.pretrained_ae_id}"
         )
         cfg.task.ae = OmegaConf.merge(
             OmegaConf.structured(AETaskConfig), run.config["task"]["ae"]
@@ -118,7 +131,7 @@ def main(cfg: Optional[TrainConfig] = None, run_id: Optional[str] = None):
         task = AETask(cfg.task.ae)
         cfg.task.ae = task.cfg
     else:
-        raise ValueError("No task specified in config")
+        raise ValueError("No task specified in config!")
 
     # Give the whole TrainConfig to wandb
     if cfg.logger and (rank_zero_only.rank == 0):
@@ -127,13 +140,24 @@ def main(cfg: Optional[TrainConfig] = None, run_id: Optional[str] = None):
         )
 
     # Compute how many batches to accumulate to reach the effective batch size
+    num_devices = torch.cuda.device_count()
     if cfg.effective_batch_size is None:
         accumulate_grad_batches = 1
     else:
+        ddp_batch_size = task.cfg.batch_size * num_devices
         assert (
-            cfg.effective_batch_size % task.cfg.batch_size == 0
-        ), f"Effective batch size ({cfg.effective_batch_size}) must be a multiple of task batch size ({task.cfg.batch_size})"
-        accumulate_grad_batches = cfg.effective_batch_size // task.cfg.batch_size
+            cfg.effective_batch_size % ddp_batch_size == 0
+        ), f"Effective batch size ({cfg.effective_batch_size}) must be a multiple of effective ddp batch_size ({ddp_batch_size})"
+        accumulate_grad_batches = cfg.effective_batch_size // ddp_batch_size
+
+        # just makin sure
+        assert (
+            accumulate_grad_batches * task.cfg.batch_size * num_devices
+            == cfg.effective_batch_size
+        )
+        rank_zero_info(
+            f"Running with {num_devices} devices, batch size {task.cfg.batch_size} per device, accumulating {accumulate_grad_batches} steps to reach effective batch size {cfg.effective_batch_size}"
+        )
 
     # Instantiate the trainer
     trainer = L.Trainer(
@@ -141,7 +165,8 @@ def main(cfg: Optional[TrainConfig] = None, run_id: Optional[str] = None):
         accelerator="gpu",
         enable_checkpointing=True if cfg.model_checkpoint else False,
         callbacks=callbacks,
-        val_check_interval=cfg.val_check_interval * accumulate_grad_batches,  # to account for accumulation
+        val_check_interval=cfg.val_check_interval
+        * accumulate_grad_batches,  # to account for accumulation
         gradient_clip_val=cfg.gradient_clip_val,
         num_sanity_val_steps=0,
         max_epochs=cfg.max_epochs,
@@ -149,10 +174,9 @@ def main(cfg: Optional[TrainConfig] = None, run_id: Optional[str] = None):
         accumulate_grad_batches=accumulate_grad_batches,
         precision=cfg.precision,
         limit_val_batches=cfg.limit_val_batches if cfg.limit_val_batches else 1.0,
-        devices=-1,
+        devices=num_devices,
         strategy=cfg.strategy,
         num_nodes=1,
-        deterministic=True
     )
     trainer.fit(
         model=task,

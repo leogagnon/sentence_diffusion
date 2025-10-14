@@ -31,6 +31,7 @@ class SEMHeadConfig:
     L: int
     V: int
     temp: float
+    D: Optional[int]
     input_dim: Optional[int] = None
 
 
@@ -43,17 +44,44 @@ class SEMHead(nn.Module):
         self.proj_out = nn.Linear(cfg.L * cfg.V, cfg.input_dim)
         self.cfg = cfg
 
-    def forward(self, x):
+    def forward(self, x, return_sem=False):
         # x: (B, D)
         x = self.proj_in(x)
         x = self.norm(x)
         x = einx.rearrange("b (l v) -> b l v", x, l=self.cfg.L, v=self.cfg.V)
         x = torch.softmax(x / self.cfg.temp, dim=-1)
+        if return_sem:
+            return x
         x = einx.rearrange("b l v -> b (l v)", x)
         x = self.proj_out(x)
 
         return x
 
+@dataclass
+class HSEMHeadConfig:
+    L: int
+    V: int
+    D: int
+    temp: float
+    input_dim: Optional[int] = None
+
+class HSEMHead(nn.Module):
+    def __init__(self, cfg: HSEMHeadConfig, n_levels: int):
+        super().__init__()
+        assert cfg.input_dim is not None, "input_dim has to be set"
+        self.levels = nn.ModuleList()
+        for _ in range(n_levels):
+            self.levels.append(SEMHead(cfg))
+        self.cfg = cfg
+        self.n_levels = n_levels
+        
+
+    def forward(self, x):
+        # x: (B, D)
+        for level in self.levels:
+            x = level(x) + x  # Residual connection
+        return x
+    
 @dataclass
 class CompressorConfig:
     n_layers: int
@@ -205,6 +233,7 @@ class STEncoder(EncoderModel):
         # Keep the transformer in eval model if not finetuning
         if self.cfg.lora_cfg == None:
             self.transformer.eval()
+        return self
 
     @property
     def latent_dim(self):
@@ -214,7 +243,7 @@ class STEncoder(EncoderModel):
     def latent_len(self):
         return 1 if self.cfg.compressor_cfg is None else self.cfg.compressor_cfg.k
 
-    def forward(self, input_ids, attention_mask=None):
+    def forward(self, input_ids, attention_mask=None, return_sem=False):
         # Maybe randomly substitute tokens (for DAE training)
         if (self.cfg.dropout_p > 0.0) and self.training:
             input_ids = random_substitution(
@@ -237,6 +266,8 @@ class STEncoder(EncoderModel):
                 sentence_embedding = batch["sentence_embedding"]
             
             if self.cfg.sem_cfg != None:
+                if return_sem:
+                    return self.sem(sentence_embedding, return_sem=True)
                 sentence_embedding = self.sem(sentence_embedding)
 
             sentence_embedding = sentence_embedding[:, None]  

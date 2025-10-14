@@ -1,0 +1,7 @@
+lr: 1e-4
+batch_size: 16
+pretrained_ae_id: usx2ekas
+
+data_seed: 42
+
+name: test
