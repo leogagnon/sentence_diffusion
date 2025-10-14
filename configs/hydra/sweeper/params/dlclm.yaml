@@ -4,6 +4,7 @@ effective_batch_size: 1024
 task.dlclm.batch_size: 16 
 task.dlclm.pretrained_ae_id: usx2ekas
 precision: bf16-mixed
+strategy: ddp_find_unused_parameters_true
 limit_val_batches: 8
 val_check_interval: 256
 

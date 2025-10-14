@@ -4,4 +4,4 @@ pretrained_ae_id: usx2ekas
 
 data_seed: 42
 
-name: test
+name: dlclm

@@ -45,7 +45,7 @@ class GaussianDiffusionTaskConfig:
     schedule_scale: float = 1.0
     sampler: str = "ddpm"
     normalize_latent: bool = False
-    validation_mauve: bool = False
+    validation_mauve: bool = False # only for backward-compatiblity, doesn't do anything
     max_generation_length: int = 150
 
 
@@ -304,16 +304,5 @@ class GaussianDiffusionTask(L.LightningModule):
         self.model = self.model.cpu()
 
     def on_validation_epoch_end(self):
-        if self.cfg.validation_mauve:
-            mauve_score = self.get_mauve_score()
-            self.log(
-                "val/mauve",
-                mauve_score,
-                prog_bar=True,
-                add_dataloader_idx=False,
-                on_epoch=True,
-                on_step=False,
-                sync_dist=True,
-            )
         self.ema_model = self.ema_model.cpu()
         self.model = self.model.cuda()
