@@ -64,6 +64,7 @@ class DLCLMTask(L.LightningModule):
                 "last.ckpt",
             ),
             strict=False,
+            map_location="cpu",
         )
         self.train_indices = ae_task.train_indices
         self.val_indices = ae_task.val_indices
@@ -88,7 +89,6 @@ class DLCLMTask(L.LightningModule):
         self.decoder.backbone.resize_token_embeddings(
             len(ae_task.decoder.tokenizer) + ae_task.encoder.cfg.sem_cfg.V
         )
-        self.decoder = self.decoder.train().requires_grad_(True)
         self.decoder.backbone = get_peft_model(
             self.decoder.backbone,
             LoraConfig(**self.decoder.cfg.lora_cfg),

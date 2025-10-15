@@ -9,7 +9,7 @@ defaults:
   - model_checkpoint: null
   - early_stopping: null
   - hydra/sweeper/params : null
-  - override hydra/launcher : base
+  - override hydra/launcher : mila
   
 seed: 1337
 log_dir: null
