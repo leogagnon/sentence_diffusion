@@ -1,0 +1,16 @@
+defaults:
+  - submitit_slurm
+
+mem_gb: 64
+gpus-per-node: gpu:h100:4
+ntasks_per_node: 4
+array_parallelism: 32
+nodes: 1 
+cpus_per_task: 4
+timeout_min: 1440
+additional_parameters:
+  no-requeue: true
+
+setup:
+  - "export NCCL_DEBUG=INFO"
+  - "source ~/sentence_diffusion/venv/bin/activate"

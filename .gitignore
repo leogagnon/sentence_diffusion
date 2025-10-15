@@ -11,5 +11,4 @@ slurm-*
 logs/
 venv/
 data/wikipedia-paragraphs-filtered
-hydra/
 wandb/
