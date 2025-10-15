@@ -8,7 +8,10 @@ import math
 
 import hydra
 import lightning as L
-from mauve.compute_mauve import get_features_from_input, compute_mauve
+try:
+    from mauve.compute_mauve import get_features_from_input, compute_mauve
+except:
+    pass
 import numpy as np
 import torch
 import torch.nn.functional as F

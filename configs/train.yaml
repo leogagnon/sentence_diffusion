@@ -12,7 +12,7 @@ defaults:
   - override hydra/launcher : base
   
 seed: 1337
-log_dir: /network/scratch/l/leo.gagnon/sentence_diffusion/logs
+log_dir: null
 max_epochs: 5 # will never be reached
 effective_batch_size: 1024
 val_check_interval: 128

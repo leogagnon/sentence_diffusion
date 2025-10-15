@@ -1,5 +1,8 @@
 torch
 transformers
+x-transformers
+sentence-transformers
+sentencepiece
 lightning
 peft
 wandb
@@ -7,3 +10,6 @@ hydra-core
 tqdm
 numpy
 ipykernel
+hydra-submitit-launcher
+einx
+einops

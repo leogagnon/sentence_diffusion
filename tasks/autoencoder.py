@@ -19,7 +19,6 @@ from data.stories import StoriesDatasetConfig, StoriesDataset
 from hydra.utils import instantiate
 from model.encoder import EncoderConfig, EncoderModel
 from model.decoder import DecoderConfig, DecoderModel
-import evaluate
 import os
 import wandb
 import hydra

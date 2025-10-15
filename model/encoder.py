@@ -92,7 +92,7 @@ class CompressorConfig:
 class SONARTransformer(nn.Module):
     def __init__(self):
         super().__init__()
-        self.auto_model = M2M100Encoder.from_pretrained("cointegrated/SONAR_200_text_encoder")
+        self.auto_model = M2M100Encoder.from_pretrained("cointegrated/SONAR_200_text_encoder",)
     
     def get_sentence_embedding_dimension(self):
         return self.auto_model.config.hidden_size

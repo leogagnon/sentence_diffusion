@@ -15,7 +15,7 @@ class WikipediaDataset(Dataset):
             cfg = WikipediaDatasetConfig(**kwargs)
 
         self.dataset = load_from_disk(
-            "/network/scratch/l/leo.gagnon/sentence_diffusion/data/wikipedia-paragraphs-filtered"
+            "data/wikipedia-paragraphs-filtered"
         )['train']
         self.cfg = cfg 
 

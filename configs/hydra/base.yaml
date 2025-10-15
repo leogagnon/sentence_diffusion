@@ -1,2 +1,2 @@
 run:
-  dir: ${log_dir}/hydra/${now:%Y-%m-%d}_${now:%H-%M-%S}
+  dir: hydra/${now:%Y-%m-%d}_${now:%H-%M-%S}

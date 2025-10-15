@@ -17,7 +17,6 @@ from lightning.pytorch.utilities.rank_zero import rank_zero_info, rank_zero_only
 
 torch.set_float32_matmul_precision("medium")
 
-
 @dataclass
 class TaskConfig:
     ae: Optional[AETaskConfig] = None
@@ -29,11 +28,11 @@ class TaskConfig:
 class TrainConfig:
     task: TaskConfig
     seed: int
-    log_dir: str
     max_epochs: int
     val_check_interval: int
     logger: dict
     strategy: str = "auto"
+    log_dir: Optional[str] = None
     sweep_id: Optional[str] = None
     effective_batch_size: Optional[int] = None  # if None, no accumulation
     model_checkpoint: Optional[dict] = None
@@ -79,6 +78,8 @@ def main(cfg: Optional[TrainConfig] = None, run_id: Optional[str] = None):
             wandb_id = "dummy"  # will not be used
 
     # Environment variable to save/load checkpoints from everywhere
+    if cfg.log_dir == None:
+        cfg.log_dir = os.environ["LOG_DIR"]
     os.environ["LATENT_CONTROL_CKPT_DIR"] = os.path.join(cfg.log_dir, "checkpoints")
 
     L.seed_everything(cfg.seed, workers=True)
