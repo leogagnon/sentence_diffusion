@@ -82,13 +82,17 @@ class DLCLMTask(L.LightningModule):
         except:
             pass
 
-        # We finetune the decoder from the AE training (by adding tokens for the SEM tokens)
+        # We finetune the decoder from the AE training, without the prompt generator, with new token embeddings
         # We merge the initial LoRA adapter and create a new one for the DLC finetuning
         self.decoder = ae_task.decoder
+        del self.decoder.prompt_generator
         self.decoder.backbone = self.decoder.backbone.merge_and_unload()
         self.decoder.backbone.resize_token_embeddings(
             len(ae_task.decoder.tokenizer) + ae_task.encoder.cfg.sem_cfg.V
         )
+        # Also finetune the token embeddings and LM head
+        lora_config = self.decoder.cfg.lora_cfg
+        lora_config["modules_to_save"] = ["transformer.wte", "lm_head"]
         self.decoder.backbone = get_peft_model(
             self.decoder.backbone,
             LoraConfig(**self.decoder.cfg.lora_cfg),
@@ -218,8 +222,8 @@ class DLCLMTask(L.LightningModule):
         self.log(
             "val/full_loss",
             full_loss,
-            on_epoch=False,
-            on_step=True,
+            on_epoch=True,
+            on_step=False,
             sync_dist=True,
         )
 
@@ -228,7 +232,23 @@ class DLCLMTask(L.LightningModule):
         self.log(
             "val/cond_loss",
             loss[:, -(batch["input_ids_dec"].size(1) - 1) :].mean(),
-            on_epoch=False,
-            on_step=True,
+            on_epoch=True,
+            on_step=False,
             sync_dist=True,
         )
+
+        # Log reconstruction samples
+        if (batch_idx == 0) and (rank_zero_only.rank == 0):
+            table_clean = wandb.Table(columns=["Original", "Reconstructed"])
+            for original, reconstructed in zip(
+                batch["input_str"][:10],
+                self.decoder.tokenizer.batch_decode(
+                    self.decoder.generate(
+                        prompt=input_ids_dec[:10, (dlc.shape[1] + 1) :],
+                        max_length=self.dataset.cfg.max_length,
+                    ),
+                    skip_special_tokens=True,
+                ),
+            ):
+                table_clean.add_data(original, reconstructed)
+            wandb.log({"val/clean_samples": table_clean})

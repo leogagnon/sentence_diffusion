@@ -33,7 +33,7 @@ class PromptGeneratorConfig:
 @dataclass
 class DecoderConfig:
     name: str
-    input_dim: Optional[int] = None 
+    input_dim: Optional[int] = None
     prompt_generator_cfg: Optional[PromptGeneratorConfig] = None
     lora_cfg: Optional[dict] = None
     disable_dropout: bool = True
@@ -54,7 +54,7 @@ class DecoderModel(nn.Module):
             for module in self.backbone.modules():
                 if isinstance(module, torch.nn.Dropout):
                     module.p = 0.0
-        
+
         if self.cfg.lora_cfg != None:
             self.backbone = get_peft_model(
                 self.backbone,
@@ -103,7 +103,9 @@ class DecoderModel(nn.Module):
                     attn_qk_norm=True,
                     attn_qk_norm_dim_scale=True,
                 )
-                self.prompt_generator["noise_embd"] = ScaledSinusoidalEmbedding(self.backbone.config.hidden_size)
+                self.prompt_generator["noise_embd"] = ScaledSinusoidalEmbedding(
+                    self.backbone.config.hidden_size
+                )
             else:
                 self.prompt_generator["encoder"] = Encoder(
                     dim=self.backbone.config.hidden_size,
@@ -183,33 +185,43 @@ class DecoderModel(nn.Module):
         self,
         max_length: int,
         z: Optional[torch.Tensor] = None,
+        prompt: Optional[torch.Tensor] = None,
         alpha: Optional[torch.Tensor] = None,
-        batch_size: Optional[int] = None
+        batch_size: Optional[int] = None,
     ):
         """Generate text using autoregressive decoding, potentially conditioned on soft prefix z"""
 
-        if z != None:
-            # Compute cache for z
-            prompt = self.z_to_prompt(z, alpha=alpha)
-            cache = self.backbone(
-                inputs_embeds=prompt,
-                use_cache=True,
-            ).past_key_values
-            # Position of the BOS should be after the prefix (like in training)
-            cache_position = torch.tensor([prompt.shape[1]], device=z.device)
+        # If there is conditionning
+        if (z != None) or (prompt != None):
+            # Compute the (soft-)prompt cache
+            if z != None:
+                assert prompt is None, "Cannot provide both z and prompt"
+                # In this case it is a soft prompt
+                prompt = self.z_to_prompt(z, alpha=alpha)
+                cache = self.backbone(
+                            inputs_embeds=prompt,
+                            use_cache=True,
+                        ).past_key_values
+            else:
+                cache = self.backbone(
+                            input_ids=prompt,
+                            use_cache=True,
+                        ).past_key_values
+
+            # Setup arguments for generation
+            assert batch_size is None, "Cannot provide batch_size if prompt is given"
+            batch_size = prompt.shape[0]
+            device = prompt.device
+            cache_position = torch.tensor([prompt.shape[1]], device=prompt.device)
             attention_mask = torch.ones(
-                (prompt.shape[0], prompt.shape[1] + 1), device=z.device
+                (prompt.shape[0], prompt.shape[1] + 1), device=device
             )
-            device=z.device
-            batch_size = z.shape[0]
-            if batch_size is not None:
-                assert batch_size == z.shape[0]
         else:
             cache = None
             cache_position = None
             attention_mask = None
             device = next(self.backbone.parameters()).device
-            assert batch_size is not None, "Must provide batch_size if no z is given"
+            assert batch_size is not None, "Must provide batch_size if no conditionning is given"
 
         # Autoregressive generation from BOS token with cached z (nucleus sampling)
         bos = torch.full(

@@ -57,6 +57,7 @@ class SEMHead(nn.Module):
 
         return x
 
+
 @dataclass
 class HSEMHeadConfig:
     L: int
@@ -65,23 +66,39 @@ class HSEMHeadConfig:
     temp: float
     input_dim: Optional[int] = None
 
+
 class HSEMHead(nn.Module):
     def __init__(self, cfg: HSEMHeadConfig, n_levels: int):
         super().__init__()
         assert cfg.input_dim is not None, "input_dim has to be set"
-        self.levels = nn.ModuleList()
-        for _ in range(n_levels):
-            self.levels.append(SEMHead(cfg))
+        self.N = (cfg.V**cfg.D) // (cfg.V - 1)
+        self.proj_in = nn.Linear(cfg.input_dim, cfg.L * cfg.V * self.N)
+        self.norm = nn.LayerNorm(cfg.L * cfg.V * self.N, eps=1e-6)
+        self.proj_out = nn.Linear(cfg.L * cfg.V * self.N, cfg.input_dim)
         self.cfg = cfg
-        self.n_levels = n_levels
-        
 
     def forward(self, x):
-        # x: (B, D)
-        for level in self.levels:
-            x = level(x) + x  # Residual connection
-        return x
-    
+        logits = einx.rearrange(
+            "b (L N V) -> b L N V",
+            self.proj_in(x),
+            L=self.cfg.L,
+            N=self.N,
+            V=self.cfg.V,
+        )
+        probs = F.softmax(logits / 1.0, -1)
+        parent_probs = torch.ones(x.shape[0], self.cfg.L, 1, device=x.device)
+        start = 0
+        out = []
+        for d in range(self.cfg.D):
+            # Select the nodes at depth d
+            end = start + self.cfg.V**d
+            final_probs = probs[:, :, start:end] * parent_probs[..., None]
+            parent_probs = einx.rearrange("b m d v -> b m (d v)", final_probs)
+            out.append(parent_probs)
+            start = end
+        out = torch.cat(out, -1)
+
+
 @dataclass
 class CompressorConfig:
     n_layers: int
@@ -92,29 +109,34 @@ class CompressorConfig:
 class SONARTransformer(nn.Module):
     def __init__(self):
         super().__init__()
-        self.auto_model = M2M100Encoder.from_pretrained("cointegrated/SONAR_200_text_encoder",)
-    
+        self.auto_model = M2M100Encoder.from_pretrained(
+            "cointegrated/SONAR_200_text_encoder",
+        )
+
     def get_sentence_embedding_dimension(self):
         return self.auto_model.config.hidden_size
-    
+
     def forward(self, features, **kwargs):
         token_embeddings = self.auto_model(**features).last_hidden_state
-        features.update({'token_embeddings': token_embeddings})
+        features.update({"token_embeddings": token_embeddings})
         return features
+
 
 def random_substitution(input_ids, sub_p, vocab_size):
 
-        probability = torch.full_like(
-            input_ids,
-            fill_value=sub_p,
-            dtype=torch.float32,
-        )
-        masked_indices = torch.bernoulli(probability).bool()
-        random_words = torch.randint_like(input_ids, low=0, high=vocab_size, dtype=torch.int64)
+    probability = torch.full_like(
+        input_ids,
+        fill_value=sub_p,
+        dtype=torch.float32,
+    )
+    masked_indices = torch.bernoulli(probability).bool()
+    random_words = torch.randint_like(
+        input_ids, low=0, high=vocab_size, dtype=torch.int64
+    )
 
-        input_ids[masked_indices] = random_words[masked_indices]
+    input_ids[masked_indices] = random_words[masked_indices]
 
-        return input_ids
+    return input_ids
 
 
 @dataclass
@@ -138,6 +160,7 @@ class EncoderModel(ABC, nn.Module):
     def forward(self, input_str):
         pass
 
+
 @dataclass
 class STEncoderConfig:
     name: str
@@ -146,7 +169,8 @@ class STEncoderConfig:
     dropout_p: float = 0.0
     compressor_cfg: Optional[CompressorConfig] = None
     sem_cfg: Optional[SEMHeadConfig] = None
-    variational: bool = False 
+    variational: bool = False
+
 
 class STEncoder(EncoderModel):
     def __init__(self, cfg: Optional[STEncoderConfig] = None, **kwargs):
@@ -155,42 +179,51 @@ class STEncoder(EncoderModel):
         if cfg == None:
             cfg = STEncoderConfig(**kwargs)
 
-        if 'SONAR' in cfg.name:
+        if "SONAR" in cfg.name:
             self.transformer = SONARTransformer()
             self.pooling = sentence_transformers.models.Pooling(
-                self.transformer.get_sentence_embedding_dimension(),
-                pooling_mode="mean"
+                self.transformer.get_sentence_embedding_dimension(), pooling_mode="mean"
             )
-            self.tokenizer = AutoTokenizer.from_pretrained("cointegrated/SONAR_200_text_encoder")
+            self.tokenizer = AutoTokenizer.from_pretrained(
+                "cointegrated/SONAR_200_text_encoder"
+            )
             self.tokenizer.src_lang = "eng_Latn"
             self._latent_dim = self.transformer.get_sentence_embedding_dimension()
         else:
             backbone = sentence_transformers.SentenceTransformer(
-                            cfg.name,
-                        )
-        
+                cfg.name,
+            )
+
             self.transformer = backbone[0]
-            assert isinstance(self.transformer, sentence_transformers.models.Transformer), "Expected Transformer as first module"
-            
+            assert isinstance(
+                self.transformer, sentence_transformers.models.Transformer
+            ), "Expected Transformer as first module"
+
             self.pooling = backbone[1]
-            assert isinstance(self.pooling, sentence_transformers.models.Pooling), "Expected Pooling as second module"
+            assert isinstance(
+                self.pooling, sentence_transformers.models.Pooling
+            ), "Expected Pooling as second module"
 
             if cfg.normalize:
                 self.normalization = backbone[2]
-                assert isinstance(self.normalization, sentence_transformers.models.Normalize), "Expected Normalize as third module (as cfg.normalize is True)"
+                assert isinstance(
+                    self.normalization, sentence_transformers.models.Normalize
+                ), "Expected Normalize as third module (as cfg.normalize is True)"
 
             self.tokenizer = backbone.tokenizer
-            self._latent_dim = self.transformer.auto_model.get_input_embeddings().weight.shape[1]
+            self._latent_dim = (
+                self.transformer.auto_model.get_input_embeddings().weight.shape[1]
+            )
 
         if cfg.compressor_cfg != None:
             # Will replace self.pooling
             self.compressor = AttentionLayers(
-                    dim=self.latent_dim,
-                    depth=cfg.compressor_cfg.n_layers,
-                    heads=cfg.compressor_cfg.n_heads,
-                    cross_attend=True,
-                    causal=False,
-                )
+                dim=self.latent_dim,
+                depth=cfg.compressor_cfg.n_layers,
+                heads=cfg.compressor_cfg.n_heads,
+                cross_attend=True,
+                causal=False,
+            )
             self.placeholder_tokens = nn.Parameter(
                 torch.randn(cfg.compressor_cfg.k, self.latent_dim)
             )
@@ -201,10 +234,14 @@ class STEncoder(EncoderModel):
 
             cfg.sem_cfg.input_dim = self.latent_dim
             self.sem = SEMHead(cfg.sem_cfg)
-        
+
         if cfg.variational:
-            assert cfg.normalize == False, "Normalization not compatible with variational AE"
-            assert cfg.compressor_cfg == None, "Compressor not compatible with variational AE"
+            assert (
+                cfg.normalize == False
+            ), "Normalization not compatible with variational AE"
+            assert (
+                cfg.compressor_cfg == None
+            ), "Compressor not compatible with variational AE"
             self.out_mean = nn.Linear(self.latent_dim, self.latent_dim)
             self.out_logvar = nn.Linear(self.latent_dim, self.latent_dim)
 
@@ -212,11 +249,11 @@ class STEncoder(EncoderModel):
             # Make the transformer non-trainable but faster!
             self.transformer.auto_model = self.transformer.auto_model.to(torch.bfloat16)
             try:
-                self.transformer.auto_model.set_attn_implementation(
-                    "flash_attention_2"
-                )
+                self.transformer.auto_model.set_attn_implementation("flash_attention_2")
             except:
-                rank_zero_info("Tried to use flash attention in encoder, but it is not available.")
+                rank_zero_info(
+                    "Tried to use flash attention in encoder, but it is not available."
+                )
             self.transformer.requires_grad_(False)
             self.transformer.eval()
         else:
@@ -238,7 +275,7 @@ class STEncoder(EncoderModel):
     @property
     def latent_dim(self):
         return self._latent_dim
-    
+
     @property
     def latent_len(self):
         return 1 if self.cfg.compressor_cfg is None else self.cfg.compressor_cfg.k
@@ -264,13 +301,13 @@ class STEncoder(EncoderModel):
                 sentence_embedding = self.normalization(batch)["sentence_embedding"]
             else:
                 sentence_embedding = batch["sentence_embedding"]
-            
+
             if self.cfg.sem_cfg != None:
                 if return_sem:
                     return self.sem(sentence_embedding, return_sem=True)
                 sentence_embedding = self.sem(sentence_embedding)
 
-            sentence_embedding = sentence_embedding[:, None]  
+            sentence_embedding = sentence_embedding[:, None]
 
             # Maybe apply VAE heads
             if self.cfg.variational:
@@ -280,10 +317,12 @@ class STEncoder(EncoderModel):
                     return mean, logvar
                 else:
                     return self.out_mean(sentence_embedding)
-        else: 
+        else:
             # Cross-attention bottleneck
             ph = einx.rearrange(
-                "k d -> b k d", self.placeholder_tokens, b=batch["token_embeddings"].shape[0]
+                "k d -> b k d",
+                self.placeholder_tokens,
+                b=batch["token_embeddings"].shape[0],
             )
             sentence_embedding = self.compressor(
                 ph,
@@ -359,7 +398,7 @@ class DAEEncoder(EncoderModel):
     @property
     def latent_dim(self):
         return self.cfg.out_dim
-    
+
     @property
     def latent_len(self):
         return self.cfg.compressor_cfg.k if self.cfg.compressor_cfg is not None else 1
