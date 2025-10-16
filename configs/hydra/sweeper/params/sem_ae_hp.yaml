@@ -3,7 +3,7 @@ model_checkpoint: base
 effective_batch_size: 1024
 task.ae.batch_size: 32 
 precision: bf16-mixed
-task.ae.encoder.train: true
+task.ae.encoder.train: false
 task.ae.decoder.train: true
 task.ae.encoder.sem_cfg.temp: 0.1, 0.5
 task.ae.encoder.sem_cfg.V: 1024, 2048

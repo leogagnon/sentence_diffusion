@@ -1,0 +1,10 @@
+task/ae: gpt2_large, gpt2_xl
+model_checkpoint: base
+effective_batch_size: 1024
+precision: bf16-mixed
+
+limit_val_batches: 8
+val_check_interval: 256
+
+sweep_id: pure_ar
+
