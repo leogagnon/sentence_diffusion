@@ -1,13 +1,14 @@
 defaults:
   - submitit_slurm
 
-mem_gb: 64
-gpus-per-node: gpu:h100:4
-tasks_per_node: 4
+mem_gb: 128
+gpus_per_node: 4
 array_parallelism: 32
 nodes: 1 
+tasks_per_node: 4
 cpus_per_task: 4
-timeout_min: 1440
+timeout_min: 960
+account: aip-glaj
 additional_parameters:
   no-requeue: true
 

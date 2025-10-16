@@ -170,7 +170,7 @@ class STEncoderConfig:
     compressor_cfg: Optional[CompressorConfig] = None
     sem_cfg: Optional[SEMHeadConfig] = None
     variational: bool = False
-
+    train: bool = True
 
 class STEncoder(EncoderModel):
     def __init__(self, cfg: Optional[STEncoderConfig] = None, **kwargs):
@@ -234,6 +234,7 @@ class STEncoder(EncoderModel):
 
             cfg.sem_cfg.input_dim = self.latent_dim
             self.sem = SEMHead(cfg.sem_cfg)
+            self.requires_grad_(True) # just making sure
 
         if cfg.variational:
             assert (
@@ -245,7 +246,16 @@ class STEncoder(EncoderModel):
             self.out_mean = nn.Linear(self.latent_dim, self.latent_dim)
             self.out_logvar = nn.Linear(self.latent_dim, self.latent_dim)
 
-        if cfg.lora_cfg == None:
+        if cfg.train:
+            self.transformer.train()
+            if cfg.lora_cfg != None:
+                self.transformer = get_peft_model(
+                    self.transformer,
+                    LoraConfig(**cfg.lora_cfg),
+                )
+            else:
+                self.transformer.requires_grad_(True)
+        else:
             # Make the transformer non-trainable but faster!
             self.transformer.auto_model = self.transformer.auto_model.to(torch.bfloat16)
             try:
@@ -256,19 +266,14 @@ class STEncoder(EncoderModel):
                 )
             self.transformer.requires_grad_(False)
             self.transformer.eval()
-        else:
-            self.transformer.requires_grad_(True)
-            self.transformer = get_peft_model(
-                self.transformer,
-                LoraConfig(**cfg.lora_cfg),
-            )
+            
 
         self.cfg = cfg
 
     def train(self, mode: bool = True):
         super().train(mode)
         # Keep the transformer in eval model if not finetuning
-        if self.cfg.lora_cfg == None:
+        if self.cfg.train == False:
             self.transformer.eval()
         return self
 

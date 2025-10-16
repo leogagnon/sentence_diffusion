@@ -37,7 +37,7 @@ class DecoderConfig:
     prompt_generator_cfg: Optional[PromptGeneratorConfig] = None
     lora_cfg: Optional[dict] = None
     disable_dropout: bool = True
-
+    train: bool = True
 
 class DecoderModel(nn.Module):
     """Wrapper around a pretrained decoder model (e.g. GPT) with optional LoRA adaptation and soft prompting."""
@@ -55,12 +55,17 @@ class DecoderModel(nn.Module):
                 if isinstance(module, torch.nn.Dropout):
                     module.p = 0.0
 
-        if self.cfg.lora_cfg != None:
-            self.backbone = get_peft_model(
-                self.backbone,
-                LoraConfig(**self.cfg.lora_cfg),
-            )
+        if self.cfg.train:
+            self.backbone.train()
+            if self.cfg.lora_cfg != None:
+                self.backbone = get_peft_model(
+                    self.backbone,
+                    LoraConfig(**self.cfg.lora_cfg),
+                )
+            else:
+                self.backbone.requires_grad_(True)
         else:
+            assert self.cfg.lora_cfg == None
             self.backbone.requires_grad_(False)
             self.backbone.eval()
 
@@ -112,6 +117,7 @@ class DecoderModel(nn.Module):
                     depth=cfg.prompt_generator_cfg.n_layers,
                     heads=cfg.prompt_generator_cfg.n_heads,
                 )
+            self.prompt_generator.requires_grad_(True) # just making sure
         elif cfg.input_dim != None:
             self.in_proj = nn.Linear(
                 cfg.input_dim, self.backbone.config.hidden_size, bias=False
@@ -122,7 +128,7 @@ class DecoderModel(nn.Module):
 
     def train(self, mode: bool = True):
         super().train(mode)
-        if self.cfg.lora_cfg == None:
+        if self.cfg.train == False:
             # Keep the backbone in eval mode if not finetuning
             self.backbone.eval()
         return self
