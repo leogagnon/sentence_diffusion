@@ -251,7 +251,7 @@ class DLCLMTask(L.LightningModule):
                 batch["input_str"][:10],
                 self.decoder.tokenizer.batch_decode(
                     self.decoder.generate(
-                        prompt=input_ids_dec[:10, (dlc.shape[1] + 1) :],
+                        prompt=input_ids_dec[:10, : (dlc.shape[1] + 1)],
                         max_length=self.dataset.cfg.max_length,
                     ),
                     skip_special_tokens=True,

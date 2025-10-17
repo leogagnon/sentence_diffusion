@@ -251,7 +251,7 @@ class DecoderModel(nn.Module):
             past_key_values=cache,
             cache_position=cache_position,
             attention_mask=attention_mask,
-            max_length=max_length,
+            max_new_tokens=max_length,
             do_sample=True,
             top_p=0.92,
             top_k=50,
