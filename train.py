@@ -16,6 +16,7 @@ from lightning.pytorch.callbacks import EarlyStopping
 from lightning.pytorch.utilities.rank_zero import rank_zero_info, rank_zero_only
 
 torch.set_float32_matmul_precision("medium")
+torch._dynamo.config.capture_scalar_outputs = True
 
 @dataclass
 class TaskConfig:
@@ -41,6 +42,7 @@ class TrainConfig:
     name: Optional[str] = None
     precision: str = "bf16-mixed"
     limit_val_batches: Optional[int] = None
+    compile: bool = False
 
 
 cs = ConfigStore.instance()
@@ -133,6 +135,9 @@ def main(cfg: Optional[TrainConfig] = None, run_id: Optional[str] = None):
         cfg.task.ae = task.cfg
     else:
         raise ValueError("No task specified in config!")
+    
+    if cfg.compile:
+        task = torch.compile(task)
 
     # Give the whole TrainConfig to wandb
     if cfg.logger and (rank_zero_only.rank == 0):

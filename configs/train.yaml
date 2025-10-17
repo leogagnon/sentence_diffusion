@@ -20,3 +20,5 @@ sweep_id: null
 precision: bf16-mixed
 limit_val_batches: 4
 strategy: auto
+compile: false
+gradient_clip_val: 1.0

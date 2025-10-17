@@ -64,7 +64,7 @@ class DLCLMTask(L.LightningModule):
                 "last.ckpt",
             ),
             strict=False,
-            map_location="cpu",
+           # map_location="cpu",
         )
         self.train_indices = ae_task.train_indices
         self.val_indices = ae_task.val_indices
@@ -73,7 +73,7 @@ class DLCLMTask(L.LightningModule):
 
         # Load and process encoder (eval, no gradients, bfloat16, flash attention)
         assert ae_task.encoder.cfg.sem_cfg != None, "DLCLM requires a SEM encoder"
-        self.encoder = ae_task.encoder.to(torch.bfloat16).eval().requires_grad_(False)
+        self.encoder = ae_task.encoder.eval().requires_grad_(False)
         try:
             # Try to use flash attention if available
             self.encoder.transformer.auto_model.set_attn_implementation(
@@ -85,24 +85,25 @@ class DLCLMTask(L.LightningModule):
         # We finetune the decoder from the AE training, without the prompt generator, with new token embeddings
         # We merge the initial LoRA adapter and create a new one for the DLC finetuning
         self.decoder = ae_task.decoder
-        del self.decoder.prompt_generator
-        self.decoder.backbone = self.decoder.backbone.merge_and_unload()
+        if self.decoder.cfg.lora_cfg != None:
+            self.decoder.backbone = self.decoder.backbone.merge_and_unload()
         self.decoder.backbone.resize_token_embeddings(
             len(ae_task.decoder.tokenizer) + ae_task.encoder.cfg.sem_cfg.V
         )
-        # Also finetune the token embeddings and LM head
-        lora_config = self.decoder.cfg.lora_cfg
-        lora_config["modules_to_save"] = ["transformer.wte", "lm_head"]
-        self.decoder.backbone = get_peft_model(
-            self.decoder.backbone,
-            LoraConfig(**self.decoder.cfg.lora_cfg),
-        )
+        self.decoder.requires_grad_(True)
+        del self.decoder.prompt_generator
 
         self.cfg = cfg
 
         self.save_hyperparameters(
             OmegaConf.to_container(OmegaConf.structured(cfg)), logger=False
         )
+    
+    def train(self, mode=True):
+        # Make sure encoder stays in eval mode
+        super().train(mode)
+        self.encoder.eval()
+        return self
 
     def setup(self, stage: Optional[str] = None):
         self.train_data = Subset(self.dataset, indices=self.train_indices)
@@ -120,6 +121,7 @@ class DLCLMTask(L.LightningModule):
                 enc_tokenizer=self.encoder.tokenizer,
                 dec_tokenizer=self.decoder.tokenizer,
             ),
+            drop_last=True,
         )
 
     def val_dataloader(self):
@@ -130,28 +132,28 @@ class DLCLMTask(L.LightningModule):
             collate_fn=self.dataset.get_collate_and_tokenize_fn(
                 enc_tokenizer=self.encoder.tokenizer,
                 dec_tokenizer=self.decoder.tokenizer,
-            ),
+            )
         )
 
     def training_step(self, batch, batch_idx):
+        with torch.no_grad():
+            dlc = self.encoder(
+                batch["input_ids_enc"], batch["attention_mask_enc"], return_sem=True
+            ).argmax(-1)
+            dlc += len(self.decoder.tokenizer)  # Shift SEM tokens to new token indices
 
-        dlc = self.encoder(
-            batch["input_ids_enc"], batch["attention_mask_enc"], return_sem=True
-        ).argmax(-1)
-        dlc += len(self.decoder.tokenizer)  # Shift SEM tokens to new token indices
-
-        # Prepend BOS + DLC to decoder input ids
-        input_ids_dec = torch.cat(
-            [
-                torch.full_like(
-                    dlc[:, [0]],
-                    fill_value=self.decoder.tokenizer.bos_token_id,
-                ),
-                dlc,
-                batch["input_ids_dec"],
-            ],
-            dim=1,
-        )
+            # Prepend BOS + DLC to decoder input ids
+            input_ids_dec = torch.cat(
+                [
+                    torch.full_like(
+                        dlc[:, [0]],
+                        fill_value=self.decoder.tokenizer.bos_token_id,
+                    ),
+                    dlc,
+                    batch["input_ids_dec"],
+                ],
+                dim=1,
+            )
 
         # Compute loss
         targets = input_ids_dec.clone()[:, 1:].contiguous()

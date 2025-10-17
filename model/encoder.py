@@ -25,6 +25,8 @@ from torch.nn import Sequential
 import sentence_transformers
 from lightning.pytorch.utilities.rank_zero import rank_zero_info
 from einops import rearrange
+from torch.utils.checkpoint import checkpoint
+
 
 @dataclass
 class SEMHeadConfig:
@@ -172,6 +174,7 @@ class STEncoderConfig:
     variational: bool = False
     train: bool = True
 
+
 class STEncoder(EncoderModel):
     def __init__(self, cfg: Optional[STEncoderConfig] = None, **kwargs):
         super().__init__()
@@ -234,7 +237,7 @@ class STEncoder(EncoderModel):
 
             cfg.sem_cfg.input_dim = self.latent_dim
             self.sem = SEMHead(cfg.sem_cfg)
-            self.requires_grad_(True) # just making sure
+            self.requires_grad_(True)  # just making sure
 
         if cfg.variational:
             assert (
@@ -266,7 +269,6 @@ class STEncoder(EncoderModel):
                 )
             self.transformer.requires_grad_(False)
             self.transformer.eval()
-            
 
         self.cfg = cfg
 
@@ -309,8 +311,10 @@ class STEncoder(EncoderModel):
 
             if self.cfg.sem_cfg != None:
                 if return_sem:
-                    return self.sem(sentence_embedding, return_sem=True)
-                sentence_embedding = self.sem(sentence_embedding)
+                    return checkpoint(self.sem, sentence_embedding, return_sem=True, use_reentrant=False)
+                sentence_embedding = checkpoint(
+                    self.sem, sentence_embedding, use_reentrant=False
+                )
 
             sentence_embedding = sentence_embedding[:, None]
 
