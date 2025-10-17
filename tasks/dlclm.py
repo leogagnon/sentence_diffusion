@@ -64,7 +64,7 @@ class DLCLMTask(L.LightningModule):
                 "last.ckpt",
             ),
             strict=False,
-           # map_location="cpu",
+            map_location="cpu",
         )
         self.train_indices = ae_task.train_indices
         self.val_indices = ae_task.val_indices
@@ -90,7 +90,7 @@ class DLCLMTask(L.LightningModule):
         self.decoder.backbone.resize_token_embeddings(
             len(ae_task.decoder.tokenizer) + ae_task.encoder.cfg.sem_cfg.V
         )
-        self.decoder.requires_grad_(True)
+        self.decoder = self.decoder.train().requires_grad_(True)
         del self.decoder.prompt_generator
 
         self.cfg = cfg
@@ -98,6 +98,11 @@ class DLCLMTask(L.LightningModule):
         self.save_hyperparameters(
             OmegaConf.to_container(OmegaConf.structured(cfg)), logger=False
         )
+
+    def compile(self):
+        self.encoder.forward = torch.compile(self.encoder.forward)
+        self.decoder.forward = torch.compile(self.decoder.forward)
+
     
     def train(self, mode=True):
         # Make sure encoder stays in eval mode

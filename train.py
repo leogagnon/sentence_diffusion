@@ -137,7 +137,7 @@ def main(cfg: Optional[TrainConfig] = None, run_id: Optional[str] = None):
         raise ValueError("No task specified in config!")
     
     if cfg.compile:
-        task = torch.compile(task)
+        task.compile()
 
     # Give the whole TrainConfig to wandb
     if cfg.logger and (rank_zero_only.rank == 0):
@@ -180,7 +180,7 @@ def main(cfg: Optional[TrainConfig] = None, run_id: Optional[str] = None):
         accumulate_grad_batches=accumulate_grad_batches,
         precision=cfg.precision,
         limit_val_batches=cfg.limit_val_batches if cfg.limit_val_batches else 1.0,
-        devices=num_devices,
+        devices= num_devices,
         strategy=cfg.strategy,
         num_nodes=1,
     )

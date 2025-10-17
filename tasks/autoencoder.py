@@ -96,6 +96,10 @@ class AETask(L.LightningModule):
         self.save_hyperparameters(
             OmegaConf.to_container(OmegaConf.structured(cfg)), logger=False
         )
+    
+    def compile(self):
+        self.encoder.forward = torch.compile(self.encoder.forward)
+        self.decoder.forward = torch.compile(self.decoder.forward)
 
     def sample_alpha(self, z):
         if self.cfg.z_noise_type == "fixed":

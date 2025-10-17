@@ -1,6 +1,6 @@
-lr: 1e-4
+lr: 1e-5
 batch_size: 32
-pretrained_ae_id: usx2ekas
+pretrained_ae_id: 13dfit14
 
 data_seed: 42
 
