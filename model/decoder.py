@@ -188,8 +188,34 @@ class DecoderModel(nn.Module):
         prompt: Optional[torch.Tensor] = None,
         alpha: Optional[torch.Tensor] = None,
         batch_size: Optional[int] = None,
+        generate_prompt: bool = False,
     ):
         """Generate text using autoregressive decoding, potentially conditioned on soft prefix z"""
+        # If generating the prompt autoregressively (DLC-LM style)
+        if generate_prompt:
+            assert (z is None) and (prompt is None)
+            bos = torch.full(
+                size=(batch_size, 1),
+                fill_value=self.tokenizer.bos_token_id,
+                dtype=torch.long,
+            ).cuda()
+            batch_size = None
+            output = self.backbone.generate(
+                input_ids=bos,
+                max_length=32 + 2,  # 32-token DLC + BOS + EOS
+                do_sample=True,
+                top_p=0.92,
+                top_k=50,
+                num_beams=1,
+                temperature=0.9,
+                return_dict_in_generate=True,
+                use_cache=True,
+                pad_token_id=self.tokenizer.pad_token_id,
+                eos_token_id=self.tokenizer.eos_token_id,
+            )
+            prompt = output.sequences[
+                :, :-1
+            ]  # Remove EOS token (which will be BOS for main generation)
 
         # If there is conditionning
         if (z != None) or (prompt != None):
@@ -199,14 +225,14 @@ class DecoderModel(nn.Module):
                 # In this case it is a soft prompt
                 prompt = self.z_to_prompt(z, alpha=alpha)
                 cache = self.backbone(
-                            inputs_embeds=prompt,
-                            use_cache=True,
-                        ).past_key_values
+                    inputs_embeds=prompt,
+                    use_cache=True,
+                ).past_key_values
             else:
                 cache = self.backbone(
-                            input_ids=prompt,
-                            use_cache=True,
-                        ).past_key_values
+                    input_ids=prompt,
+                    use_cache=True,
+                ).past_key_values
 
             # Setup arguments for generation
             assert batch_size is None, "Cannot provide batch_size if prompt is given"
@@ -221,7 +247,9 @@ class DecoderModel(nn.Module):
             cache_position = None
             attention_mask = None
             device = next(self.backbone.parameters()).device
-            assert batch_size is not None, "Must provide batch_size if no conditionning is given"
+            assert (
+                batch_size is not None
+            ), "Must provide batch_size if no conditionning is given"
 
         # Autoregressive generation from BOS token with cached z (nucleus sampling)
         bos = torch.full(

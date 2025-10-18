@@ -252,3 +252,5 @@ class DLCLMTask(L.LightningModule):
             ):
                 table_clean.add_data(original, reconstructed)
             wandb.log({"val/clean_samples": table_clean})
+
+    
