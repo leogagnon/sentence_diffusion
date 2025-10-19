@@ -100,7 +100,8 @@ class AETask(L.LightningModule):
         )
     
     def compile(self):
-        self.encoder.compile()
+        if self.cfg.encoder != None:
+            self.encoder.compile()
         self.decoder.compile()
 
     def sample_alpha(self, z):

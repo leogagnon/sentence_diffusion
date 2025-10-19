@@ -6,5 +6,7 @@ precision: bf16-mixed
 limit_val_batches: 8
 val_check_interval: 256
 
-sweep_id: pure_ar
+compile: true
+max_epochs: 5
+sweep_id: pure_ar_long
 

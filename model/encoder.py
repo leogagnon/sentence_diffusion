@@ -46,7 +46,6 @@ class SEMHead(nn.Module):
         self.cfg = cfg
 
     def forward(self, x, return_sem=False):
-        # x: (B, D)
         x = self.proj_in(x)
         x = self.norm(x)
         x = einx.rearrange("b (l v) -> b l v", x, l=self.cfg.L, v=self.cfg.V)
@@ -69,7 +68,7 @@ class HSEMHeadConfig:
 
 
 class HSEMHead(nn.Module):
-    def __init__(self, cfg: HSEMHeadConfig, n_levels: int):
+    def __init__(self, cfg: HSEMHeadConfig):
         super().__init__()
         assert cfg.input_dim is not None, "input_dim has to be set"
         self.N = (cfg.V**cfg.D) // (cfg.V - 1)
@@ -78,26 +77,35 @@ class HSEMHead(nn.Module):
         self.proj_out = nn.Linear(cfg.L * cfg.V * self.N, cfg.input_dim)
         self.cfg = cfg
 
-    def forward(self, x):
-        logits = einx.rearrange(
+    def forward(self, x: torch.Tensor, return_sem=False):
+        x = self.proj_in(x)
+        x = self.norm(x)
+        x = einx.rearrange(
             "b (L N V) -> b L N V",
-            self.proj_in(x),
+            x,
             L=self.cfg.L,
             N=self.N,
             V=self.cfg.V,
         )
-        probs = F.softmax(logits / 1.0, -1)
-        parent_probs = torch.ones(x.shape[0], self.cfg.L, 1, device=x.device)
+        x = F.softmax(x / self.cfg.temp, -1)  # Raw conditional probs
+
+        # Compute absolute probs by going down tree
+        bs = x.shape[0]
+        parent_probs = torch.ones(
+            size=(bs, self.cfg.L, 1), device=x.device, dtype=x.dtype
+        )
         start = 0
-        out = []
+        x_final = []
         for d in range(self.cfg.D):
-            # Select the nodes at depth d
             end = start + self.cfg.V**d
-            final_probs = probs[:, :, start:end] * parent_probs[..., None]
-            parent_probs = einx.rearrange("b m d v -> b m (d v)", final_probs)
-            out.append(parent_probs)
+            level = x[:, :, start:end] * parent_probs[..., None]
+            x_final.append(level)
+            parent_probs = einx.rearrange("b L n V -> b L (n V)", level)
             start = end
-        out = torch.cat(out, -1)
+        x_final = torch.cat(x_final, dim=2)
+        x_final = einx.rearrange("b L N V -> b (L N V)", x_final)
+        x_final = self.proj_out(x_final)
+        return x_final
 
 
 @dataclass
@@ -170,6 +178,7 @@ class STEncoderConfig:
     dropout_p: float = 0.0
     compressor_cfg: Optional[CompressorConfig] = None
     sem_cfg: Optional[SEMHeadConfig] = None
+    hsem_cfg: Optional[HSEMHeadConfig] = None
     variational: bool = False
     train: bool = True
 
@@ -233,10 +242,20 @@ class STEncoder(EncoderModel):
         if cfg.sem_cfg != None:
             assert cfg.compressor_cfg == None
             assert cfg.normalize == False
+            assert cfg.hsem_cfg == None
 
             cfg.sem_cfg.input_dim = self.latent_dim
             self.sem = SEMHead(cfg.sem_cfg)
-            self.requires_grad_(True)  # just making sure
+            self.sem.requires_grad_(True)  # just making sure
+
+        if cfg.hsem_cfg != None:
+            assert cfg.sem_cfg == None
+            assert cfg.compressor_cfg == None
+            assert cfg.normalize == False
+
+            cfg.hsem_cfg.input_dim = self.latent_dim
+            self.sem = HSEMHead(cfg.hsem_cfg)
+            self.sem.requires_grad_(True)  # just making sure
 
         if cfg.variational:
             assert (
@@ -312,7 +331,7 @@ class STEncoder(EncoderModel):
             else:
                 sentence_embedding = batch["sentence_embedding"]
 
-            if self.cfg.sem_cfg != None:
+            if (self.cfg.sem_cfg != None) or (self.cfg.hsem_cfg != None):
                 if return_sem:
                     return self.sem(sentence_embedding, return_sem=True)
                 sentence_embedding = self.sem(sentence_embedding)
