@@ -5,7 +5,6 @@ val_size: 16384
 z_noise_type: none
 
 encoder:
-  _target_: model.encoder.STEncoder
   name: SONAR 
   normalize: false
   train: true

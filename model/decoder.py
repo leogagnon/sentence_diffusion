@@ -49,6 +49,7 @@ class DecoderModel(nn.Module):
 
         # Init causal LM backbone
         self.backbone = AutoModelForCausalLM.from_pretrained(cfg.name)
+        self.backbone.set_attn_implementation("flash_attention_2")
 
         # Disable dropout in the backbone
         if self.cfg.disable_dropout:
@@ -134,6 +135,10 @@ class DecoderModel(nn.Module):
             # This means there is no z; the model is just a standard unconditional decoder
             pass
 
+    def compile(self):
+        # Only compile GPT2 backbone
+        self.backbone = torch.compile(self.backbone)
+
     def train(self, mode: bool = True):
         super().train(mode)
         if self.cfg.train == False:
@@ -194,7 +199,7 @@ class DecoderModel(nn.Module):
 
         return logits
 
-    @torch.no_grad()
+    @torch.inference_mode()
     def generate(
         self,
         max_length: int,
@@ -202,8 +207,35 @@ class DecoderModel(nn.Module):
         prompt: Optional[torch.Tensor] = None,
         alpha: Optional[torch.Tensor] = None,
         batch_size: Optional[int] = None,
+        generate_prompt: bool = False,
+        dlc_len: Optional[int] = None
     ):
         """Generate text using autoregressive decoding, potentially conditioned on soft prefix z"""
+        # If generating the prompt autoregressively (DLC-LM style)
+        if generate_prompt:
+            assert (z is None) and (prompt is None)
+            bos = torch.full(
+                size=(batch_size, 1),
+                fill_value=self.tokenizer.bos_token_id,
+                dtype=torch.long,
+            ).cuda()
+            batch_size = None
+            output = self.backbone.generate(
+                input_ids=bos,
+                max_length=dlc_len + 2,  # 32-token DLC + BOS + EOS
+                do_sample=True,
+                top_p=0.92,
+                top_k=50,
+                num_beams=1,
+                temperature=0.9,
+                return_dict_in_generate=False,
+                use_cache=True,
+                pad_token_id=self.tokenizer.pad_token_id,
+                eos_token_id=self.tokenizer.eos_token_id,
+            )
+            prompt = output[
+                :, :-1
+            ]  # Remove EOS token (which will be BOS for main generation)
 
         # If there is conditionning
         if (z != None) or (prompt != None):
@@ -257,12 +289,12 @@ class DecoderModel(nn.Module):
             top_k=50,
             num_beams=1,
             temperature=0.9,
-            return_dict_in_generate=True,
+            return_dict_in_generate=False,
             use_cache=True,
             pad_token_id=self.tokenizer.pad_token_id,
             eos_token_id=self.tokenizer.eos_token_id,
         )
 
-        output = output.sequences[:, 1:]  # Remove BOS token
+        output = output[:, 1:]  # Remove BOS token
 
         return output

@@ -33,7 +33,6 @@ class SEMHeadConfig:
     L: int
     V: int
     temp: float
-    D: Optional[int]
     input_dim: Optional[int] = None
 
 
@@ -271,6 +270,10 @@ class STEncoder(EncoderModel):
             self.transformer.eval()
 
         self.cfg = cfg
+
+    def compile(self):
+        if self.cfg.sem_cfg != None:
+            self.sem = torch.compile(self.sem)
 
     def train(self, mode: bool = True):
         super().train(mode)

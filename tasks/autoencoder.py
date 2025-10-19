@@ -24,7 +24,9 @@ import wandb
 import hydra
 from model.gaussian_diffusion import time_to_alpha, cosine_schedule
 from lightning.pytorch.utilities.rank_zero import rank_zero_info, rank_zero_only
-
+from tqdm import tqdm
+from mauve import compute_mauve, get_features_from_input
+from model.encoder import STEncoder, STEncoderConfig
 
 def reparameterize(mean, logvar):
     std = torch.exp(0.5 * logvar)
@@ -40,7 +42,7 @@ class AETaskConfig:
     max_generation_length: int
     dataset: dict
     val_size: int
-    encoder: Optional[dict] = None
+    encoder: Optional[STEncoderConfig] = None
 
     data_seed: int = 42
 
@@ -71,7 +73,7 @@ class AETask(L.LightningModule):
 
         # Load encoder and decoder
         if cfg.encoder != None:
-            self.encoder = hydra.utils.instantiate(cfg.encoder)
+            self.encoder = STEncoder(cfg.encoder)
             cfg.decoder.input_dim = self.encoder.latent_dim
 
         if cfg.z_noise_type == "variational":
@@ -86,7 +88,7 @@ class AETask(L.LightningModule):
 
         indices = torch.randperm(
             len(self.dataset),
-            generator=torch.Generator().manual_seed(cfg.data_seed),
+            generator=torch.Generator().manual_seed(42), # make sure this never changes
         )
         self.train_indices = indices[: -cfg.val_size]
         self.val_indices = indices[-cfg.val_size :]
@@ -98,8 +100,8 @@ class AETask(L.LightningModule):
         )
     
     def compile(self):
-        self.encoder.forward = torch.compile(self.encoder.forward)
-        self.decoder.forward = torch.compile(self.decoder.forward)
+        self.encoder.compile()
+        self.decoder.compile()
 
     def sample_alpha(self, z):
         if self.cfg.z_noise_type == "fixed":
@@ -278,3 +280,41 @@ class AETask(L.LightningModule):
             ):
                 table_clean.add_data(original, reconstructed)
             wandb.log({"val/clean_samples": table_clean})
+
+    def eval_mauve(self, seed: int = 1337):
+        assert self.cfg.encoder == None, "Can only compute MAUVE for unconditional models"
+        # Load reference features
+        ref_feats = torch.load("mauve_eval_feats.pt")
+
+        # Generate unconditionally
+        with torch.inference_mode():
+            gen_text = []
+            for _ in tqdm(range(len(ref_feats) // 128), desc=f"Generating paragraphs..."):
+                gen_text.extend(
+                    self.decoder.tokenizer.batch_decode(
+                        self.decoder.generate(
+                            max_length=150, batch_size=128
+                        ),
+                        skip_special_tokens=True,
+                    )
+                )
+        
+        # Featurize for MAUVE
+        gen_feats = get_features_from_input(
+            None, None, gen_text, "gpt2-large", 150, 0, "generated paragraphs", 64
+        )
+
+        # Comput MAUVE
+        mauve = compute_mauve(
+            p_features=gen_feats,
+            q_features=ref_feats,
+            max_text_length=150,
+            batch_size=64,
+            device_id=0,
+            featurize_model_name="gpt2-large",
+            seed=seed
+        )
+
+        torch.cuda.empty_cache()
+
+        return mauve.mauve

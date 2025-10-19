@@ -26,6 +26,8 @@ from model.gaussian_diffusion import time_to_alpha, cosine_schedule
 from lightning.pytorch.utilities.rank_zero import rank_zero_info, rank_zero_only
 from tasks.autoencoder import AETask
 from data.wiki import WikipediaDataset
+from tqdm import tqdm
+from mauve import compute_mauve, get_features_from_input
 
 
 @dataclass
@@ -59,7 +61,8 @@ class DLCLMTask(L.LightningModule):
         # Extract encoder, decoder and dataset from pretrained autoencoder
         ae_task = AETask.load_from_checkpoint(
             os.path.join(
-                os.environ["LATENT_CONTROL_CKPT_DIR"],
+                os.environ["LOG_DIR"],
+                "checkpoints/",
                 cfg.pretrained_ae_id,
                 "last.ckpt",
             ),
@@ -91,7 +94,10 @@ class DLCLMTask(L.LightningModule):
             len(ae_task.decoder.tokenizer) + ae_task.encoder.cfg.sem_cfg.V
         )
         self.decoder = self.decoder.train().requires_grad_(True)
+        self.decoder.backbone.set_attn_implementation("flash_attention_2")
         del self.decoder.prompt_generator
+
+        self.val_epoch_counter = 0
 
         self.cfg = cfg
 
@@ -100,10 +106,9 @@ class DLCLMTask(L.LightningModule):
         )
 
     def compile(self):
-        self.encoder.forward = torch.compile(self.encoder.forward)
-        self.decoder.forward = torch.compile(self.decoder.forward)
+        self.encoder.compile()
+        self.decoder.compile()
 
-    
     def train(self, mode=True):
         # Make sure encoder stays in eval mode
         super().train(mode)
@@ -137,7 +142,7 @@ class DLCLMTask(L.LightningModule):
             collate_fn=self.dataset.get_collate_and_tokenize_fn(
                 enc_tokenizer=self.encoder.tokenizer,
                 dec_tokenizer=self.decoder.tokenizer,
-            )
+            ),
         )
 
     def training_step(self, batch, batch_idx):
@@ -244,8 +249,8 @@ class DLCLMTask(L.LightningModule):
             sync_dist=True,
         )
 
-        # Log reconstruction samples
         if (batch_idx == 0) and (rank_zero_only.rank == 0):
+            # Log reconstruction samples
             table_clean = wandb.Table(columns=["Original", "Reconstructed"])
             for original, reconstructed in zip(
                 batch["input_str"][:10],
@@ -259,3 +264,50 @@ class DLCLMTask(L.LightningModule):
             ):
                 table_clean.add_data(original, reconstructed)
             wandb.log({"val/clean_samples": table_clean})
+
+            # Log MAUVE score every 5 validation steps
+            if self.val_epoch_counter % 5 == 0:
+                mauve = self.eval_mauve()
+                wandb.log({"val/MAUVE": mauve})
+
+    def eval_mauve(self, seed: int = 1337):
+        # Load reference features
+        ref_feats = torch.load("mauve_eval_feats.pt")
+
+        # Generate unconditionally
+        with torch.inference_mode():
+            gen_text = []
+            for _ in tqdm(
+                range(len(ref_feats) // 128), desc=f"Generating paragraphs..."
+            ):
+                gen_text.extend(
+                    self.decoder.tokenizer.batch_decode(
+                        self.decoder.generate(
+                            max_length=150,
+                            batch_size=128,
+                            generate_prompt=True,
+                            dlc_len=self.encoder.cfg.sem_cfg.L,
+                        ),
+                        skip_special_tokens=True,
+                    )
+                )
+
+        # Featurize for MAUVE
+        gen_feats = get_features_from_input(
+            None, None, gen_text, "gpt2-large", 150, 0, "generated paragraphs", 64
+        )
+
+        # Comput MAUVE
+        mauve = compute_mauve(
+            p_features=gen_feats,
+            q_features=ref_feats,
+            max_text_length=150,
+            batch_size=64,
+            device_id=0,
+            featurize_model_name="gpt2-large",
+            seed=seed,
+        )
+
+        torch.cuda.empty_cache()
+
+        return mauve.mauve
