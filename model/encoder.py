@@ -102,6 +102,8 @@ class HSEMHead(nn.Module):
             x_final.append(level)
             parent_probs = einx.rearrange("b L n V -> b L (n V)", level)
             start = end
+        if return_sem:
+            return x_final
         x_final = torch.cat(x_final, dim=2)
         x_final = einx.rearrange("b L N V -> b (L N V)", x_final)
         x_final = self.proj_out(x_final)
@@ -181,7 +183,6 @@ class STEncoderConfig:
     hsem_cfg: Optional[HSEMHeadConfig] = None
     variational: bool = False
     train: bool = True
-
 
 class STEncoder(EncoderModel):
     def __init__(self, cfg: Optional[STEncoderConfig] = None, **kwargs):

@@ -15,7 +15,7 @@ from tasks.dlclm import DLCLMTask, DLCLMTaskConfig
 from lightning.pytorch.callbacks import EarlyStopping
 from lightning.pytorch.utilities.rank_zero import rank_zero_info, rank_zero_only
 
-torch.set_float32_matmul_precision("medium")
+torch.set_float32_matmul_precision("high")
 torch._dynamo.config.capture_scalar_outputs = True
 
 @dataclass

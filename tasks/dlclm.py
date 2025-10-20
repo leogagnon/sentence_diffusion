@@ -28,6 +28,7 @@ from tasks.autoencoder import AETask
 from data.wiki import WikipediaDataset
 from tqdm import tqdm
 from mauve import compute_mauve, get_features_from_input
+import einx
 
 
 @dataclass
@@ -66,7 +67,7 @@ class DLCLMTask(L.LightningModule):
                 cfg.pretrained_ae_id,
                 "last.ckpt",
             ),
-            strict=False,
+            strict=True,
             map_location="cpu",
         )
         self.train_indices = ae_task.train_indices
@@ -74,16 +75,13 @@ class DLCLMTask(L.LightningModule):
         self.dataset = ae_task.dataset
         self.dataset: WikipediaDataset
 
-        # Load and process encoder (eval, no gradients, bfloat16, flash attention)
-        assert ae_task.encoder.cfg.sem_cfg != None, "DLCLM requires a SEM encoder"
+        if ae_task.encoder.cfg.sem_cfg != None:
+            V = ae_task.encoder.cfg.sem_cfg.V
+        elif ae_task.encoder.cfg.hsem_cfg != None:
+            V = ae_task.encoder.cfg.hsem_cfg.V
+        else:
+            assert False, "DLCLM requires a SEM encoder"
         self.encoder = ae_task.encoder.eval().requires_grad_(False)
-        try:
-            # Try to use flash attention if available
-            self.encoder.transformer.auto_model.set_attn_implementation(
-                "flash_attention_2"
-            )
-        except:
-            pass
 
         # We finetune the decoder from the AE training, without the prompt generator, with new token embeddings
         # We merge the initial LoRA adapter and create a new one for the DLC finetuning
@@ -91,10 +89,9 @@ class DLCLMTask(L.LightningModule):
         if self.decoder.cfg.lora_cfg != None:
             self.decoder.backbone = self.decoder.backbone.merge_and_unload()
         self.decoder.backbone.resize_token_embeddings(
-            len(ae_task.decoder.tokenizer) + ae_task.encoder.cfg.sem_cfg.V
+            len(ae_task.decoder.tokenizer) + V
         )
         self.decoder = self.decoder.train().requires_grad_(True)
-        self.decoder.backbone.set_attn_implementation("flash_attention_2")
         del self.decoder.prompt_generator
 
         self.val_epoch_counter = 0
@@ -104,10 +101,6 @@ class DLCLMTask(L.LightningModule):
         self.save_hyperparameters(
             OmegaConf.to_container(OmegaConf.structured(cfg)), logger=False
         )
-
-    def compile(self):
-        self.encoder.compile()
-        self.decoder.compile()
 
     def train(self, mode=True):
         # Make sure encoder stays in eval mode
@@ -147,9 +140,23 @@ class DLCLMTask(L.LightningModule):
 
     def training_step(self, batch, batch_idx):
         with torch.no_grad():
-            dlc = self.encoder(
+            dlc_logits = self.encoder(
                 batch["input_ids_enc"], batch["attention_mask_enc"], return_sem=True
-            ).argmax(-1)
+            )
+            if self.encoder.cfg.sem_cfg != None:
+                dlc = dlc_logits.argmax(-1)
+            elif self.encoder.cfg.hsem_cfg != None:
+                V = dlc_logits[0].shape[-1]
+                dlc = [dlc_logits[0].argmax(-1).squeeze()]
+                for i in range(len(dlc_logits) - 1):
+                    level = torch.gather(
+                        input=dlc_logits[1],
+                        dim=2,
+                        index=einx.rearrange("b l -> b l n v", dlc[i], n=1, v=V),
+                    )
+                    dlc.append(torch.argmax(level, dim=-1).squeeze())
+                dlc = torch.cat(dlc, dim=1)
+
             dlc += len(self.decoder.tokenizer)  # Shift SEM tokens to new token indices
 
             # Prepend BOS + DLC to decoder input ids
@@ -200,9 +207,22 @@ class DLCLMTask(L.LightningModule):
 
     @torch.no_grad()
     def validation_step(self, batch, batch_idx):
-        dlc = self.encoder(
-            batch["input_ids_enc"], batch["attention_mask_enc"], return_sem=True
-        ).argmax(-1)
+        dlc_logits = self.encoder(
+                batch["input_ids_enc"], batch["attention_mask_enc"], return_sem=True
+            )
+        if self.encoder.cfg.sem_cfg != None:
+            dlc = dlc_logits.argmax(-1)
+        elif self.encoder.cfg.hsem_cfg != None:
+            V = dlc_logits[0].shape[-1]
+            dlc = [dlc_logits[0].argmax(-1).squeeze()]
+            for i in range(len(dlc_logits) - 1):
+                level = torch.gather(
+                    input=dlc_logits[1],
+                    dim=2,
+                    index=einx.rearrange("b l -> b l n v", dlc[i], n=1, v=V),
+                )
+                dlc.append(torch.argmax(level, dim=-1).squeeze())
+            dlc = torch.cat(dlc, dim=1)
         dlc += len(self.decoder.tokenizer)  # Shift SEM tokens to new token indices
 
         # Prepend BOS + DLC to decoder input ids
@@ -253,10 +273,10 @@ class DLCLMTask(L.LightningModule):
             # Log reconstruction samples
             table_clean = wandb.Table(columns=["Original", "Reconstructed"])
             for original, reconstructed in zip(
-                batch["input_str"][:10],
+                batch["input_str"][:5],
                 self.decoder.tokenizer.batch_decode(
                     self.decoder.generate(
-                        prompt=input_ids_dec[:10, : (dlc.shape[1] + 1)],
+                        prompt=input_ids_dec[:5, : (dlc.shape[1] + 1)],
                         max_length=self.dataset.cfg.max_length,
                     ),
                     skip_special_tokens=True,
@@ -264,6 +284,7 @@ class DLCLMTask(L.LightningModule):
             ):
                 table_clean.add_data(original, reconstructed)
             wandb.log({"val/clean_samples": table_clean})
+            del table_clean
 
             # Log MAUVE score every 5 validation steps
             if self.val_epoch_counter % 5 == 0:
@@ -276,6 +297,10 @@ class DLCLMTask(L.LightningModule):
 
         # Generate unconditionally
         with torch.inference_mode():
+            if self.encoder.cfg.sem_cfg != None:
+                dlc_len = self.encoder.cfg.sem_cfg.L
+            else: 
+                dlc_len = self.encoder.cfg.hsem_cfg.L * self.encoder.cfg.hsem_cfg.D
             gen_text = []
             for _ in tqdm(
                 range(len(ref_feats) // 128), desc=f"Generating paragraphs..."
@@ -286,7 +311,7 @@ class DLCLMTask(L.LightningModule):
                             max_length=150,
                             batch_size=128,
                             generate_prompt=True,
-                            dlc_len=self.encoder.cfg.sem_cfg.L,
+                            dlc_len=dlc_len,
                         ),
                         skip_special_tokens=True,
                     )
@@ -298,15 +323,16 @@ class DLCLMTask(L.LightningModule):
         )
 
         # Comput MAUVE
-        mauve = compute_mauve(
-            p_features=gen_feats,
-            q_features=ref_feats,
-            max_text_length=150,
-            batch_size=64,
-            device_id=0,
-            featurize_model_name="gpt2-large",
-            seed=seed,
-        )
+        with torch.autocast(device_type="cuda", enabled=False):
+            mauve = compute_mauve(
+                p_features=gen_feats,
+                q_features=ref_feats,
+                max_text_length=150,
+                batch_size=64,
+                device_id=0,
+                featurize_model_name="gpt2-large",
+                seed=seed,
+            )
 
         torch.cuda.empty_cache()
 

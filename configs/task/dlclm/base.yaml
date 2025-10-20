@@ -1,6 +1,6 @@
 lr: 1e-5
 batch_size: 32
-pretrained_ae_id: 13dfit14
+pretrained_ae_id: 4dp80ubw #sem : dl2fh5wd
 
 data_seed: 42
 
