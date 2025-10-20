@@ -22,4 +22,4 @@ limit_val_batches: 4
 strategy: auto
 compile: false
 gradient_clip_val: 1.0
-num_devices: 1
+num_devices: null
