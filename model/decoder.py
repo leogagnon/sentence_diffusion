@@ -49,7 +49,7 @@ class DecoderModel(nn.Module):
 
         # Init causal LM backbone
         self.backbone = AutoModelForCausalLM.from_pretrained(cfg.name)
-        self.backbone.set_attn_implementation("flash_attention_2")
+        #self.backbone.set_attn_implementation("flash_attention_2")
 
         # Disable dropout in the backbone
         if self.cfg.disable_dropout:

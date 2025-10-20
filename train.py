@@ -43,6 +43,7 @@ class TrainConfig:
     precision: str = "bf16-mixed"
     limit_val_batches: Optional[int] = None
     compile: bool = False
+    num_devices: Optional[int] = None
 
 
 cs = ConfigStore.instance()
@@ -146,7 +147,7 @@ def main(cfg: Optional[TrainConfig] = None, run_id: Optional[str] = None):
         )
 
     # Compute how many batches to accumulate to reach the effective batch size
-    num_devices = torch.cuda.device_count()
+    num_devices = cfg.num_devices if cfg.num_devices != None else torch.cuda.device_count()
     if cfg.effective_batch_size is None:
         accumulate_grad_batches = 1
     else:
@@ -180,7 +181,7 @@ def main(cfg: Optional[TrainConfig] = None, run_id: Optional[str] = None):
         accumulate_grad_batches=accumulate_grad_batches,
         precision=cfg.precision,
         limit_val_batches=cfg.limit_val_batches if cfg.limit_val_batches else 1.0,
-        devices= num_devices,
+        devices=num_devices,
         strategy=cfg.strategy,
         num_nodes=1,
     )
