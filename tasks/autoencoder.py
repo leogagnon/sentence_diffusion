@@ -53,7 +53,7 @@ class AETaskConfig:
 
     name: Optional[str] = None
     encoder_prompt: Optional[str] = None
-
+    compile: bool = True
 
 class AETask(L.LightningModule):
     """
@@ -94,6 +94,9 @@ class AETask(L.LightningModule):
         self.val_indices = indices[-cfg.val_size :]
 
         self.cfg = cfg
+
+        if self.cfg.compile:    
+            self.compile()
 
         self.save_hyperparameters(
             OmegaConf.to_container(OmegaConf.structured(cfg)), logger=False

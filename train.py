@@ -132,13 +132,11 @@ def main(cfg: Optional[TrainConfig] = None, run_id: Optional[str] = None):
             OmegaConf.structured(AETaskConfig), run.config["task"]["ae"]
         )
     elif cfg.task.ae != None:
+        cfg.task.ae.compile = cfg.compile
         task = AETask(cfg.task.ae)
         cfg.task.ae = task.cfg
     else:
         raise ValueError("No task specified in config!")
-    
-    if cfg.compile:
-        task.compile()
 
     # Give the whole TrainConfig to wandb
     if cfg.logger and (rank_zero_only.rank == 0):

@@ -4,7 +4,6 @@
     // For more information, visit: https://go.microsoft.com/fwlink/?linkid=830387
     "version": "0.2.0",
     "configurations": [
-
         {
             "name": "Debug",
             "type": "debugpy",
@@ -12,7 +11,11 @@
             "program": "train.py",
             "console": "integratedTerminal",
             "justMyCode": false,
-            "args": ["task/ae=sem/sonar"],
+            "args": [
+                "task/ae=sem/sonar",
+                "num_devices=1",
+                "val_check_interval=1"
+            ],
         }
     ]
 }
