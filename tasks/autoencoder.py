@@ -27,6 +27,7 @@ from lightning.pytorch.utilities.rank_zero import rank_zero_info, rank_zero_only
 from tqdm import tqdm
 from mauve import compute_mauve, get_features_from_input
 from model.encoder import STEncoder, STEncoderConfig
+from transformers import get_cosine_schedule_with_warmup
 
 def reparameterize(mean, logvar):
     std = torch.exp(0.5 * logvar)
@@ -43,6 +44,7 @@ class AETaskConfig:
     dataset: dict
     val_size: int
     encoder: Optional[STEncoderConfig] = None
+    lr_schedule: bool = False
 
     data_seed: int = 42
 
@@ -152,8 +154,29 @@ class AETask(L.LightningModule):
         )
 
     def configure_optimizers(self):
-        optimizer = torch.optim.AdamW(self.parameters(), lr=self.cfg.lr)
-        return optimizer
+        no_decay = ["bias", "norm"]
+        optimizer_grouped_parameters = [
+            {
+                "params": [p for n, p in self.named_parameters() if not any(nd in n.lower() for nd in no_decay)],
+                "weight_decay": 0.01,
+            },
+            {
+                "params": [p for n, p in self.named_parameters() if any(nd in n.lower() for nd in no_decay)],
+                "weight_decay": 0.0,
+            },
+        ]
+        optimizer = torch.optim.AdamW(optimizer_grouped_parameters, lr=self.cfg.lr)
+        if self.cfg.lr_schedule:
+            scheduler = get_cosine_schedule_with_warmup(
+                optimizer,
+                num_warmup_steps=2000,
+                num_training_steps=20000,
+            )
+            scheduler = {"scheduler": scheduler, "interval": "step", "frequency": 1}
+
+            return [optimizer], [scheduler]
+        else: 
+            return optimizer
 
     def training_step(self, batch, batch_idx):
 
