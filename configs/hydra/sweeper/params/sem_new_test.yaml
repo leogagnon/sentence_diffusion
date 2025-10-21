@@ -1,19 +1,19 @@
-task/ae: sem/sonar_h1, sem/sonar_h2, sem/sonar_h3
+task/ae: sem/sonar
 model_checkpoint: base
 effective_batch_size: 1024
 task.ae.batch_size: 32 
 task.ae.lr: 1e-4
+task.ae.lr_warmup: true
 precision: bf16-mixed
 
-task.ae.encoder.train: true
-task.ae.decoder.train: true
-task.ae.encoder.hsem_cfg.temp: 0.5
+task.ae.encoder.sem.temp: 0.5
+task.ae.encoder.sem.V: 2048
+task.ae.encoder.sem.L: 32
 
 compile: true
-max_epochs: 2
 
 limit_val_batches: 8
 val_check_interval: 256
 
-sweep_id: h_sem_vae
+sweep_id: sem_new_test
 

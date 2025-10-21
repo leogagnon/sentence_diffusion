@@ -18,7 +18,7 @@ from typing import Optional, Union
 from einops import rearrange
 from torch.nn import ModuleDict
 from tokenizers.processors import TemplateProcessing
-from model.gaussian_diffusion import time_to_alpha
+from lightning.pytorch.utilities.rank_zero import rank_zero_info
 
 
 @dataclass
@@ -26,8 +26,6 @@ class PromptGeneratorConfig:
     n_layers: int
     n_heads: int
     k: int
-    noise_conditioning: bool = False
-    default_alpha: float = 0.95  # delta^2=0.05 like in DGLM
 
 
 @dataclass
@@ -37,7 +35,6 @@ class DecoderConfig:
     prompt_generator_cfg: Optional[PromptGeneratorConfig] = None
     lora_cfg: Optional[dict] = None
     disable_dropout: bool = True
-    train: bool = True
 
 
 class DecoderModel(nn.Module):
@@ -49,7 +46,12 @@ class DecoderModel(nn.Module):
 
         # Init causal LM backbone
         self.backbone = AutoModelForCausalLM.from_pretrained(cfg.name)
-        #self.backbone.set_attn_implementation("flash_attention_2")
+        try:
+            self.backbone.set_attn_implementation("flash_attention_2")
+        except:
+            rank_zero_info(
+                "Tried to use flash attention in encoder, but it is not available."
+            )
 
         # Disable dropout in the backbone
         if self.cfg.disable_dropout:
@@ -57,21 +59,13 @@ class DecoderModel(nn.Module):
                 if isinstance(module, torch.nn.Dropout):
                     module.p = 0.0
 
-        if self.cfg.train:
-            self.backbone.train()
-            if self.cfg.lora_cfg != None:
-                self.backbone = get_peft_model(
-                    self.backbone,
-                    LoraConfig(**self.cfg.lora_cfg),
-                )
-            else:
-                self.backbone.requires_grad_(True)
-        else:
-            assert self.cfg.lora_cfg == None
-            self.backbone.requires_grad_(False)
-            self.backbone.eval()
+        if self.cfg.lora_cfg != None:
+            self.backbone = get_peft_model(
+                self.backbone,
+                LoraConfig(**self.cfg.lora_cfg),
+            )
 
-        # Init tokenizer, make it put BOS and EOS tokens around inputs, and add PAD token if missing
+        # Init tokenizer, make it put BOS and EOS tokens around inputs, and add PAD and THINK tokens.
         self.tokenizer = AutoTokenizer.from_pretrained(cfg.name)
         self.tokenizer._tokenizer.post_processor = TemplateProcessing(
             single=self.tokenizer.bos_token + " $A " + self.tokenizer.eos_token,
@@ -85,6 +79,10 @@ class DecoderModel(nn.Module):
             self.backbone.resize_token_embeddings(
                 len(self.tokenizer), mean_resizing=True
             )
+        self.tokenizer.add_special_tokens({"additional_special_tokens": ["<|think|>"]})
+        self.tokenizer.think_token_id = self.tokenizer.convert_tokens_to_ids(
+            "<|think|>"
+        )
 
         # Init prompt generator (project up, chunk, project up again, process with transformer)
         if cfg.prompt_generator_cfg != None:
@@ -101,56 +99,16 @@ class DecoderModel(nn.Module):
                     ),
                 }
             )
-            if cfg.prompt_generator_cfg.noise_conditioning:
-                self.prompt_generator["encoder"] = AttentionLayers(
-                    dim=self.backbone.config.hidden_size,
-                    depth=cfg.prompt_generator_cfg.n_layers,
-                    heads=cfg.prompt_generator_cfg.n_heads,
-                    causal=False,
-                    use_adaptive_rmsnorm=True,
-                    use_adaptive_layerscale=True,
-                    ff_swish=True,
-                    ff_glu=True,
-                    dim_condition=self.backbone.config.hidden_size,
-                    adaptive_condition_mlp=True,
-                    adaptive_condition_mlp_expansion=4,
-                    attn_qk_norm=True,
-                    attn_qk_norm_dim_scale=True,
-                )
-                self.prompt_generator["noise_embd"] = ScaledSinusoidalEmbedding(
-                    self.backbone.config.hidden_size
-                )
-            else:
-                self.prompt_generator["encoder"] = Encoder(
-                    dim=self.backbone.config.hidden_size,
-                    depth=cfg.prompt_generator_cfg.n_layers,
-                    heads=cfg.prompt_generator_cfg.n_heads,
-                )
-            self.prompt_generator.requires_grad_(True)  # just making sure
-        elif cfg.input_dim != None:
-            self.in_proj = nn.Linear(
-                cfg.input_dim, self.backbone.config.hidden_size, bias=False
+            self.prompt_generator["encoder"] = Encoder(
+                dim=self.backbone.config.hidden_size,
+                depth=cfg.prompt_generator_cfg.n_layers,
+                heads=cfg.prompt_generator_cfg.n_heads,
             )
         else:
             # This means there is no z; the model is just a standard unconditional decoder
             pass
 
-    def compile(self):
-        # Only compile GPT2 backbone
-        self.backbone = torch.compile(self.backbone)
-
-    def train(self, mode: bool = True):
-        super().train(mode)
-        if self.cfg.train == False:
-            # Keep the backbone in eval mode if not finetuning
-            self.backbone.eval()
-        return self
-
-    def z_to_prompt(self, z: torch.Tensor, alpha: Optional[torch.Tensor] = None):
-        if self.cfg.prompt_generator_cfg == None:
-            # In this case z is already the prompt
-            return self.in_proj(z)
-
+    def z_to_soft_prompt(self, z):
         # Project z to prompt space (B, D) -> (B, k * d) -> (B, k, d) -> (B, k, embd_dim)
         prompt = self.prompt_generator["z_to_chunk"](z)
         prompt = rearrange(
@@ -159,45 +117,31 @@ class DecoderModel(nn.Module):
             k=self.cfg.prompt_generator_cfg.k,
         )
         prompt = self.prompt_generator["chunk_to_embd"](prompt)
-
-        # Process prompt with transformer (potentially conditioned on noise level)
-        if self.cfg.prompt_generator_cfg.noise_conditioning:
-            if alpha is None:
-                # If no alpha is given, use default value (e.g. at inference)
-                alpha = torch.full(
-                    (z.shape[0], 1, 1),
-                    self.cfg.prompt_generator_cfg.default_alpha,
-                    device=z.device,
-                )
-            else:
-                assert alpha.ndim == 3
-            noise_embd = self.prompt_generator["noise_embd"](alpha * 1000)
-            noise_embd = rearrange(noise_embd, "b d -> b 1 d")
-            prompt = self.prompt_generator["encoder"](prompt, condition=noise_embd)
-        else:
-            prompt = self.prompt_generator["encoder"](prompt)
-
+        prompt = self.prompt_generator["encoder"](prompt)
         return prompt
+
+    def compile(self):
+        # Only compile GPT2 backbone
+        self.backbone.compile()
 
     def forward(
         self,
         input_ids,
         z: Optional[torch.Tensor] = None,
-        alpha: Optional[torch.Tensor] = None,
     ):
         if z == None:
+            assert hasattr(self, "prompt_generator") == False
             return self.backbone(input_ids=input_ids).logits
         else:
             # Compute input embeddings
-            prompt = self.z_to_prompt(z, alpha=alpha)
+            prompt = self.z_to_soft_prompt(z)
             input_embeds = self.backbone.get_input_embeddings()(input_ids)
             input_embeds = torch.cat([prompt, input_embeds], dim=1)
 
             # Forward pass
-            output = self.backbone(inputs_embeds=input_embeds)
-            logits = output.logits[:, prompt.shape[1] :]
-
-        return logits
+            return self.backbone(inputs_embeds=input_embeds).logits[
+                :, prompt.shape[1] :
+            ]
 
     @torch.inference_mode()
     def generate(
@@ -205,59 +149,55 @@ class DecoderModel(nn.Module):
         max_length: int,
         z: Optional[torch.Tensor] = None,
         prompt: Optional[torch.Tensor] = None,
-        alpha: Optional[torch.Tensor] = None,
         batch_size: Optional[int] = None,
-        generate_prompt: bool = False,
-        dlc_len: Optional[int] = None
+        is_dlc: bool = False,
+        dlc_len: Optional[int] = None,
     ):
         """Generate text using autoregressive decoding, potentially conditioned on soft prefix z"""
-        # If generating the prompt autoregressively (DLC-LM style)
-        if generate_prompt:
-            assert (z is None) and (prompt is None)
-            bos = torch.full(
-                size=(batch_size, 1),
-                fill_value=self.tokenizer.bos_token_id,
-                dtype=torch.long,
-            ).cuda()
-            batch_size = None
-            output = self.backbone.generate(
-                input_ids=bos,
-                max_length=dlc_len + 2,  # 32-token DLC + BOS + EOS
-                do_sample=True,
-                top_p=0.92,
-                top_k=50,
-                num_beams=1,
-                temperature=0.9,
-                return_dict_in_generate=False,
-                use_cache=True,
-                pad_token_id=self.tokenizer.pad_token_id,
-                eos_token_id=self.tokenizer.eos_token_id,
-            )
-            prompt = output[
-                :, :-1
-            ]  # Remove EOS token (which will be BOS for main generation)
-
-        # If there is conditionning
-        if (z != None) or (prompt != None):
-            # Compute the (soft-)prompt cache
-            if z != None:
-                assert prompt is None, "Cannot provide both z and prompt"
-                # In this case it is a soft prompt
-                prompt = self.z_to_prompt(z, alpha=alpha)
-                cache = self.backbone(
-                    inputs_embeds=prompt,
+        # Maybe compute prompt and cache it
+        if is_dlc:
+            assert z is None
+            if prompt is None:
+                bot = torch.full(
+                    size=(batch_size, 1),
+                    fill_value=self.tokenizer.think_token_id,
+                    dtype=torch.long,
+                ).cuda()
+                batch_size = None
+                prompt = self.backbone.generate(
+                    input_ids=bot,
+                    max_new_tokens=dlc_len + 1,  # 32-token DLC + closing <|think|>
+                    do_sample=True,
+                    top_p=0.92,
+                    top_k=50,
+                    num_beams=1,
+                    temperature=0.9,
+                    return_dict_in_generate=False,
                     use_cache=True,
-                ).past_key_values
-            else:
+                    pad_token_id=self.tokenizer.pad_token_id,
+                    eos_token_id=self.tokenizer.think_token_id,
+                )
+                prompt = prompt[
+                    :, :-1
+                ]  # Remove closing <|think|>, will be re-added as BOS for next phase
                 cache = self.backbone(
                     input_ids=prompt,
                     use_cache=True,
                 ).past_key_values
-
-            # Setup arguments for generation
-            assert batch_size is None, "Cannot provide batch_size if prompt is given"
-            batch_size = prompt.shape[0]
+                device = prompt.device
+                cache_position = torch.tensor([prompt.shape[1]], device=prompt.device)
+                attention_mask = torch.ones(
+                    (prompt.shape[0], prompt.shape[1] + 1), device=device
+                )
+        elif z != None:
+            assert prompt is None, "Cannot provide both z and prompt"
+            prompt = self.z_to_soft_prompt(z)
+            cache = self.backbone(
+                inputs_embeds=prompt,
+                use_cache=True,
+            ).past_key_values
             device = prompt.device
+            batch_size = z.shape[0]
             cache_position = torch.tensor([prompt.shape[1]], device=prompt.device)
             attention_mask = torch.ones(
                 (prompt.shape[0], prompt.shape[1] + 1), device=device
@@ -271,10 +211,14 @@ class DecoderModel(nn.Module):
                 batch_size is not None
             ), "Must provide batch_size if no conditionning is given"
 
-        # Autoregressive generation from BOS token with cached z (nucleus sampling)
+        # Autoregressive generation from token (maybe with cached prompt)
+        # Start with the new <|think|> token if conditionning on a DLC
+        bos_token_id = (
+            self.tokenizer.think_token_id if is_dlc else self.tokenizer.bos_token_id
+        )
         bos = torch.full(
             (batch_size, 1),
-            self.tokenizer.bos_token_id,
+            bos_token_id,
             device=device,
             dtype=torch.long,
         )
@@ -294,7 +238,5 @@ class DecoderModel(nn.Module):
             pad_token_id=self.tokenizer.pad_token_id,
             eos_token_id=self.tokenizer.eos_token_id,
         )
-
-        output = output[:, 1:]  # Remove BOS token
 
         return output

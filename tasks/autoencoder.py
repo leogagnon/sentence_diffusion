@@ -14,7 +14,6 @@ from torch.utils.data.dataset import Subset
 from transformers import AutoTokenizer
 from transformers.models.auto.modeling_auto import AutoModelForCausalLM
 from peft import get_peft_model
-from model.gaussian_diffusion import DiTConfig, DiT, right_pad_dims_to
 from data.stories import StoriesDatasetConfig, StoriesDataset
 from hydra.utils import instantiate
 from model.encoder import EncoderConfig, EncoderModel
@@ -22,17 +21,64 @@ from model.decoder import DecoderConfig, DecoderModel
 import os
 import wandb
 import hydra
-from model.gaussian_diffusion import time_to_alpha, cosine_schedule
 from lightning.pytorch.utilities.rank_zero import rank_zero_info, rank_zero_only
 from tqdm import tqdm
 from mauve import compute_mauve, get_features_from_input
-from model.encoder import STEncoder, STEncoderConfig
-from transformers import get_cosine_schedule_with_warmup
+from transformers import get_constant_schedule_with_warmup
+from data.wiki import DATA_SEED
 
-def reparameterize(mean, logvar):
-    std = torch.exp(0.5 * logvar)
-    eps = torch.randn_like(std)
-    return eps.mul(std).add_(mean)
+import os
+import torch
+from torch.utils.data import Sampler
+from typing import Iterator, Optional
+
+
+class InfiniteDistributedUniformSampler(Sampler[int]):
+    """
+    Infinite, per-rank independent uniform sampling *with replacement*.
+
+    - No epoch notion (no set_epoch).
+    - Works in single-process and DDP.
+    - Yields indices forever → use max_steps / manual break in training loop.
+    - Deterministic if `seed` is set; otherwise non-deterministic.
+
+    Args:
+        dataset: map-style dataset (needs __len__).
+        seed: optional base seed; if None, a random 64-bit seed is used.
+        chunk_size: draw this many indices per RNG call (perf tweak).
+    """
+
+    def __init__(self, n: int, seed: Optional[int] = None, chunk_size: int = 4096):
+
+        self.n = n
+
+        # Rank/world
+        if torch.distributed.is_available() and torch.distributed.is_initialized():
+            self.rank = torch.distributed.get_rank()
+        else:
+            self.rank = 0
+
+        # Base seed (None → random)
+        if seed is None:
+            seed = int.from_bytes(os.urandom(8), "little", signed=False)
+
+        # Mix in rank to get independent streams per process
+        mixed = (int(seed) ^ (0x9E3779B97F4A7C15 * (self.rank + 1))) & ((1 << 63) - 1)
+
+        self._g = torch.Generator()
+        self._g.manual_seed(mixed)
+        self._chunk = int(chunk_size)
+
+    def __len__(self) -> int:
+        # Sentinel for frameworks that read len(); loader never actually exhausts.
+        return 2**31 - 1
+
+    def __iter__(self) -> Iterator[int]:
+        while True:
+            # Vectorized draw, then yield scalars
+            idx = torch.randint(0, self.n, (self._chunk,), generator=self._g)
+            for i in idx:
+                yield int(i)
 
 
 @dataclass
@@ -40,22 +86,14 @@ class AETaskConfig:
     lr: float
     batch_size: int
     decoder: DecoderConfig
-    max_generation_length: int
     dataset: dict
     val_size: int
-    encoder: Optional[STEncoderConfig] = None
-    lr_schedule: bool = False
-
-    data_seed: int = 42
-
-    z_noise_type: str = "none"  # fixed, schedule, none
-    z_noise_alpha: float = 0.999
-    z_dropout_p: float = 0.0
-    kl_beta: float = 1e-5
+    encoder: Optional[EncoderConfig] = None
+    lr_warmup: bool = False
+    sub_p: float = 0.3
 
     name: Optional[str] = None
-    encoder_prompt: Optional[str] = None
-    compile: bool = True
+
 
 class AETask(L.LightningModule):
     """
@@ -75,50 +113,47 @@ class AETask(L.LightningModule):
 
         # Load encoder and decoder
         if cfg.encoder != None:
-            self.encoder = STEncoder(cfg.encoder)
+            self.encoder = EncoderModel(cfg.encoder).requires_grad_(True)
             cfg.decoder.input_dim = self.encoder.latent_dim
 
-        if cfg.z_noise_type == "variational":
-            assert (
-                self.encoder.cfg.variational == True
-            ), "Encoder must be variational if z_noise_type is variational"
-
-        self.decoder = DecoderModel(cfg.decoder)
+        self.decoder = DecoderModel(cfg.decoder).requires_grad_(True)
 
         # Setup dataset
         self.dataset = hydra.utils.instantiate(cfg.dataset)
 
+        # This is with a fixed seed to make sure validation set never changes
         indices = torch.randperm(
             len(self.dataset),
-            generator=torch.Generator().manual_seed(42), # make sure this never changes
+            generator=torch.Generator().manual_seed(DATA_SEED),
         )
         self.train_indices = indices[: -cfg.val_size]
         self.val_indices = indices[-cfg.val_size :]
 
         self.cfg = cfg
 
-        if self.cfg.compile:    
-            self.compile()
-
         self.save_hyperparameters(
             OmegaConf.to_container(OmegaConf.structured(cfg)), logger=False
         )
-    
+
+    def random_substitution(self, input_ids):
+        input_ids = input_ids.clone()
+        probability = torch.full_like(
+            input_ids, fill_value=self.cfg.sub_p, dtype=torch.float32
+        )
+        masked_indices = torch.bernoulli(probability).bool()
+        vocab_size = len(self.encoder.tokenizer) - len(
+            self.encoder.tokenizer.all_special_ids
+        )
+        random_words = torch.randint_like(input_ids, low=0, high=vocab_size)
+
+        input_ids[masked_indices] = random_words[masked_indices]
+
+        return input_ids
+
     def compile(self):
         if self.cfg.encoder != None:
             self.encoder.compile()
         self.decoder.compile()
-
-    def sample_alpha(self, z):
-        if self.cfg.z_noise_type == "fixed":
-            return torch.full(
-                size=(z.size(0),), fill_value=self.cfg.z_noise_alpha, device=z.device
-            )
-        elif self.cfg.z_noise_type == "schedule":
-            t = torch.zeros((z.size(0),), device=z.device).float().uniform_(0, 1.0)
-            return time_to_alpha(t=t, alpha_schedule=cosine_schedule, scale=3.0)
-        else:
-            raise ValueError(f"Unknown z_noise_type {self.cfg.z_noise_type}")
 
     def setup(self, **kwargs):
         """Setup the data"""
@@ -129,27 +164,25 @@ class AETask(L.LightningModule):
         return DataLoader(
             self.train_data,
             batch_size=self.cfg.batch_size,
-            shuffle=True,
+            sampler=InfiniteDistributedUniformSampler(n=len(self.train_data)),
             collate_fn=self.dataset.get_collate_and_tokenize_fn(
                 enc_tokenizer=(
                     self.encoder.tokenizer if self.cfg.encoder != None else None
                 ),
                 dec_tokenizer=self.decoder.tokenizer,
-                prompt=self.cfg.encoder_prompt,
-            )
+            ),
         )
 
     def val_dataloader(self):
         return DataLoader(
             self.val_data,
             batch_size=self.cfg.batch_size,
-            shuffle=False,
+            sampler=torch.utils.data.DistributedSampler(self.val_data, shuffle=False),
             collate_fn=self.dataset.get_collate_and_tokenize_fn(
                 enc_tokenizer=(
                     self.encoder.tokenizer if self.cfg.encoder != None else None
                 ),
                 dec_tokenizer=self.decoder.tokenizer,
-                prompt=self.cfg.encoder_prompt,
             ),
         )
 
@@ -157,59 +190,42 @@ class AETask(L.LightningModule):
         no_decay = ["bias", "norm"]
         optimizer_grouped_parameters = [
             {
-                "params": [p for n, p in self.named_parameters() if not any(nd in n.lower() for nd in no_decay)],
+                "params": [
+                    p
+                    for n, p in self.named_parameters()
+                    if not any(nd in n.lower() for nd in no_decay)
+                ],
                 "weight_decay": 0.01,
             },
             {
-                "params": [p for n, p in self.named_parameters() if any(nd in n.lower() for nd in no_decay)],
+                "params": [
+                    p
+                    for n, p in self.named_parameters()
+                    if any(nd in n.lower() for nd in no_decay)
+                ],
                 "weight_decay": 0.0,
             },
         ]
         optimizer = torch.optim.AdamW(optimizer_grouped_parameters, lr=self.cfg.lr)
-        if self.cfg.lr_schedule:
-            scheduler = get_cosine_schedule_with_warmup(
-                optimizer,
-                num_warmup_steps=2000,
-                num_training_steps=20000,
+        if self.cfg.lr_warmup:
+            scheduler = get_constant_schedule_with_warmup(
+                optimizer, num_warmup_steps=2000
             )
             scheduler = {"scheduler": scheduler, "interval": "step", "frequency": 1}
 
             return [optimizer], [scheduler]
-        else: 
+        else:
             return optimizer
 
     def training_step(self, batch, batch_idx):
-
-        # If there is an encoder, compute z and potentially add noise
+        # If there is an encoder, compute z
         z = None
-        alpha = None
         if self.cfg.encoder != None:
-            z = self.encoder(batch["input_ids_enc"], batch["attention_mask_enc"])
+            input_ids_enc_noised = self.random_substitution(batch["input_ids_enc"])
+            z = self.encoder(input_ids_enc_noised, batch["attention_mask_enc"])
 
-            if self.cfg.z_noise_type == "variational":
-                # Variational AE style reparameterization
-                mean, logvar = z
-                z = reparameterize(mean, logvar)
-            elif self.cfg.z_noise_type != "none":
-                # Add scale-invariant noise to z
-                # Keeps norm of z roughly the same and SNR controlled by alpha
-                alpha = self.sample_alpha(z)
-                alpha = right_pad_dims_to(z, alpha)
-
-                z_flat = z.view(z.shape[0], -1)
-                norm = z_flat.norm(dim=1, keepdim=True).detach()
-                w = (norm / (z_flat.shape[1] ** 0.5)).clamp_min(1e-6)
-                w = right_pad_dims_to(z, w)
-
-                z = alpha.sqrt() * z + (1 - alpha).sqrt() * w * torch.randn_like(z)
-
-            # Apply z dropout
-            if self.cfg.z_dropout_p > 0.0:
-                mask = torch.rand_like(z) < self.cfg.z_dropout_p
-                z = z.masked_fill(mask, 0.0)
-
-        # Compute decoder likelihood of input_ids
-        logits = self.decoder(input_ids=batch["input_ids_dec"], z=z, alpha=alpha)
+        # Compute decoder likelihood of input_ids (no need for attention mask cuz causal)
+        logits = self.decoder(input_ids=batch["input_ids_dec"], z=z)
 
         # Compute loss
         targets = batch["input_ids_dec"].masked_fill(
@@ -217,33 +233,21 @@ class AETask(L.LightningModule):
         )
         logits = logits[:, :-1].contiguous()
         targets = targets[:, 1:].contiguous()
-        recon_loss = torch.nn.functional.cross_entropy(
+        loss = torch.nn.functional.cross_entropy(
             logits.view(-1, logits.size(-1)),
             targets.view(-1),
             ignore_index=-100,
         )
 
         self.log(
-            "train/reconstruction_loss",
-            recon_loss,
+            "train/loss",
+            loss,
             on_epoch=False,
             on_step=True,
             sync_dist=True,
         )
 
-        # If variational, add KL loss
-        if self.cfg.z_noise_type == "variational":
-            kl_loss = -0.5 * torch.sum(1 + logvar - mean.pow(2) - logvar.exp())
-            recon_loss += self.cfg.kl_beta * kl_loss
-            self.log(
-                "train/KL_loss",
-                kl_loss,
-                on_epoch=False,
-                on_step=True,
-                sync_dist=True,
-            )
-
-        return recon_loss
+        return loss
 
     @torch.no_grad()
     def validation_step(self, batch, batch_idx):
@@ -276,31 +280,13 @@ class AETask(L.LightningModule):
 
         # Maybe log some generations
         if (batch_idx == 0) and (rank_zero_only.rank == 0) and (z != None):
-            # Log generations from interpolated samples
-            group_indices = torch.randperm(z.shape[0]).chunk(2)
-            z_groups = [z[indices] for indices in group_indices]
-            z_interp = 0.5 * z_groups[0] + 0.5 * z_groups[1]
-            gen_interp_ids = self.decoder.generate(
-                z=z_interp, max_length=self.cfg.max_generation_length
-            )
-            table = wandb.Table(columns=["S1", "S2", "Interpolated"])
-            for s1, s2, s_interp in zip(
-                [batch["input_str"][i] for i in group_indices[0]][:10],
-                [batch["input_str"][i] for i in group_indices[1]][:10],
-                self.decoder.tokenizer.batch_decode(
-                    gen_interp_ids[:10], skip_special_tokens=True
-                ),
-            ):
-                table.add_data(s1, s2, s_interp)
-            wandb.log({"val/interp_samples": table})
-
             # Log generation from clean samples
             table_clean = wandb.Table(columns=["Original", "Reconstructed"])
             for original, reconstructed in zip(
-                batch["input_str"][:10],
+                batch["input_str"][:5],
                 self.decoder.tokenizer.batch_decode(
                     self.decoder.generate(
-                        z=z[:10], max_length=self.cfg.max_generation_length
+                        z=z[:5], max_length=self.dataset.cfg.max_length
                     ),
                     skip_special_tokens=True,
                 ),
@@ -309,23 +295,27 @@ class AETask(L.LightningModule):
             wandb.log({"val/clean_samples": table_clean})
 
     def eval_mauve(self, seed: int = 1337):
-        assert self.cfg.encoder == None, "Can only compute MAUVE for unconditional models"
+        assert (
+            self.cfg.encoder == None
+        ), "Can only compute MAUVE for unconditional models"
         # Load reference features
         ref_feats = torch.load("mauve_eval_feats.pt")
 
         # Generate unconditionally
         with torch.inference_mode():
             gen_text = []
-            for _ in tqdm(range(len(ref_feats) // 128), desc=f"Generating paragraphs..."):
+            for _ in tqdm(
+                range(len(ref_feats) // 128), desc=f"Generating paragraphs..."
+            ):
                 gen_text.extend(
                     self.decoder.tokenizer.batch_decode(
                         self.decoder.generate(
-                            max_length=150, batch_size=128
+                            max_length=self.dataset.cfg.max_length, batch_size=128
                         ),
                         skip_special_tokens=True,
                     )
                 )
-        
+
         # Featurize for MAUVE
         gen_feats = get_features_from_input(
             None, None, gen_text, "gpt2-large", 150, 0, "generated paragraphs", 64
@@ -339,7 +329,7 @@ class AETask(L.LightningModule):
             batch_size=64,
             device_id=0,
             featurize_model_name="gpt2-large",
-            seed=seed
+            seed=seed,
         )
 
         torch.cuda.empty_cache()

@@ -10,18 +10,17 @@ from hydra.core.config_store import ConfigStore
 from lightning.pytorch.loggers import WandbLogger
 from omegaconf import MISSING, DictConfig, OmegaConf, SCMode
 from tasks.autoencoder import AETask, AETaskConfig
-from tasks.diffusion import GaussianDiffusionTask, GaussianDiffusionTaskConfig
 from tasks.dlclm import DLCLMTask, DLCLMTaskConfig
 from lightning.pytorch.callbacks import EarlyStopping
 from lightning.pytorch.utilities.rank_zero import rank_zero_info, rank_zero_only
 
-torch.set_float32_matmul_precision("high")
+torch.set_float32_matmul_precision("medium")
 torch._dynamo.config.capture_scalar_outputs = True
+
 
 @dataclass
 class TaskConfig:
     ae: Optional[AETaskConfig] = None
-    diffusion: Optional[GaussianDiffusionTaskConfig] = None
     dlclm: Optional[DLCLMTaskConfig] = None
 
 
@@ -29,7 +28,7 @@ class TaskConfig:
 class TrainConfig:
     task: TaskConfig
     seed: int
-    max_epochs: int
+    max_steps: int
     val_check_interval: int
     logger: dict
     strategy: str = "auto"
@@ -60,7 +59,7 @@ def main(cfg: Optional[TrainConfig] = None, run_id: Optional[str] = None):
         wandb_id = run_id
         api = wandb.Api()
         entity = "guillaume-lajoie"
-        project = "sentence_diffusion"
+        project = "dlc_lm"
         run = api.run(f"{entity}/{project}/{run_id}")
         cfg = OmegaConf.merge(OmegaConf.structured(TrainConfig), run.config)
 
@@ -108,19 +107,7 @@ def main(cfg: Optional[TrainConfig] = None, run_id: Optional[str] = None):
         rank_zero_info("Using early stopping!")
         callbacks.append(hydra.utils.instantiate(cfg.early_stopping))
 
-    # Init lightning module
-    if cfg.task.diffusion != None:
-        task = GaussianDiffusionTask(cfg.task.diffusion)
-        cfg.task.diffusion = task.cfg
-
-        # Add the autoencoder config to cfg
-        run = wandb.Api().run(
-            f"guillaume-lajoie/sentence_diffusion/{cfg.task.diffusion.pretrained_ae_id}"
-        )
-        cfg.task.ae = OmegaConf.merge(
-            OmegaConf.structured(AETaskConfig), run.config["task"]["ae"]
-        )
-    elif cfg.task.dlclm != None:
+    if cfg.task.dlclm != None:
         task = DLCLMTask(cfg.task.dlclm)
         cfg.task.dlclm = task.cfg
 
@@ -132,11 +119,13 @@ def main(cfg: Optional[TrainConfig] = None, run_id: Optional[str] = None):
             OmegaConf.structured(AETaskConfig), run.config["task"]["ae"]
         )
     elif cfg.task.ae != None:
-        cfg.task.ae.compile = cfg.compile
         task = AETask(cfg.task.ae)
         cfg.task.ae = task.cfg
     else:
         raise ValueError("No task specified in config!")
+
+    if cfg.compile:
+        task.compile()
 
     # Give the whole TrainConfig to wandb
     if cfg.logger and (rank_zero_only.rank == 0):
@@ -145,7 +134,9 @@ def main(cfg: Optional[TrainConfig] = None, run_id: Optional[str] = None):
         )
 
     # Compute how many batches to accumulate to reach the effective batch size
-    num_devices = cfg.num_devices if cfg.num_devices != None else torch.cuda.device_count()
+    num_devices = (
+        cfg.num_devices if cfg.num_devices != None else torch.cuda.device_count()
+    )
     if cfg.effective_batch_size is None:
         accumulate_grad_batches = 1
     else:
@@ -174,7 +165,7 @@ def main(cfg: Optional[TrainConfig] = None, run_id: Optional[str] = None):
         * accumulate_grad_batches,  # to account for accumulation
         gradient_clip_val=cfg.gradient_clip_val,
         num_sanity_val_steps=0,
-        max_epochs=cfg.max_epochs,
+        max_steps=cfg.max_steps * accumulate_grad_batches,
         log_every_n_steps=50,
         accumulate_grad_batches=accumulate_grad_batches,
         precision=cfg.precision,
@@ -182,6 +173,7 @@ def main(cfg: Optional[TrainConfig] = None, run_id: Optional[str] = None):
         devices=num_devices,
         strategy=cfg.strategy,
         num_nodes=1,
+        use_distributed_sampler=False,
     )
     trainer.fit(
         model=task,

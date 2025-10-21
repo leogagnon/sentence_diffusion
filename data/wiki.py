@@ -1,9 +1,12 @@
 from dataclasses import dataclass
 from typing import Optional
-from datasets.load import load_from_disk
+from datasets.load import load_from_disk, load_dataset
 import torch
 from torch.nn.utils.rnn import pad_sequence
 from torch.utils.data.dataset import Dataset
+from lightning.pytorch.utilities.rank_zero import rank_zero_info, rank_zero_only
+
+DATA_SEED = 42
 
 
 @dataclass
@@ -15,27 +18,17 @@ class WikipediaDataset(Dataset):
     def __init__(self, cfg: Optional[WikipediaDatasetConfig] = None, **kwargs):
         if cfg == None:
             cfg = WikipediaDatasetConfig(**kwargs)
-
         self.dataset = load_from_disk("data/wikipedia-paragraphs-filtered")["train"]
         self.cfg = cfg
 
-    def get_collate_and_tokenize_fn(
-        self, dec_tokenizer=None, enc_tokenizer=None, prompt=None
-    ):
+    def get_collate_and_tokenize_fn(self, dec_tokenizer=None, enc_tokenizer=None):
         def collate_fn(texts):
 
             out = {"input_str": texts}
 
             if enc_tokenizer is not None:
-
-                # Maybe add prompt to encoder input
-                if prompt is not None:
-                    texts_enc = [(prompt + text) for text in texts]
-                else:
-                    texts_enc = texts
-
                 batch_enc = enc_tokenizer.batch_encode_plus(
-                    texts_enc,
+                    texts,
                     truncation=True,
                     padding="max_length",
                     max_length=self.cfg.max_length,
@@ -63,7 +56,7 @@ class WikipediaDataset(Dataset):
                         "attention_mask_dec": batch_dec["attention_mask"].bool(),
                     }
                 )
-
+            
             return out
 
         return collate_fn

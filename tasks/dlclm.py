@@ -14,7 +14,6 @@ from torch.utils.data.dataset import Subset
 from transformers import AutoTokenizer
 from transformers.models.auto.modeling_auto import AutoModelForCausalLM
 from peft import get_peft_model
-from model.gaussian_diffusion import DiTConfig, DiT, right_pad_dims_to
 from data.stories import StoriesDatasetConfig, StoriesDataset
 from hydra.utils import instantiate
 from model.encoder import EncoderConfig, EncoderModel
@@ -22,7 +21,6 @@ from model.decoder import DecoderConfig, DecoderModel
 import os
 import wandb
 import hydra
-from model.gaussian_diffusion import time_to_alpha, cosine_schedule
 from lightning.pytorch.utilities.rank_zero import rank_zero_info, rank_zero_only
 from tasks.autoencoder import AETask
 from data.wiki import WikipediaDataset
