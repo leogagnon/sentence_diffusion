@@ -1,19 +1,17 @@
 batch_size: 32
 lr: 1e-4
-max_generation_length: 150
+lr_warmup: true
 val_size: 16384
-z_noise_type: none
+sub_p: 0.3
 
 encoder:
   name: SONAR 
-  normalize: false
-  train: true
-  hsem_cfg:
+  sem:
+    _target_: model.encoder.HSEMHead
     L: 16
     V: 48
     D: 2
     temp: 0.5
-  dropout_p: 0.3
 
 decoder:
   name: gpt2-large # 1.5B params
@@ -21,7 +19,6 @@ decoder:
     n_layers: 6
     n_heads: 12
     k: 8
-  train: true
 
 name: sonar_sem
 

@@ -48,9 +48,16 @@ class InfiniteDistributedUniformSampler(Sampler[int]):
         chunk_size: draw this many indices per RNG call (perf tweak).
     """
 
-    def __init__(self, n: int, seed: Optional[int] = None, chunk_size: int = 4096):
+    def __init__(
+        self,
+        n: int,
+        batch_size: int,
+        seed: Optional[int] = None,
+        chunk_size: int = 4096,
+    ):
 
         self.n = n
+        self.batch_size = batch_size
 
         # Rank/world
         if torch.distributed.is_available() and torch.distributed.is_initialized():
@@ -76,9 +83,12 @@ class InfiniteDistributedUniformSampler(Sampler[int]):
     def __iter__(self) -> Iterator[int]:
         while True:
             # Vectorized draw, then yield scalars
-            idx = torch.randint(0, self.n, (self._chunk,), generator=self._g)
-            for i in idx:
-                yield int(i)
+            idx = torch.randint(
+                0, self.n, (self._chunk, self.batch_size), generator=self._g
+            )
+            # Yield as Python lists (fast path in DataLoader)
+            for row in idx:
+                yield row.tolist()
 
 
 @dataclass
@@ -136,7 +146,9 @@ class AETask(L.LightningModule):
         )
 
     def random_substitution(self, input_ids):
+        # It is important that this function is not in-place
         input_ids = input_ids.clone()
+
         probability = torch.full_like(
             input_ids, fill_value=self.cfg.sub_p, dtype=torch.float32
         )
@@ -163,8 +175,9 @@ class AETask(L.LightningModule):
     def train_dataloader(self):
         return DataLoader(
             self.train_data,
-            batch_size=self.cfg.batch_size,
-            sampler=InfiniteDistributedUniformSampler(n=len(self.train_data)),
+            batch_sampler=InfiniteDistributedUniformSampler(
+                n=len(self.train_data), batch_size=self.cfg.batch_size
+            ),
             collate_fn=self.dataset.get_collate_and_tokenize_fn(
                 enc_tokenizer=(
                     self.encoder.tokenizer if self.cfg.encoder != None else None
