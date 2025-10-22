@@ -50,17 +50,22 @@ class SEMHead(nn.Module):
         self.proj_out = nn.Linear(cfg.L * cfg.V, cfg.input_dim)
         self.cfg = cfg
 
-    def forward(self, x, return_sem=False):
+    def forward(self, x, return_logits=False):
         x = self.proj_in(x)
         x = self.norm(x)
         x = einx.rearrange("b (l v) -> b l v", x, l=self.cfg.L, v=self.cfg.V)
         x = torch.softmax(x / self.cfg.temp, dim=-1)
-        if return_sem:
+        if return_logits:
             return x
         x = einx.rearrange("b l v -> b (l v)", x)
         x = self.proj_out(x)
 
         return x
+
+    def encode(self, x):
+        logits = self.forward(x, return_logits=True)
+        dlc = logits.argmax(-1)
+        return dlc
 
 
 @dataclass
@@ -86,7 +91,7 @@ class HSEMHead(nn.Module):
         self.proj_out = nn.Linear(cfg.L * cfg.V * self.N, cfg.input_dim)
         self.cfg = cfg
 
-    def forward(self, x: torch.Tensor, return_sem=False):
+    def forward(self, x: torch.Tensor, return_logits=False):
         x = self.proj_in(x)
         x = self.norm(x)
         x = einx.rearrange(
@@ -111,12 +116,34 @@ class HSEMHead(nn.Module):
             x_final.append(level)
             parent_probs = einx.rearrange("b L n V -> b L (n V)", level)
             start = end
-        if return_sem:
+        if return_logits:
             return x_final
         x_final = torch.cat(x_final, dim=2)
         x_final = einx.rearrange("b L N V -> b (L N V)", x_final)
         x_final = self.proj_out(x_final)
         return x_final
+
+    def encode(self, x):
+        logits = self.forward(x, return_logits=True)
+
+        # Argmax on first level
+        dlc = [logits[0].squeeze(2).argmax(-1)]
+        for i in range(self.cfg.D - 1):
+            # Get the node at level i that was chosen at level i-1
+            node = torch.gather(
+                input=logits[i],
+                dim=2,
+                index=einx.rearrange("b l -> b l n v", dlc[i], n=1, v=self.cfg.V),
+            ).squeeze(2)
+            
+            # Argmax at level i (on the chosen node)
+            dlc.append(node.argmax(-1))
+
+        # Concatenate all levels
+        # First L indices are level 1, second L are level 2, ...
+        dlc = torch.cat(dlc, dim=1)
+
+        return dlc
 
 
 class SONARTransformer(nn.Module):
@@ -193,6 +220,7 @@ class EncoderModel(nn.Module):
         if cfg.sem != None:
             cfg.sem["input_dim"] = self.latent_dim
             self.sem = hydra.utils.instantiate(cfg.sem)
+            self.sem : SEMHead | HSEMHead
 
         if cfg.lora_cfg != None:
             self.transformer = get_peft_model(
@@ -215,7 +243,7 @@ class EncoderModel(nn.Module):
     def latent_len(self):
         return 1
 
-    def forward(self, input_ids, attention_mask, return_sem=False):
+    def forward(self, input_ids, attention_mask, return_dlc=False):
 
         # Make the batch dict expected by sentence_transformers models
         batch = {"input_ids": input_ids, "attention_mask": attention_mask}
@@ -227,8 +255,7 @@ class EncoderModel(nn.Module):
 
         # Run through SEM
         if self.cfg.sem != None:
-            if return_sem:
-                return self.sem(sentence_embedding, return_sem=True)
+            if return_dlc:
+                return self.sem.encode(sentence_embedding)
             else:
                 return self.sem(sentence_embedding)[:, None]
-            

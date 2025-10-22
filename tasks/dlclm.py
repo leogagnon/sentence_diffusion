@@ -22,20 +22,21 @@ import os
 import wandb
 import hydra
 from lightning.pytorch.utilities.rank_zero import rank_zero_info, rank_zero_only
-from tasks.autoencoder import AETask
+from tasks.autoencoder import AETask, InfiniteDistributedUniformSampler
 from data.wiki import WikipediaDataset
 from tqdm import tqdm
 from mauve import compute_mauve, get_features_from_input
 import einx
+from transformers import get_constant_schedule_with_warmup
 
 
 @dataclass
 class DLCLMTaskConfig:
     lr: float
+    lr_warmup: bool 
     batch_size: int
     pretrained_ae_id: str
-
-    data_seed: int = 42
+    conditional: bool
 
     name: Optional[str] = None
 
@@ -73,25 +74,22 @@ class DLCLMTask(L.LightningModule):
         self.dataset = ae_task.dataset
         self.dataset: WikipediaDataset
 
-        if ae_task.encoder.cfg.sem_cfg != None:
-            V = ae_task.encoder.cfg.sem_cfg.V
-        elif ae_task.encoder.cfg.hsem_cfg != None:
-            V = ae_task.encoder.cfg.hsem_cfg.V
-        else:
-            assert False, "DLCLM requires a SEM encoder"
+        assert ae_task.encoder.cfg.sem is not None
+
+        # Load encoder and freeze it
         self.encoder = ae_task.encoder.eval().requires_grad_(False)
 
-        # We finetune the decoder from the AE training, without the prompt generator, with new token embeddings
-        # We merge the initial LoRA adapter and create a new one for the DLC finetuning
+        # Load decoder, add DLC tokens, remove prompt generator
         self.decoder = ae_task.decoder
         if self.decoder.cfg.lora_cfg != None:
             self.decoder.backbone = self.decoder.backbone.merge_and_unload()
         self.decoder.backbone.resize_token_embeddings(
-            len(ae_task.decoder.tokenizer) + V
+            len(ae_task.decoder.tokenizer) + self.encoder.sem.cfg.V
         )
         self.decoder = self.decoder.train().requires_grad_(True)
         del self.decoder.prompt_generator
 
+        # To not eval MAUVE every validation step
         self.val_epoch_counter = 0
 
         self.cfg = cfg
@@ -111,66 +109,86 @@ class DLCLMTask(L.LightningModule):
         self.val_data = Subset(self.dataset, indices=self.val_indices)
 
     def configure_optimizers(self):
-        return torch.optim.AdamW(self.decoder.parameters(), lr=self.cfg.lr)
+        no_decay = ["bias", "norm"]
+        optimizer_grouped_parameters = [
+            {
+                "params": [
+                    p
+                    for n, p in self.decoder.named_parameters()
+                    if not any(nd in n.lower() for nd in no_decay)
+                ],
+                "weight_decay": 0.01,
+            },
+            {
+                "params": [
+                    p
+                    for n, p in self.decoder.named_parameters()
+                    if any(nd in n.lower() for nd in no_decay)
+                ],
+                "weight_decay": 0.0,
+            },
+        ]
+        optimizer = torch.optim.AdamW(optimizer_grouped_parameters, lr=self.cfg.lr)
+        if self.cfg.lr_warmup:
+            scheduler = get_constant_schedule_with_warmup(
+                optimizer, num_warmup_steps=2000
+            )
+            scheduler = {"scheduler": scheduler, "interval": "step", "frequency": 1}
+
+            return [optimizer], [scheduler]
+        else:
+            return optimizer
 
     def train_dataloader(self):
         return DataLoader(
             self.train_data,
-            batch_size=self.cfg.batch_size,
-            shuffle=True,
+            batch_sampler=InfiniteDistributedUniformSampler(
+                n=len(self.train_data), batch_size=self.cfg.batch_size
+            ),
             collate_fn=self.dataset.get_collate_and_tokenize_fn(
-                enc_tokenizer=self.encoder.tokenizer,
+                enc_tokenizer=(
+                    self.encoder.tokenizer if self.cfg.encoder != None else None
+                ),
                 dec_tokenizer=self.decoder.tokenizer,
             ),
-            drop_last=True,
         )
 
     def val_dataloader(self):
         return DataLoader(
             self.val_data,
             batch_size=self.cfg.batch_size,
-            shuffle=False,
+            sampler=torch.utils.data.DistributedSampler(self.val_data, shuffle=False),
             collate_fn=self.dataset.get_collate_and_tokenize_fn(
-                enc_tokenizer=self.encoder.tokenizer,
+                enc_tokenizer=(
+                    self.encoder.tokenizer if self.cfg.encoder != None else None
+                ),
                 dec_tokenizer=self.decoder.tokenizer,
             ),
         )
 
     def training_step(self, batch, batch_idx):
+        assert self.encoder.training == False
+        # Construct the input
         with torch.no_grad():
-            dlc_logits = self.encoder(
-                batch["input_ids_enc"], batch["attention_mask_enc"], return_sem=True
+            dlc = self.encoder(
+                batch["cont_ids_enc"], batch["cont_mask_enc"], return_dlc=True
             )
-            if self.encoder.cfg.sem_cfg != None:
-                dlc = dlc_logits.argmax(-1)
-            elif self.encoder.cfg.hsem_cfg != None:
-                V = dlc_logits[0].shape[-1]
-                dlc = [dlc_logits[0].argmax(-1).squeeze()]
-                for i in range(len(dlc_logits) - 1):
-                    level = torch.gather(
-                        input=dlc_logits[1],
-                        dim=2,
-                        index=einx.rearrange("b l -> b l n v", dlc[i], n=1, v=V),
+
+            # IMPORTANT : Shift SEM tokens to new token indices
+            dlc += len(self.decoder.tokenizer)  
+
+            think_token = torch.full(
+                        size=(dlc.shape[0], 1),
+                        fill_value=self.decoder.tokenizer.think_token_id,
+                        dtype=torch.long,
+                        device=dlc.device
                     )
-                    dlc.append(torch.argmax(level, dim=-1).squeeze())
-                dlc = torch.cat(dlc, dim=1)
+            input_ids_dec = [think_token, dlc, think_token, batch['cont_ids_dec']]
+            if self.cfg.conditional:
+                input_ids_dec = [batch["prompt_ids_dec"]] + input_ids_dec
+            input_ids_dec = torch.cat(input_ids_dec, dim=1)
 
-            dlc += len(self.decoder.tokenizer)  # Shift SEM tokens to new token indices
-
-            # Prepend BOS + DLC to decoder input ids
-            input_ids_dec = torch.cat(
-                [
-                    torch.full_like(
-                        dlc[:, [0]],
-                        fill_value=self.decoder.tokenizer.bos_token_id,
-                    ),
-                    dlc,
-                    batch["input_ids_dec"],
-                ],
-                dim=1,
-            )
-
-        # Compute loss
+        # Compute cross-entropy loss
         targets = input_ids_dec.clone()[:, 1:].contiguous()
         logits = self.decoder(input_ids=input_ids_dec)[:, :-1].contiguous()
         loss = torch.nn.functional.cross_entropy(
@@ -180,9 +198,9 @@ class DLCLMTask(L.LightningModule):
             reduction="none",
         )
         loss = loss.view_as(targets)
+        full_loss = loss.mean()
 
         # p(z)p(x|z)
-        full_loss = loss.mean()
         self.log(
             "train/full_loss",
             full_loss,
@@ -205,36 +223,25 @@ class DLCLMTask(L.LightningModule):
 
     @torch.no_grad()
     def validation_step(self, batch, batch_idx):
-        dlc_logits = self.encoder(
-                batch["input_ids_enc"], batch["attention_mask_enc"], return_sem=True
-            )
-        if self.encoder.cfg.sem_cfg != None:
-            dlc = dlc_logits.argmax(-1)
-        elif self.encoder.cfg.hsem_cfg != None:
-            V = dlc_logits[0].shape[-1]
-            dlc = [dlc_logits[0].argmax(-1).squeeze()]
-            for i in range(len(dlc_logits) - 1):
-                level = torch.gather(
-                    input=dlc_logits[1],
-                    dim=2,
-                    index=einx.rearrange("b l -> b l n v", dlc[i], n=1, v=V),
-                )
-                dlc.append(torch.argmax(level, dim=-1).squeeze())
-            dlc = torch.cat(dlc, dim=1)
-        dlc += len(self.decoder.tokenizer)  # Shift SEM tokens to new token indices
-
-        # Prepend BOS + DLC to decoder input ids
-        input_ids_dec = torch.cat(
-            [
-                torch.full_like(
-                    dlc[:, [0]],
-                    fill_value=self.decoder.tokenizer.bos_token_id,
-                ),
-                dlc,
-                batch["input_ids_dec"],
-            ],
-            dim=1,
+        # Construct the input
+        
+        dlc = self.encoder(
+            batch["cont_ids_enc"], batch["cont_mask_enc"], return_dlc=True
         )
+
+        # IMPORTANT : Shift SEM tokens to new token indices
+        dlc += len(self.decoder.tokenizer)  
+
+        think_token = torch.full(
+                    size=(dlc.shape[0], 1),
+                    fill_value=self.decoder.tokenizer.think_token_id,
+                    dtype=torch.long,
+                    device=dlc.device
+                )
+        input_ids_dec = [think_token, dlc, think_token, batch['cont_ids_dec']]
+        if self.cfg.conditional:
+            input_ids_dec = [batch["prompt_ids_dec"]] + input_ids_dec
+        input_ids_dec = torch.cat(input_ids_dec, dim=1)
 
         # Compute loss
         targets = input_ids_dec.clone()[:, 1:].contiguous()

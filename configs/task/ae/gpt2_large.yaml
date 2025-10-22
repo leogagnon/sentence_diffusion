@@ -1,11 +1,10 @@
 batch_size: 64
 lr: 1e-4
-max_generation_length: 150
+lr_warmup: true
 val_size: 16384
 
 decoder:
   name: gpt2-large # 0.7B params
-  train: true
 
 name: gpt2_large
 
