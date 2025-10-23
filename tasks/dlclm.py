@@ -28,15 +28,18 @@ from tqdm import tqdm
 from mauve import compute_mauve, get_features_from_input
 import einx
 from transformers import get_constant_schedule_with_warmup
-
+from data.wiki import DATA_SEED
 
 @dataclass
 class DLCLMTaskConfig:
     lr: float
-    lr_warmup: bool 
+    lr_warmup: bool
     batch_size: int
     pretrained_ae_id: str
-    conditional: bool
+    pure_ar_baseline: bool = False
+    
+    # If not giving pretrained_ae_id
+    decoder: Optional[DecoderConfig] = None
 
     name: Optional[str] = None
 
@@ -67,27 +70,45 @@ class DLCLMTask(L.LightningModule):
                 "last.ckpt",
             ),
             strict=True,
-            map_location="cpu",
+            map_location=torch.device("cpu"),
         )
         self.train_indices = ae_task.train_indices
         self.val_indices = ae_task.val_indices
         self.dataset = ae_task.dataset
         self.dataset: WikipediaDataset
 
-        assert ae_task.encoder.cfg.sem is not None
+        # If decoder is not given, start from the DAE's decoder
+        if cfg.decoder is None:
+            self.decoder = ae_task.decoder
+            if self.decoder.cfg.lora_cfg != None:
+                self.decoder.backbone = self.decoder.backbone.merge_and_unload()
+            del self.decoder.prompt_generator
+            self.decoder = self.decoder.train().requires_grad_(True)
+        else:
+            rank_zero_info("Starting from a fresh decoder!")
+            self.decoder = DecoderModel(cfg.decoder).train().requires_grad_(True)
 
-        # Load encoder and freeze it
-        self.encoder = ae_task.encoder.eval().requires_grad_(False)
+        if not cfg.pure_ar_baseline:
+            assert ae_task.encoder.cfg.sem is not None
 
-        # Load decoder, add DLC tokens, remove prompt generator
-        self.decoder = ae_task.decoder
-        if self.decoder.cfg.lora_cfg != None:
-            self.decoder.backbone = self.decoder.backbone.merge_and_unload()
-        self.decoder.backbone.resize_token_embeddings(
-            len(ae_task.decoder.tokenizer) + self.encoder.sem.cfg.V
-        )
-        self.decoder = self.decoder.train().requires_grad_(True)
-        del self.decoder.prompt_generator
+            # Load encoder and freeze it
+            self.encoder = ae_task.encoder.eval().requires_grad_(False)
+
+            # Turn on DLC mode on decoder
+            self.decoder.is_dlc = True
+            # Add <|think|> token
+            self.decoder.tokenizer.add_special_tokens(
+                {"additional_special_tokens": ["<|think|>"]}
+            )
+            self.decoder.tokenizer.think_token_id = (
+                self.decoder.tokenizer.convert_tokens_to_ids("<|think|>")
+            )
+            # Add DLC tokens
+            self.decoder.backbone.resize_token_embeddings(
+                len(self.decoder.tokenizer) + self.encoder.sem.cfg.V, mean_resizing=True
+            )
+            # Just making sure
+            self.decoder.requires_grad_(True)
 
         # To not eval MAUVE every validation step
         self.val_epoch_counter = 0
@@ -98,10 +119,16 @@ class DLCLMTask(L.LightningModule):
             OmegaConf.to_container(OmegaConf.structured(cfg)), logger=False
         )
 
+    def compile(self):
+        if hasattr(self, 'encoder'):
+            self.encoder.compile()
+        self.decoder.compile()
+
     def train(self, mode=True):
         # Make sure encoder stays in eval mode
         super().train(mode)
-        self.encoder.eval()
+        if hasattr(self, 'encoder'):
+            self.encoder.eval()
         return self
 
     def setup(self, stage: Optional[str] = None):
@@ -146,51 +173,54 @@ class DLCLMTask(L.LightningModule):
                 n=len(self.train_data), batch_size=self.cfg.batch_size
             ),
             collate_fn=self.dataset.get_collate_and_tokenize_fn(
+                conditional=False,
                 enc_tokenizer=(
-                    self.encoder.tokenizer if self.cfg.encoder != None else None
+                    self.encoder.tokenizer if hasattr(self, "encoder") else None
                 ),
                 dec_tokenizer=self.decoder.tokenizer,
             ),
         )
 
     def val_dataloader(self):
+        if torch.distributed.is_available() and torch.distributed.is_initialized():
+            sampler = torch.utils.data.DistributedSampler(self.val_data, shuffle=False)
+        else:
+            sampler = torch.utils.data.SequentialSampler(self.val_data)
         return DataLoader(
             self.val_data,
             batch_size=self.cfg.batch_size,
-            sampler=torch.utils.data.DistributedSampler(self.val_data, shuffle=False),
+            sampler=sampler,
             collate_fn=self.dataset.get_collate_and_tokenize_fn(
+                conditional=False,
                 enc_tokenizer=(
-                    self.encoder.tokenizer if self.cfg.encoder != None else None
+                    self.encoder.tokenizer if hasattr(self, "encoder") else None
                 ),
                 dec_tokenizer=self.decoder.tokenizer,
             ),
         )
 
     def training_step(self, batch, batch_idx):
-        assert self.encoder.training == False
-        # Construct the input
         with torch.no_grad():
-            dlc = self.encoder(
-                batch["cont_ids_enc"], batch["cont_mask_enc"], return_dlc=True
-            )
-
-            # IMPORTANT : Shift SEM tokens to new token indices
-            dlc += len(self.decoder.tokenizer)  
-
-            think_token = torch.full(
-                        size=(dlc.shape[0], 1),
-                        fill_value=self.decoder.tokenizer.think_token_id,
-                        dtype=torch.long,
-                        device=dlc.device
-                    )
-            input_ids_dec = [think_token, dlc, think_token, batch['cont_ids_dec']]
-            if self.cfg.conditional:
-                input_ids_dec = [batch["prompt_ids_dec"]] + input_ids_dec
+            input_ids_dec = [batch["cont_ids_dec"]]
+            if hasattr(self, "encoder"):
+                # Compute DLC. IMPORTANT : Shift SEM tokens to new token indices
+                dlc_ids = self.encoder(
+                    batch["cont_ids_enc"], batch["cont_mask_enc"], return_dlc=True
+                ) + len(self.decoder.tokenizer)
+                think_token = torch.full(
+                    size=(dlc_ids.shape[0], 1),
+                    fill_value=self.decoder.tokenizer.think_token_id,
+                    dtype=dlc_ids.dtype,
+                    device=dlc_ids.device,
+                )
+                # <|think|> DLC <|bos|> x <|eos|>
+                input_ids_dec = [think_token, dlc_ids] + input_ids_dec
             input_ids_dec = torch.cat(input_ids_dec, dim=1)
 
-        # Compute cross-entropy loss
-        targets = input_ids_dec.clone()[:, 1:].contiguous()
-        logits = self.decoder(input_ids=input_ids_dec)[:, :-1].contiguous()
+        # Maybe add prompt before the <|think|> token
+        logits = self.decoder(input_ids=input_ids_dec)
+        targets = input_ids_dec[:, 1:].contiguous()
+        logits = logits[:, :-1].contiguous()
         loss = torch.nn.functional.cross_entropy(
             logits.view(-1, logits.size(-1)),
             targets.view(-1),
@@ -210,10 +240,10 @@ class DLCLMTask(L.LightningModule):
         )
 
         # p(x|z) only, more like the reconstruction loss
-        # -2 because the length of input_ids_dec includes the BOS and EOS tokens
+        cont_len = batch["cont_ids_dec"].size(1) - 1  # Do not include BOS token
         self.log(
             "train/cond_loss",
-            loss[:, -(batch["input_ids_dec"].size(1) - 1) :].mean(),
+            loss[:, -cont_len:].mean(),
             on_epoch=False,
             on_step=True,
             sync_dist=True,
@@ -223,29 +253,27 @@ class DLCLMTask(L.LightningModule):
 
     @torch.no_grad()
     def validation_step(self, batch, batch_idx):
-        # Construct the input
-        
-        dlc = self.encoder(
-            batch["cont_ids_enc"], batch["cont_mask_enc"], return_dlc=True
-        )
-
-        # IMPORTANT : Shift SEM tokens to new token indices
-        dlc += len(self.decoder.tokenizer)  
-
-        think_token = torch.full(
-                    size=(dlc.shape[0], 1),
+        with torch.no_grad():
+            input_ids_dec = [batch["cont_ids_dec"]]
+            if hasattr(self, "encoder"):
+                # Compute DLC. IMPORTANT : Shift SEM tokens to new token indices
+                dlc_ids = self.encoder(
+                    batch["cont_ids_enc"], batch["cont_mask_enc"], return_dlc=True
+                ) + len(self.decoder.tokenizer)
+                think_token = torch.full(
+                    size=(dlc_ids.shape[0], 1),
                     fill_value=self.decoder.tokenizer.think_token_id,
-                    dtype=torch.long,
-                    device=dlc.device
+                    dtype=dlc_ids.dtype,
+                    device=dlc_ids.device,
                 )
-        input_ids_dec = [think_token, dlc, think_token, batch['cont_ids_dec']]
-        if self.cfg.conditional:
-            input_ids_dec = [batch["prompt_ids_dec"]] + input_ids_dec
-        input_ids_dec = torch.cat(input_ids_dec, dim=1)
+                # <|think|> DLC <|bos|> x <|eos|>
+                input_ids_dec = [think_token, dlc_ids] + input_ids_dec
+            input_ids_dec = torch.cat(input_ids_dec, dim=1)
 
-        # Compute loss
-        targets = input_ids_dec.clone()[:, 1:].contiguous()
-        logits = self.decoder(input_ids=input_ids_dec)[:, :-1].contiguous()
+        # Maybe add prompt before the <|think|> token
+        logits = self.decoder(input_ids=input_ids_dec)
+        targets = input_ids_dec[:, 1:].contiguous()
+        logits = logits[:, :-1].contiguous()
         loss = torch.nn.functional.cross_entropy(
             logits.view(-1, logits.size(-1)),
             targets.view(-1),
@@ -253,6 +281,7 @@ class DLCLMTask(L.LightningModule):
             reduction="none",
         )
         loss = loss.view_as(targets)
+        full_loss = loss.mean()
 
         # p(z)p(x|z)
         full_loss = loss.mean()
@@ -266,11 +295,12 @@ class DLCLMTask(L.LightningModule):
 
         # p(x|z) only, more like the reconstruction loss
         # -2 because the length of input_ids_dec includes the BOS and EOS tokens
+        cont_len = batch["cont_ids_dec"].size(1) - 1  # Do not include BOS token
         self.log(
-            "val/cond_loss",
-            loss[:, -(batch["input_ids_dec"].size(1) - 1) :].mean(),
-            on_epoch=True,
-            on_step=False,
+            "train/cond_loss",
+            loss[:, -cont_len:].mean(),
+            on_epoch=False,
+            on_step=True,
             sync_dist=True,
         )
 
@@ -281,7 +311,8 @@ class DLCLMTask(L.LightningModule):
                 batch["input_str"][:5],
                 self.decoder.tokenizer.batch_decode(
                     self.decoder.generate(
-                        prompt=input_ids_dec[:5, : (dlc.shape[1] + 1)],
+                        dlc=dlc_ids[:5] if hasattr(self, 'encoder') else None,
+                        batch_size=5,
                         max_length=self.dataset.cfg.max_length,
                     ),
                     skip_special_tokens=True,
@@ -291,21 +322,17 @@ class DLCLMTask(L.LightningModule):
             wandb.log({"val/clean_samples": table_clean})
             del table_clean
 
-            # Log MAUVE score every 5 validation steps
+            # Log MAUVE score every 5 validation steps (takes a few minutes)
             if self.val_epoch_counter % 5 == 0:
                 mauve = self.eval_mauve()
                 wandb.log({"val/MAUVE": mauve})
 
     def eval_mauve(self, seed: int = 1337):
-        # Load reference features
-        ref_feats = torch.load("mauve_eval_feats.pt")
+        # Load reference features (5120 sequences pre-featurized with GPT2-large)
+        ref_feats = torch.load("mauve_eval_feats.pt", map_location=torch.device("cpu"))
 
         # Generate unconditionally
         with torch.inference_mode():
-            if self.encoder.cfg.sem_cfg != None:
-                dlc_len = self.encoder.cfg.sem_cfg.L
-            else: 
-                dlc_len = self.encoder.cfg.hsem_cfg.L * self.encoder.cfg.hsem_cfg.D
             gen_text = []
             for _ in tqdm(
                 range(len(ref_feats) // 128), desc=f"Generating paragraphs..."
@@ -313,32 +340,32 @@ class DLCLMTask(L.LightningModule):
                 gen_text.extend(
                     self.decoder.tokenizer.batch_decode(
                         self.decoder.generate(
-                            max_length=150,
+                            max_length=self.dataset.cfg.max_length,
                             batch_size=128,
-                            generate_prompt=True,
-                            dlc_len=dlc_len,
+                            dlc_len=self.encoder.sem.dlc_len if hasattr(self, 'encoder') else None,
                         ),
                         skip_special_tokens=True,
                     )
                 )
 
-        # Featurize for MAUVE
+        # Featurize generated text
         gen_feats = get_features_from_input(
             None, None, gen_text, "gpt2-large", 150, 0, "generated paragraphs", 64
         )
 
-        # Comput MAUVE
+        # Comput MAUVE against reference features (remove AMP since it caused errors that I don't wanna debug)
         with torch.autocast(device_type="cuda", enabled=False):
             mauve = compute_mauve(
                 p_features=gen_feats,
                 q_features=ref_feats,
-                max_text_length=150,
+                max_text_length=self.dataset.cfg.max_length,
                 batch_size=64,
                 device_id=0,
                 featurize_model_name="gpt2-large",
                 seed=seed,
             )
 
+        # Avoid CUDA memory leaks
         torch.cuda.empty_cache()
 
         return mauve.mauve

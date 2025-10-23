@@ -50,6 +50,10 @@ class SEMHead(nn.Module):
         self.proj_out = nn.Linear(cfg.L * cfg.V, cfg.input_dim)
         self.cfg = cfg
 
+    @property
+    def dlc_len(self):
+        return self.cfg.L
+
     def forward(self, x, return_logits=False):
         x = self.proj_in(x)
         x = self.norm(x)
@@ -91,6 +95,11 @@ class HSEMHead(nn.Module):
         self.proj_out = nn.Linear(cfg.L * cfg.V * self.N, cfg.input_dim)
         self.cfg = cfg
 
+    
+    @property
+    def dlc_len(self):
+        return self.cfg.D * self.cfg.L
+
     def forward(self, x: torch.Tensor, return_logits=False):
         x = self.proj_in(x)
         x = self.norm(x)
@@ -131,7 +140,7 @@ class HSEMHead(nn.Module):
         for i in range(self.cfg.D - 1):
             # Get the node at level i that was chosen at level i-1
             node = torch.gather(
-                input=logits[i],
+                input=logits[i+1],
                 dim=2,
                 index=einx.rearrange("b l -> b l n v", dlc[i], n=1, v=self.cfg.V),
             ).squeeze(2)

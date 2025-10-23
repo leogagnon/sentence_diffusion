@@ -1,0 +1,9 @@
+lr: 1e-4
+lr_warmup: true
+batch_size: 32
+pretrained_ae_id: iczc7jdi # doesn't do much, only to get the dataset
+pure_ar_baseline: true
+decoder:
+  name: gpt2-large # 1.5B params
+
+name: dlclm

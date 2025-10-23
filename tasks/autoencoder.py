@@ -123,10 +123,10 @@ class AETask(L.LightningModule):
 
         # Load encoder and decoder
         if cfg.encoder != None:
-            self.encoder = EncoderModel(cfg.encoder).requires_grad_(True)
+            self.encoder = EncoderModel(cfg.encoder).train().requires_grad_(True)
             cfg.decoder.input_dim = self.encoder.latent_dim
 
-        self.decoder = DecoderModel(cfg.decoder).requires_grad_(True)
+        self.decoder = DecoderModel(cfg.decoder).train().requires_grad_(True)
 
         # Setup dataset
         self.dataset = hydra.utils.instantiate(cfg.dataset)
@@ -179,6 +179,7 @@ class AETask(L.LightningModule):
                 n=len(self.train_data), batch_size=self.cfg.batch_size
             ),
             collate_fn=self.dataset.get_collate_and_tokenize_fn(
+                conditional=False,
                 enc_tokenizer=(
                     self.encoder.tokenizer if self.cfg.encoder != None else None
                 ),
@@ -187,11 +188,17 @@ class AETask(L.LightningModule):
         )
 
     def val_dataloader(self):
+        if torch.distributed.is_available() and torch.distributed.is_initialized():
+            sampler = torch.utils.data.DistributedSampler(self.val_data, shuffle=False)
+        else:
+            sampler = torch.utils.data.SequentialSampler(self.val_data)
+    
         return DataLoader(
             self.val_data,
             batch_size=self.cfg.batch_size,
-            sampler=torch.utils.data.DistributedSampler(self.val_data, shuffle=False),
+            sampler=sampler,
             collate_fn=self.dataset.get_collate_and_tokenize_fn(
+                conditional=False,
                 enc_tokenizer=(
                     self.encoder.tokenizer if self.cfg.encoder != None else None
                 ),
@@ -234,16 +241,15 @@ class AETask(L.LightningModule):
         # If there is an encoder, compute z
         z = None
         if self.cfg.encoder != None:
-            input_ids_enc_noised = self.random_substitution(batch["input_ids_enc"])
-            z = self.encoder(input_ids_enc_noised, batch["attention_mask_enc"])
+            z = self.encoder(
+                self.random_substitution(batch["cont_ids_enc"]), batch["cont_mask_enc"]
+            )
 
         # Compute decoder likelihood of input_ids (no need for attention mask cuz causal)
-        logits = self.decoder(input_ids=batch["input_ids_dec"], z=z)
+        logits = self.decoder(input_ids=batch["cont_ids_dec"], z=z)
 
         # Compute loss
-        targets = batch["input_ids_dec"].masked_fill(
-            batch["attention_mask_dec"] == 0, -100
-        )
+        targets = batch["cont_ids_dec"].masked_fill(batch["cont_mask_dec"] == 0, -100)
         logits = logits[:, :-1].contiguous()
         targets = targets[:, 1:].contiguous()
         loss = torch.nn.functional.cross_entropy(
@@ -268,7 +274,7 @@ class AETask(L.LightningModule):
         # If there is an encoder, compute z and potentially add noise
         z = None
         if self.cfg.encoder != None:
-            z = self.encoder(batch["input_ids_enc"], batch["attention_mask_enc"])
+            z = self.encoder(batch["cont_ids_enc"], batch["cont_mask_enc"])
 
             self.log(
                 "val/latent_norm",
@@ -278,10 +284,8 @@ class AETask(L.LightningModule):
             )
 
         # Compute clean reconstruction loss
-        logits = self.decoder(batch["input_ids_dec"], z)
-        targets = batch["input_ids_dec"].masked_fill(
-            batch["attention_mask_dec"] == 0, -100
-        )
+        logits = self.decoder(batch["cont_ids_dec"], z)
+        targets = batch["cont_ids_dec"].masked_fill(batch["cont_mask_dec"] == 0, -100)
         logits = logits[:, :-1].contiguous()
         targets = targets[:, 1:].contiguous()
         recon_loss = torch.nn.functional.cross_entropy(
@@ -289,7 +293,7 @@ class AETask(L.LightningModule):
             targets.view(-1),
             ignore_index=-100,
         )
-        self.log("val/reconstruction_loss", recon_loss, on_epoch=True, sync_dist=True)
+        self.log("val/loss", recon_loss, on_epoch=True, sync_dist=True)
 
         # Maybe log some generations
         if (batch_idx == 0) and (rank_zero_only.rank == 0) and (z != None):
@@ -305,46 +309,4 @@ class AETask(L.LightningModule):
                 ),
             ):
                 table_clean.add_data(original, reconstructed)
-            wandb.log({"val/clean_samples": table_clean})
-
-    def eval_mauve(self, seed: int = 1337):
-        assert (
-            self.cfg.encoder == None
-        ), "Can only compute MAUVE for unconditional models"
-        # Load reference features
-        ref_feats = torch.load("mauve_eval_feats.pt")
-
-        # Generate unconditionally
-        with torch.inference_mode():
-            gen_text = []
-            for _ in tqdm(
-                range(len(ref_feats) // 128), desc=f"Generating paragraphs..."
-            ):
-                gen_text.extend(
-                    self.decoder.tokenizer.batch_decode(
-                        self.decoder.generate(
-                            max_length=self.dataset.cfg.max_length, batch_size=128
-                        ),
-                        skip_special_tokens=True,
-                    )
-                )
-
-        # Featurize for MAUVE
-        gen_feats = get_features_from_input(
-            None, None, gen_text, "gpt2-large", 150, 0, "generated paragraphs", 64
-        )
-
-        # Comput MAUVE
-        mauve = compute_mauve(
-            p_features=gen_feats,
-            q_features=ref_feats,
-            max_text_length=150,
-            batch_size=64,
-            device_id=0,
-            featurize_model_name="gpt2-large",
-            seed=seed,
-        )
-
-        torch.cuda.empty_cache()
-
-        return mauve.mauve
+            wandb.log({"val/samples": table_clean})

@@ -12,7 +12,8 @@
             "console": "integratedTerminal",
             "justMyCode": false,
             "args": [
-                "task/ae=sem/sonar",
+                "task/dlclm=base",
+                "task.dlclm.conditional=true",
                 "num_devices=1",
                 "val_check_interval=10"
             ],

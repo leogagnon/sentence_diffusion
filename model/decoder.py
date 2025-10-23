@@ -79,10 +79,6 @@ class DecoderModel(nn.Module):
             self.backbone.resize_token_embeddings(
                 len(self.tokenizer), mean_resizing=True
             )
-        self.tokenizer.add_special_tokens({"additional_special_tokens": ["<|think|>"]})
-        self.tokenizer.think_token_id = self.tokenizer.convert_tokens_to_ids(
-            "<|think|>"
-        )
 
         # Init prompt generator (project up, chunk, project up again, process with transformer)
         if cfg.prompt_generator_cfg != None:
@@ -107,6 +103,9 @@ class DecoderModel(nn.Module):
         else:
             # This means there is no z; the model is just a standard unconditional decoder
             pass
+
+        # Whether the model is in DLC mode or not
+        self.is_dlc = False
 
     def z_to_soft_prompt(self, z):
         # Project z to prompt space (B, D) -> (B, k * d) -> (B, k, d) -> (B, k, embd_dim)
@@ -148,25 +147,29 @@ class DecoderModel(nn.Module):
         self,
         max_length: int,
         z: Optional[torch.Tensor] = None,
-        prompt: Optional[torch.Tensor] = None,
-        batch_size: Optional[int] = None,
-        is_dlc: bool = False,
+        dlc: Optional[torch.Tensor] = None,
         dlc_len: Optional[int] = None,
+        batch_size: Optional[int] = None,
     ):
         """Generate text using autoregressive decoding, potentially conditioned on soft prefix z"""
-        # Maybe compute prompt and cache it
-        if is_dlc:
+        device = next(self.parameters()).device
+        # If in DLC mode
+        if self.is_dlc:
             assert z is None
-            if prompt is None:
-                bot = torch.full(
-                    size=(batch_size, 1),
-                    fill_value=self.tokenizer.think_token_id,
-                    dtype=torch.long,
-                ).cuda()
-                batch_size = None
-                prompt = self.backbone.generate(
-                    input_ids=bot,
-                    max_new_tokens=dlc_len + 1,  # 32-token DLC + closing <|think|>
+            batch_size = batch_size if dlc is None else dlc.shape[0]
+            think_token = torch.full(
+                size=(batch_size, 1),
+                fill_value=self.tokenizer.think_token_id,
+                dtype=torch.long,
+                device=device
+            )
+            if dlc is None:
+                assert dlc_len is not None
+                # If no DLC is provided, generate it
+                # Remove closing <|bos|>, will be re-added for continuation generation
+                dlc = self.backbone.generate(
+                    input_ids=think_token,
+                    max_new_tokens=dlc_len + 1,  # 32-token DLC + closing <|bos|>
                     do_sample=True,
                     top_p=0.92,
                     top_k=50,
@@ -175,50 +178,42 @@ class DecoderModel(nn.Module):
                     return_dict_in_generate=False,
                     use_cache=True,
                     pad_token_id=self.tokenizer.pad_token_id,
-                    eos_token_id=self.tokenizer.think_token_id,
-                )
-                prompt = prompt[
-                    :, :-1
-                ]  # Remove closing <|think|>, will be re-added as BOS for next phase
-                cache = self.backbone(
-                    input_ids=prompt,
-                    use_cache=True,
-                ).past_key_values
-                device = prompt.device
-                cache_position = torch.tensor([prompt.shape[1]], device=prompt.device)
-                attention_mask = torch.ones(
-                    (prompt.shape[0], prompt.shape[1] + 1), device=device
-                )
-        elif z != None:
-            assert prompt is None, "Cannot provide both z and prompt"
-            prompt = self.z_to_soft_prompt(z)
+                    eos_token_id=self.tokenizer.bos_token_id,
+                )[:, :-1]
+            else:
+                # Prepend <|think|> token
+                dlc = torch.cat([think_token, dlc], dim=1)
             cache = self.backbone(
-                inputs_embeds=prompt,
+                input_ids=dlc,
                 use_cache=True,
             ).past_key_values
-            device = prompt.device
+            cache_position = torch.tensor([dlc.shape[1]], device=device)
+            attention_mask = torch.ones((dlc.shape[0], dlc.shape[1] + 1), device=device)
+        # If generating from latent (for auto-encoding phase)
+        elif z != None:
+            soft_prompt = self.z_to_soft_prompt(z)
+            cache = self.backbone(
+                inputs_embeds=soft_prompt,
+                use_cache=True,
+            ).past_key_values
             batch_size = z.shape[0]
-            cache_position = torch.tensor([prompt.shape[1]], device=prompt.device)
+            cache_position = torch.tensor([soft_prompt.shape[1]], device=device)
             attention_mask = torch.ones(
-                (prompt.shape[0], prompt.shape[1] + 1), device=device
+                (soft_prompt.shape[0], soft_prompt.shape[1] + 1), device=device
             )
+        # If generating unconditionally (for baseline)
         else:
-            cache = None
-            cache_position = None
-            attention_mask = None
-            device = next(self.backbone.parameters()).device
             assert (
                 batch_size is not None
             ), "Must provide batch_size if no conditionning is given"
+            cache = None
+            cache_position = None
+            attention_mask = None
 
-        # Autoregressive generation from token (maybe with cached prompt)
-        # Start with the new <|think|> token if conditionning on a DLC
-        bos_token_id = (
-            self.tokenizer.think_token_id if is_dlc else self.tokenizer.bos_token_id
-        )
+        # Autoregressive generation from <|BOS|> token (maybe with cached prefix)
         bos = torch.full(
             (batch_size, 1),
-            bos_token_id,
+            self.tokenizer.bos_token_id,
             device=device,
             dtype=torch.long,
         )

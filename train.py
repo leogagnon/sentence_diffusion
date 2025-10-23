@@ -113,7 +113,7 @@ def main(cfg: Optional[TrainConfig] = None, run_id: Optional[str] = None):
 
         # Add the autoencoder config to cfg
         run = wandb.Api().run(
-            f"guillaume-lajoie/sentence_diffusion/{cfg.task.dlclm.pretrained_ae_id}"
+            f"guillaume-lajoie/dlc_lm/{cfg.task.dlclm.pretrained_ae_id}"
         )
         cfg.task.ae = OmegaConf.merge(
             OmegaConf.structured(AETaskConfig), run.config["task"]["ae"]

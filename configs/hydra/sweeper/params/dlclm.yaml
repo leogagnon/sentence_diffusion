@@ -1,0 +1,18 @@
+task/dlclm: base
+model_checkpoint: base
+effective_batch_size: 1024
+task.dlclm.batch_size: 32 
+task.dlclm.lr: 1e-4
+task.dlclm.lr_warmup: true
+precision: bf16-mixed
+
+task.dlclm.pretrained_ae_id : gaq66j6q, oass55nt, iczc7jdi, 8zs9855w
+
+compile: true
+max_steps: 30000
+
+limit_val_batches: 4
+val_check_interval: 256
+
+sweep_id: dlclm_base
+

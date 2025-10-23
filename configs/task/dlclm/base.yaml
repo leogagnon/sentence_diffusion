@@ -1,7 +1,6 @@
-lr: 1e-5
+lr: 1e-4
+lr_warmup: true
 batch_size: 32
-pretrained_ae_id: 4dp80ubw #sem : dl2fh5wd
-
-data_seed: 42
+pretrained_ae_id: gaq66j6q
 
 name: dlclm
