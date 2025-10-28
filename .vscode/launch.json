@@ -12,10 +12,7 @@
             "console": "integratedTerminal",
             "justMyCode": false,
             "args": [
-                "task/dlclm=base",
-                "task.dlclm.conditional=true",
-                "num_devices=1",
-                "val_check_interval=10"
+                "--wandb_id=5qnx3646"
             ],
         }
     ]

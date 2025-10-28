@@ -19,7 +19,7 @@ from einops import rearrange
 from torch.nn import ModuleDict
 from tokenizers.processors import TemplateProcessing
 from lightning.pytorch.utilities.rank_zero import rank_zero_info
-
+from transformers import GenerationConfig
 
 @dataclass
 class PromptGeneratorConfig:
@@ -150,6 +150,8 @@ class DecoderModel(nn.Module):
         dlc: Optional[torch.Tensor] = None,
         dlc_len: Optional[int] = None,
         batch_size: Optional[int] = None,
+        gen_kwargs: Optional[dict] = None,
+        gen_kwargs_dlc: Optional[dict] = None,
     ):
         """Generate text using autoregressive decoding, potentially conditioned on soft prefix z"""
         device = next(self.parameters()).device
@@ -161,25 +163,34 @@ class DecoderModel(nn.Module):
                 size=(batch_size, 1),
                 fill_value=self.tokenizer.think_token_id,
                 dtype=torch.long,
-                device=device
+                device=device,
             )
             if dlc is None:
-                assert dlc_len is not None
                 # If no DLC is provided, generate it
-                # Remove closing <|bos|>, will be re-added for continuation generation
+                assert dlc_len is not None
+                gen_cfg_dlc = {
+                    "max_new_tokens": dlc_len + 1,  # 32-token DLC + closing <|bos|>
+                    "do_sample": True,
+                    "top_p": 0.92,
+                    "top_k": 50,
+                    "num_beams": 1,
+                    "temperature": 1.0,
+                    "return_dict_in_generate": False,
+                    "pad_token_id": self.tokenizer.pad_token_id,
+                    "eos_token_id": self.tokenizer.bos_token_id,
+                    "use_cache": True
+
+                }
+                if gen_kwargs_dlc is not None:
+                    gen_cfg_dlc.update(gen_kwargs_dlc)
+                
                 dlc = self.backbone.generate(
                     input_ids=think_token,
-                    max_new_tokens=dlc_len + 1,  # 32-token DLC + closing <|bos|>
-                    do_sample=True,
-                    top_p=0.92,
-                    top_k=50,
-                    num_beams=1,
-                    temperature=0.9,
-                    return_dict_in_generate=False,
-                    use_cache=True,
-                    pad_token_id=self.tokenizer.pad_token_id,
-                    eos_token_id=self.tokenizer.bos_token_id,
-                )[:, :-1]
+                    generation_config=GenerationConfig(**gen_cfg_dlc)
+                )
+
+                # Remove closing <|bos|>, will be re-added for continuation generation
+                dlc = dlc[:, :-1]
             else:
                 # Prepend <|think|> token
                 dlc = torch.cat([think_token, dlc], dim=1)
@@ -217,21 +228,27 @@ class DecoderModel(nn.Module):
             device=device,
             dtype=torch.long,
         )
+        gen_cfg = {
+            "max_new_tokens": max_length,  # 32-token DLC + closing <|bos|>
+            "do_sample": True,
+            "top_p": 0.92,
+            "top_k": 50,
+            "num_beams": 1,
+            "temperature": 1.0,
+            "return_dict_in_generate": False,
+            "pad_token_id": self.tokenizer.pad_token_id,
+            "eos_token_id": self.tokenizer.eos_token_id,
+            "use_cache": True
+
+        }
+        if gen_kwargs is not None:
+            gen_cfg.update(gen_kwargs)
         output = self.backbone.generate(
             input_ids=bos,
+            generation_config=GenerationConfig(**gen_cfg),
             past_key_values=cache,
             cache_position=cache_position,
-            attention_mask=attention_mask,
-            max_new_tokens=max_length,
-            do_sample=True,
-            top_p=0.92,
-            top_k=50,
-            num_beams=1,
-            temperature=0.9,
-            return_dict_in_generate=False,
-            use_cache=True,
-            pad_token_id=self.tokenizer.pad_token_id,
-            eos_token_id=self.tokenizer.eos_token_id,
+            attention_mask=attention_mask
         )
 
         return output

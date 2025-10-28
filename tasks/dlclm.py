@@ -28,7 +28,8 @@ from tqdm import tqdm
 from mauve import compute_mauve, get_features_from_input
 import einx
 from transformers import get_constant_schedule_with_warmup
-from data.wiki import DATA_SEED
+from data.wiki import DATA_SEED, InfoLabel
+
 
 @dataclass
 class DLCLMTaskConfig:
@@ -37,7 +38,7 @@ class DLCLMTaskConfig:
     batch_size: int
     pretrained_ae_id: str
     pure_ar_baseline: bool = False
-    
+
     # If not giving pretrained_ae_id
     decoder: Optional[DecoderConfig] = None
 
@@ -85,7 +86,6 @@ class DLCLMTask(L.LightningModule):
             del self.decoder.prompt_generator
             self.decoder = self.decoder.train().requires_grad_(True)
         else:
-            rank_zero_info("Starting from a fresh decoder!")
             self.decoder = DecoderModel(cfg.decoder).train().requires_grad_(True)
 
         if not cfg.pure_ar_baseline:
@@ -120,14 +120,14 @@ class DLCLMTask(L.LightningModule):
         )
 
     def compile(self):
-        if hasattr(self, 'encoder'):
+        if hasattr(self, "encoder"):
             self.encoder.compile()
         self.decoder.compile()
 
     def train(self, mode=True):
         # Make sure encoder stays in eval mode
         super().train(mode)
-        if hasattr(self, 'encoder'):
+        if hasattr(self, "encoder"):
             self.encoder.eval()
         return self
 
@@ -174,9 +174,7 @@ class DLCLMTask(L.LightningModule):
             ),
             collate_fn=self.dataset.get_collate_and_tokenize_fn(
                 conditional=False,
-                enc_tokenizer=(
-                    self.encoder.tokenizer if hasattr(self, "encoder") else None
-                ),
+                dlc_encoder=self.encoder if hasattr(self, "encoder") else None,
                 dec_tokenizer=self.decoder.tokenizer,
             ),
         )
@@ -192,43 +190,29 @@ class DLCLMTask(L.LightningModule):
             sampler=sampler,
             collate_fn=self.dataset.get_collate_and_tokenize_fn(
                 conditional=False,
-                enc_tokenizer=(
-                    self.encoder.tokenizer if hasattr(self, "encoder") else None
-                ),
+                dlc_encoder=self.encoder if hasattr(self, "encoder") else None,
                 dec_tokenizer=self.decoder.tokenizer,
             ),
         )
 
     def training_step(self, batch, batch_idx):
-        with torch.no_grad():
-            input_ids_dec = [batch["cont_ids_dec"]]
-            if hasattr(self, "encoder"):
-                # Compute DLC. IMPORTANT : Shift SEM tokens to new token indices
-                dlc_ids = self.encoder(
-                    batch["cont_ids_enc"], batch["cont_mask_enc"], return_dlc=True
-                ) + len(self.decoder.tokenizer)
-                think_token = torch.full(
-                    size=(dlc_ids.shape[0], 1),
-                    fill_value=self.decoder.tokenizer.think_token_id,
-                    dtype=dlc_ids.dtype,
-                    device=dlc_ids.device,
-                )
-                # <|think|> DLC <|bos|> x <|eos|>
-                input_ids_dec = [think_token, dlc_ids] + input_ids_dec
-            input_ids_dec = torch.cat(input_ids_dec, dim=1)
 
-        # Maybe add prompt before the <|think|> token
-        logits = self.decoder(input_ids=input_ids_dec)
-        targets = input_ids_dec[:, 1:].contiguous()
+        logits = self.decoder(input_ids=batch["input_ids_dec"])
+
+        # Compute loss (no mask/reduce, we do it after)
+        info_mask_dec = batch["info_mask_dec"][:, 1:]
+        targets = batch["input_ids_dec"][:, 1:].contiguous()
         logits = logits[:, :-1].contiguous()
         loss = torch.nn.functional.cross_entropy(
             logits.view(-1, logits.size(-1)),
             targets.view(-1),
-            ignore_index=self.decoder.tokenizer.pad_token_id,
             reduction="none",
         )
         loss = loss.view_as(targets)
-        full_loss = loss.mean()
+        full_loss = loss[
+            (info_mask_dec == InfoLabel.DLC.value)
+            + (info_mask_dec == InfoLabel.CONT.value)
+        ].mean()
 
         # p(z)p(x|z)
         self.log(
@@ -240,10 +224,10 @@ class DLCLMTask(L.LightningModule):
         )
 
         # p(x|z) only, more like the reconstruction loss
-        cont_len = batch["cont_ids_dec"].size(1) - 1  # Do not include BOS token
+        cond_loss = loss[info_mask_dec == InfoLabel.CONT.value].mean()
         self.log(
             "train/cond_loss",
-            loss[:, -cont_len:].mean(),
+            cond_loss,
             on_epoch=False,
             on_step=True,
             sync_dist=True,
@@ -253,70 +237,71 @@ class DLCLMTask(L.LightningModule):
 
     @torch.no_grad()
     def validation_step(self, batch, batch_idx):
-        with torch.no_grad():
-            input_ids_dec = [batch["cont_ids_dec"]]
-            if hasattr(self, "encoder"):
-                # Compute DLC. IMPORTANT : Shift SEM tokens to new token indices
-                dlc_ids = self.encoder(
-                    batch["cont_ids_enc"], batch["cont_mask_enc"], return_dlc=True
-                ) + len(self.decoder.tokenizer)
-                think_token = torch.full(
-                    size=(dlc_ids.shape[0], 1),
-                    fill_value=self.decoder.tokenizer.think_token_id,
-                    dtype=dlc_ids.dtype,
-                    device=dlc_ids.device,
-                )
-                # <|think|> DLC <|bos|> x <|eos|>
-                input_ids_dec = [think_token, dlc_ids] + input_ids_dec
-            input_ids_dec = torch.cat(input_ids_dec, dim=1)
 
-        # Maybe add prompt before the <|think|> token
-        logits = self.decoder(input_ids=input_ids_dec)
-        targets = input_ids_dec[:, 1:].contiguous()
+        logits = self.decoder(input_ids=batch["input_ids_dec"])
+
+        # Compute loss (no mask/reduce, we do it after)
+        info_mask_dec = batch["info_mask_dec"][:, 1:]
+        targets = batch["input_ids_dec"][:, 1:].contiguous()
         logits = logits[:, :-1].contiguous()
         loss = torch.nn.functional.cross_entropy(
             logits.view(-1, logits.size(-1)),
             targets.view(-1),
-            ignore_index=self.decoder.tokenizer.pad_token_id,
             reduction="none",
         )
         loss = loss.view_as(targets)
-        full_loss = loss.mean()
+        full_loss = loss[
+            (info_mask_dec == InfoLabel.DLC.value)
+            + (info_mask_dec == InfoLabel.CONT.value)
+        ].mean()
 
         # p(z)p(x|z)
-        full_loss = loss.mean()
         self.log(
             "val/full_loss",
             full_loss,
-            on_epoch=True,
-            on_step=False,
-            sync_dist=True,
-        )
-
-        # p(x|z) only, more like the reconstruction loss
-        # -2 because the length of input_ids_dec includes the BOS and EOS tokens
-        cont_len = batch["cont_ids_dec"].size(1) - 1  # Do not include BOS token
-        self.log(
-            "train/cond_loss",
-            loss[:, -cont_len:].mean(),
             on_epoch=False,
             on_step=True,
             sync_dist=True,
         )
 
-        if (batch_idx == 0) and (rank_zero_only.rank == 0):
-            # Log reconstruction samples
+        if not self.cfg.pure_ar_baseline:
+            # p(x|z) only, more like the reconstruction loss
+            cond_loss = loss[info_mask_dec == InfoLabel.CONT.value].mean()
+            self.log(
+                "val/cond_loss",
+                cond_loss,
+                on_epoch=False,
+                on_step=True,
+                sync_dist=True,
+            )
+
+        if (
+            (batch_idx == 0)
+            and (rank_zero_only.rank == 0)
+            and (not self.cfg.pure_ar_baseline)
+        ):
+            # Reconstruct text from DLC
+            dlc = torch.stack(
+                [
+                    batch["input_ids_dec"][i][
+                        batch["info_mask_dec"][i] == InfoLabel.DLC.value
+                    ]
+                    for i in range(5)
+                ]
+            )
+            reconstruction = self.decoder.tokenizer.batch_decode(
+                self.decoder.generate(
+                    dlc=dlc,
+                    max_length=self.dataset.cfg.max_length,
+                ),
+                skip_special_tokens=True,
+            )
+
+            # Put in table and log
             table_clean = wandb.Table(columns=["Original", "Reconstructed"])
             for original, reconstructed in zip(
                 batch["input_str"][:5],
-                self.decoder.tokenizer.batch_decode(
-                    self.decoder.generate(
-                        dlc=dlc_ids[:5] if hasattr(self, 'encoder') else None,
-                        batch_size=5,
-                        max_length=self.dataset.cfg.max_length,
-                    ),
-                    skip_special_tokens=True,
-                ),
+                reconstruction,
             ):
                 table_clean.add_data(original, reconstructed)
             wandb.log({"val/clean_samples": table_clean})
@@ -327,7 +312,12 @@ class DLCLMTask(L.LightningModule):
                 mauve = self.eval_mauve()
                 wandb.log({"val/MAUVE": mauve})
 
-    def eval_mauve(self, seed: int = 1337):
+    def eval_mauve(
+        self,
+        seed: int = 1337,
+        gen_kwargs: Optional[dict] = None,
+        gen_kwargs_dlc: Optional[dict] = None,
+    ):
         # Load reference features (5120 sequences pre-featurized with GPT2-large)
         ref_feats = torch.load("mauve_eval_feats.pt", map_location=torch.device("cpu"))
 
@@ -342,7 +332,13 @@ class DLCLMTask(L.LightningModule):
                         self.decoder.generate(
                             max_length=self.dataset.cfg.max_length,
                             batch_size=128,
-                            dlc_len=self.encoder.sem.dlc_len if hasattr(self, 'encoder') else None,
+                            dlc_len=(
+                                self.encoder.sem.dlc_len
+                                if hasattr(self, "encoder")
+                                else None
+                            ),
+                            gen_kwargs=gen_kwargs,
+                            gen_kwargs_dlc=gen_kwargs_dlc
                         ),
                         skip_special_tokens=True,
                     )

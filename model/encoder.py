@@ -34,6 +34,7 @@ class SEMHeadConfig:
     L: int
     V: int
     temp: float
+    l2_norm: bool = False
     input_dim: Optional[int] = None
 
 
@@ -45,30 +46,36 @@ class SEMHead(nn.Module):
             cfg = SEMHeadConfig(**kwargs)
 
         assert cfg.input_dim is not None, "input_dim has to be set"
-        self.proj_in = nn.Linear(cfg.input_dim, cfg.L * cfg.V)
+        self.proj_in = nn.Linear(cfg.input_dim, cfg.L * cfg.V, bias=False)
         self.norm = nn.LayerNorm(cfg.L * cfg.V, eps=1e-6)
-        self.proj_out = nn.Linear(cfg.L * cfg.V, cfg.input_dim)
+        self.proj_out = nn.Linear(cfg.L * cfg.V, cfg.input_dim, bias=False)
         self.cfg = cfg
 
     @property
     def dlc_len(self):
         return self.cfg.L
 
-    def forward(self, x, return_logits=False):
+    def forward(self, x, return_dlc=False):
+        # Compute DLC probs
         x = self.proj_in(x)
         x = self.norm(x)
         x = einx.rearrange("b (l v) -> b l v", x, l=self.cfg.L, v=self.cfg.V)
-        x = torch.softmax(x / self.cfg.temp, dim=-1)
-        if return_logits:
-            return x
-        x = einx.rearrange("b l v -> b (l v)", x)
-        x = self.proj_out(x)
+        probs = torch.softmax(x / self.cfg.temp, dim=-1)
 
-        return x
+        # Compute output
+        out = einx.rearrange("b l v -> b (l v)", probs)
+        out = self.proj_out(out)
 
-    def encode(self, x):
-        logits = self.forward(x, return_logits=True)
-        dlc = logits.argmax(-1)
+        if self.cfg.l2_norm:
+            out = F.normalize(out, p=2, dim=1)
+
+        if return_dlc:
+            return out, self.encode(probs)
+        else:
+            return out, probs
+
+    def encode(self, probs):
+        dlc = probs.argmax(-1)
         return dlc
 
 
@@ -90,17 +97,19 @@ class HSEMHead(nn.Module):
 
         assert cfg.input_dim is not None, "input_dim has to be set"
         self.N = (cfg.V**cfg.D) // (cfg.V - 1)
-        self.proj_in = nn.Linear(cfg.input_dim, cfg.L * cfg.V * self.N)
+        self.proj_in = nn.Linear(cfg.input_dim, cfg.L * cfg.V * self.N, bias=False)
         self.norm = nn.LayerNorm(cfg.L * cfg.V * self.N, eps=1e-6)
-        self.proj_out = nn.Linear(cfg.L * cfg.V * self.N, cfg.input_dim)
+        self.proj_out = nn.Linear(cfg.L * cfg.V * self.N, cfg.input_dim, bias=False)
         self.cfg = cfg
 
-    
     @property
     def dlc_len(self):
         return self.cfg.D * self.cfg.L
 
-    def forward(self, x: torch.Tensor, return_logits=False):
+    def forward(self, x: torch.Tensor, return_dlc=False):
+        bs = x.shape[0]
+
+        # Compute conditional probabilities
         x = self.proj_in(x)
         x = self.norm(x)
         x = einx.rearrange(
@@ -110,41 +119,46 @@ class HSEMHead(nn.Module):
             N=self.N,
             V=self.cfg.V,
         )
-        x = F.softmax(x / self.cfg.temp, -1)  # Raw conditional probs
+        x = F.softmax(x / self.cfg.temp, -1)
 
-        # Compute absolute probs by going down tree
-        bs = x.shape[0]
+        # Compute DLC probs (i.e. the joint) by going down tree
+        # E.g. p(x_0,x_1,x_2) = p(x_0) * p(x_1 | x_0) * p(x_2 | x_0, x_1)
         parent_probs = torch.ones(
             size=(bs, self.cfg.L, 1), device=x.device, dtype=x.dtype
         )
         start = 0
-        x_final = []
+        probs = []
         for d in range(self.cfg.D):
+            # Compute probs at level d by multiplying with parent probs
             end = start + self.cfg.V**d
             level = x[:, :, start:end] * parent_probs[..., None]
-            x_final.append(level)
+            probs.append(level)
+            # Update parent and go down a level
             parent_probs = einx.rearrange("b L n V -> b L (n V)", level)
             start = end
-        if return_logits:
-            return x_final
-        x_final = torch.cat(x_final, dim=2)
-        x_final = einx.rearrange("b L N V -> b (L N V)", x_final)
-        x_final = self.proj_out(x_final)
-        return x_final
+        
+        # Compute output
+        out = torch.cat(probs, dim=2)
+        out = einx.rearrange("b L N V -> b (L N V)", out)
+        out = self.proj_out(out)
 
-    def encode(self, x):
-        logits = self.forward(x, return_logits=True)
+        if return_dlc:
+            return out, self.encode(probs)
+        else:
+            return out, probs
+
+    def encode(self, probs):
 
         # Argmax on first level
-        dlc = [logits[0].squeeze(2).argmax(-1)]
+        dlc = [probs[0].squeeze(2).argmax(-1)]
         for i in range(self.cfg.D - 1):
             # Get the node at level i that was chosen at level i-1
             node = torch.gather(
-                input=logits[i+1],
+                input=probs[i + 1],
                 dim=2,
                 index=einx.rearrange("b l -> b l n v", dlc[i], n=1, v=self.cfg.V),
             ).squeeze(2)
-            
+
             # Argmax at level i (on the chosen node)
             dlc.append(node.argmax(-1))
 
@@ -174,9 +188,9 @@ class SONARTransformer(nn.Module):
 @dataclass
 class EncoderConfig:
     name: str
+    sem: dict
     lora_cfg: Optional[dict] = None
     dropout_p: float = 0.0
-    sem: Optional[dict] = None
     train: bool = True
 
 
@@ -226,10 +240,9 @@ class EncoderModel(nn.Module):
                 "Tried to use flash attention in encoder, but it is not available."
             )
 
-        if cfg.sem != None:
-            cfg.sem["input_dim"] = self.latent_dim
-            self.sem = hydra.utils.instantiate(cfg.sem)
-            self.sem : SEMHead | HSEMHead
+        cfg.sem["input_dim"] = self.latent_dim
+        self.sem = hydra.utils.instantiate(cfg.sem)
+        self.sem: SEMHead | HSEMHead
 
         if cfg.lora_cfg != None:
             self.transformer = get_peft_model(
@@ -241,8 +254,7 @@ class EncoderModel(nn.Module):
 
     def compile(self):
         # Only compile the SEM
-        if self.cfg.sem is not None:
-            self.sem.compile()
+        self.sem.compile()
 
     @property
     def latent_dim(self):
@@ -263,8 +275,6 @@ class EncoderModel(nn.Module):
         sentence_embedding = batch["sentence_embedding"]
 
         # Run through SEM
-        if self.cfg.sem != None:
-            if return_dlc:
-                return self.sem.encode(sentence_embedding)
-            else:
-                return self.sem(sentence_embedding)[:, None]
+        x_out, x_intern = self.sem(sentence_embedding, return_dlc=return_dlc)
+        x_out = x_out[:, None]
+        return x_out, x_intern

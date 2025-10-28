@@ -26,11 +26,18 @@ from tqdm import tqdm
 from mauve import compute_mauve, get_features_from_input
 from transformers import get_constant_schedule_with_warmup
 from data.wiki import DATA_SEED
-
+import einx
 import os
 import torch
 from torch.utils.data import Sampler
 from typing import Iterator, Optional
+
+
+def compute_entropy(probs, normalized=False):
+    ent = -(probs * torch.clamp(probs, min=1e-12).log()).sum(-1)
+    if normalized:
+        return ent / math.log(probs.shape[-1])
+    return ent
 
 
 class InfiniteDistributedUniformSampler(Sampler[int]):
@@ -95,12 +102,14 @@ class InfiniteDistributedUniformSampler(Sampler[int]):
 class AETaskConfig:
     lr: float
     batch_size: int
+    encoder: EncoderConfig
     decoder: DecoderConfig
     dataset: dict
     val_size: int
-    encoder: Optional[EncoderConfig] = None
     lr_warmup: bool = False
     sub_p: float = 0.3
+    delta_ent: Optional[float] = None
+    delta_ent_warmup: bool = False
 
     name: Optional[str] = None
 
@@ -121,11 +130,9 @@ class AETask(L.LightningModule):
                 )
             )
 
-        # Load encoder and decoder
-        if cfg.encoder != None:
-            self.encoder = EncoderModel(cfg.encoder).train().requires_grad_(True)
-            cfg.decoder.input_dim = self.encoder.latent_dim
-
+        # Load encoder and decoder and make sure they are trainable
+        self.encoder = EncoderModel(cfg.encoder).train().requires_grad_(True)
+        cfg.decoder.input_dim = self.encoder.latent_dim
         self.decoder = DecoderModel(cfg.decoder).train().requires_grad_(True)
 
         # Setup dataset
@@ -146,7 +153,9 @@ class AETask(L.LightningModule):
         )
 
     def random_substitution(self, input_ids):
-        # It is important that this function is not in-place
+        """
+        Randomly subtitute token with some random word with some probablity
+        """
         input_ids = input_ids.clone()
 
         probability = torch.full_like(
@@ -158,13 +167,15 @@ class AETask(L.LightningModule):
         )
         random_words = torch.randint_like(input_ids, low=0, high=vocab_size)
 
+        # Don't sub the first token (language token in SONAR)
+        masked_indices[:, 0] = False
+
         input_ids[masked_indices] = random_words[masked_indices]
 
         return input_ids
 
     def compile(self):
-        if self.cfg.encoder != None:
-            self.encoder.compile()
+        self.encoder.compile()
         self.decoder.compile()
 
     def setup(self, **kwargs):
@@ -173,6 +184,7 @@ class AETask(L.LightningModule):
         self.val_data = Subset(self.dataset, indices=self.val_indices)
 
     def train_dataloader(self):
+        # We use a random, infinite sampler WITH replacement for convenience
         return DataLoader(
             self.train_data,
             batch_sampler=InfiniteDistributedUniformSampler(
@@ -180,9 +192,7 @@ class AETask(L.LightningModule):
             ),
             collate_fn=self.dataset.get_collate_and_tokenize_fn(
                 conditional=False,
-                enc_tokenizer=(
-                    self.encoder.tokenizer if self.cfg.encoder != None else None
-                ),
+                enc_tokenizer=self.encoder.tokenizer,
                 dec_tokenizer=self.decoder.tokenizer,
             ),
         )
@@ -192,16 +202,14 @@ class AETask(L.LightningModule):
             sampler = torch.utils.data.DistributedSampler(self.val_data, shuffle=False)
         else:
             sampler = torch.utils.data.SequentialSampler(self.val_data)
-    
+
         return DataLoader(
             self.val_data,
             batch_size=self.cfg.batch_size,
             sampler=sampler,
             collate_fn=self.dataset.get_collate_and_tokenize_fn(
                 conditional=False,
-                enc_tokenizer=(
-                    self.encoder.tokenizer if self.cfg.encoder != None else None
-                ),
+                enc_tokenizer=self.encoder.tokenizer,
                 dec_tokenizer=self.decoder.tokenizer,
             ),
         )
@@ -238,24 +246,22 @@ class AETask(L.LightningModule):
             return optimizer
 
     def training_step(self, batch, batch_idx):
-        # If there is an encoder, compute z
-        z = None
-        if self.cfg.encoder != None:
-            z = self.encoder(
-                self.random_substitution(batch["cont_ids_enc"]), batch["cont_mask_enc"]
-            )
+
+        z, dlc_probs = self.encoder(
+            self.random_substitution(batch["input_ids_enc"]),
+            batch["attention_mask_enc"],
+        )
 
         # Compute decoder likelihood of input_ids (no need for attention mask cuz causal)
-        logits = self.decoder(input_ids=batch["cont_ids_dec"], z=z)
+        logits = self.decoder(input_ids=batch["input_ids_dec"], z=z)
 
         # Compute loss
-        targets = batch["cont_ids_dec"].masked_fill(batch["cont_mask_dec"] == 0, -100)
         logits = logits[:, :-1].contiguous()
-        targets = targets[:, 1:].contiguous()
+        targets = batch["input_ids_dec"][:, 1:].contiguous()
         loss = torch.nn.functional.cross_entropy(
             logits.view(-1, logits.size(-1)),
             targets.view(-1),
-            ignore_index=-100,
+            ignore_index=self.decoder.tokenizer.pad_token_id,
         )
 
         self.log(
@@ -266,32 +272,84 @@ class AETask(L.LightningModule):
             sync_dist=True,
         )
 
+        if self.cfg.delta_ent is not None:
+            # Compute normalized entropy
+            if isinstance(dlc_probs, list):
+                norm_ent = sum(
+                    [
+                        compute_entropy(
+                            einx.rearrange("b L N V -> b L (N V)", level),
+                            normalized=True,
+                        ).mean()
+                        for level in dlc_probs
+                    ]
+                ) / len(dlc_probs)
+            else:
+                norm_ent = compute_entropy(dlc_probs, normalized=True).mean()
+
+            delta = self.cfg.delta_ent
+            # Maybe warmup entropy regularization coefficient
+            if self.cfg.delta_ent_warmup:
+                # Cosine warmup
+                if self.global_step < 15000:
+                    delta *= 0.5 * (
+                        1 - math.cos(math.pi * math.pow(self.global_step / 15000, 2))
+                    )
+
+            # Apply regularization
+            loss = loss + delta * norm_ent
+
+            self.log(
+                "train/sem_entropy",
+                norm_ent.detach().item(),
+                on_epoch=False,
+                on_step=True,
+                sync_dist=True,
+            )
+
         return loss
 
     @torch.no_grad()
     def validation_step(self, batch, batch_idx):
 
-        # If there is an encoder, compute z and potentially add noise
-        z = None
-        if self.cfg.encoder != None:
-            z = self.encoder(batch["cont_ids_enc"], batch["cont_mask_enc"])
+        z, dlc_probs = self.encoder(batch["input_ids_enc"], batch["attention_mask_enc"])
 
-            self.log(
-                "val/latent_norm",
-                z.norm(p=2, dim=-1).mean().detach().item(),
-                on_epoch=True,
-                sync_dist=True,
-            )
+        if isinstance(dlc_probs, list):
+            ent = sum(
+                [
+                    compute_entropy(
+                        einx.rearrange("b L N V -> b L (N V)", level),
+                        normalized=True,
+                    ).mean()
+                    for level in dlc_probs
+                ]
+            ) / len(dlc_probs)
+        else:
+            ent = compute_entropy(dlc_probs, normalized=True).mean()
+
+        self.log(
+            "val/sem_entropy",
+            ent.detach().item(),
+            on_epoch=True,
+            sync_dist=True,
+        )
+
+        self.log(
+            "val/latent_norm",
+            z.norm(p=2, dim=-1).mean().detach().item(),
+            on_epoch=True,
+            sync_dist=True,
+        )
 
         # Compute clean reconstruction loss
-        logits = self.decoder(batch["cont_ids_dec"], z)
-        targets = batch["cont_ids_dec"].masked_fill(batch["cont_mask_dec"] == 0, -100)
+        logits = self.decoder(input_ids=batch["input_ids_dec"], z=z)
+
         logits = logits[:, :-1].contiguous()
-        targets = targets[:, 1:].contiguous()
+        targets = batch["input_ids_dec"][:, 1:].contiguous()
         recon_loss = torch.nn.functional.cross_entropy(
             logits.view(-1, logits.size(-1)),
             targets.view(-1),
-            ignore_index=-100,
+            ignore_index=self.decoder.tokenizer.pad_token_id,
         )
         self.log("val/loss", recon_loss, on_epoch=True, sync_dist=True)
 
