@@ -13,3 +13,4 @@ venv/
 data/wikipedia-paragraphs-filtered
 hydra_logs/
 wandb/
+fineweb_tokenized/

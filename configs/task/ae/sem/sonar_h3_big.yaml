@@ -10,9 +10,9 @@ encoder:
   name: SONAR 
   sem:
     _target_: model.encoder.HSEMHead
-    L: 4
-    V: 3
-    D: 8
+    L: 32
+    V: 48
+    D: 2
     dirichlet_eta: 0.00
     temp: 0.5
 

@@ -1,2 +1,2 @@
-_target_: data.wiki.WikipediaDataset
+_target_: data.datasets.WikipediaDataset
 max_length: 150

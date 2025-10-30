@@ -12,7 +12,8 @@
             "console": "integratedTerminal",
             "justMyCode": false,
             "args": [
-                "--wandb_id=5qnx3646"
+                "task/ae=sem/sonar",
+                "num_devices=1"
             ],
         }
     ]

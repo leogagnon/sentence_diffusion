@@ -27,6 +27,30 @@ from lightning.pytorch.utilities.rank_zero import rank_zero_info
 from einops import rearrange
 from torch.utils.checkpoint import checkpoint
 import hydra
+from torch.distributions import Gamma
+
+def sem_dirichlet_noise(z, eta=1.0, eps=1e-3):
+    """
+    Add Dirichlet noise to SEM probabilities.
+
+    Args:
+        z: Tensor [B, L, V] (already softmaxed, each simplex sums to 1)
+        eta: target relative std at uniform (η/V ≈ std)
+             smaller η -> stronger noise (discourages fine variations)
+        eps: small constant for numerical stability
+
+    Returns:
+        z_tilde: noisy probabilities, same shape as z
+    """
+    B, L, V = z.shape
+    # Compute kappa from target η using the uniform variance formula
+    # Var ≈ 1 / [V * (kappa + 1)]  =>  κ ≈ V / η² - 1
+    kappa = max(V / (eta ** 2) - 1.0, 1e-3)
+
+    alpha = kappa * z + eps
+    g = Gamma(alpha, torch.ones_like(alpha)).rsample()  # reparameterized Dirichlet
+    z_tilde = g / g.sum(dim=-1, keepdim=True)
+    return z_tilde.clamp_min(1e-8)
 
 
 @dataclass
@@ -34,6 +58,7 @@ class SEMHeadConfig:
     L: int
     V: int
     temp: float
+    dirichlet_eta: float = 0.0
     l2_norm: bool = False
     input_dim: Optional[int] = None
 
@@ -62,6 +87,9 @@ class SEMHead(nn.Module):
         x = einx.rearrange("b (l v) -> b l v", x, l=self.cfg.L, v=self.cfg.V)
         probs = torch.softmax(x / self.cfg.temp, dim=-1)
 
+        if (self.cfg.dirichlet_eta > 0.0) and self.training:
+            probs = sem_dirichlet_noise(probs, self.cfg.dirichlet_eta)
+
         # Compute output
         out = einx.rearrange("b l v -> b (l v)", probs)
         out = self.proj_out(out)
@@ -85,6 +113,7 @@ class HSEMHeadConfig:
     V: int
     D: int
     temp: float
+    dirichlet_eta: float = 0.0
     input_dim: Optional[int] = None
 
 
@@ -136,7 +165,13 @@ class HSEMHead(nn.Module):
             # Update parent and go down a level
             parent_probs = einx.rearrange("b L n V -> b L (n V)", level)
             start = end
-        
+
+        if (self.cfg.dirichlet_eta > 0.0) and self.training:
+            probs = [
+                sem_dirichlet_noise(level_probs, self.cfg.dirichlet_eta)
+                for level_probs in probs
+            ]
+
         # Compute output
         out = torch.cat(probs, dim=2)
         out = einx.rearrange("b L N V -> b (L N V)", out)

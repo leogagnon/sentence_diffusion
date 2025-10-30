@@ -3,7 +3,7 @@ lr: 1e-4
 lr_warmup: true
 val_size: 16384
 sub_p: 0.3
-delta_ent: null
+delta_ent: 0.0
 delta_ent_warmup: False
 
 encoder:
@@ -12,6 +12,7 @@ encoder:
     _target_: model.encoder.HSEMHead
     L: 8
     V: 8
+    dirichlet_eta: 0.00
     D: 4
     temp: 0.5
 

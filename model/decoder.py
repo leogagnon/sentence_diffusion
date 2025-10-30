@@ -171,11 +171,11 @@ class DecoderModel(nn.Module):
                 gen_cfg_dlc = {
                     "max_new_tokens": dlc_len + 1,  # 32-token DLC + closing <|bos|>
                     "do_sample": True,
-                    "top_p": 0.92,
+                    "top_p": 1.0,
                     "top_k": 50,
                     "num_beams": 1,
                     "temperature": 1.0,
-                    "return_dict_in_generate": False,
+                    "return_dict_in_generate": True,
                     "pad_token_id": self.tokenizer.pad_token_id,
                     "eos_token_id": self.tokenizer.bos_token_id,
                     "use_cache": True
@@ -187,7 +187,7 @@ class DecoderModel(nn.Module):
                 dlc = self.backbone.generate(
                     input_ids=think_token,
                     generation_config=GenerationConfig(**gen_cfg_dlc)
-                )
+                ).sequences
 
                 # Remove closing <|bos|>, will be re-added for continuation generation
                 dlc = dlc[:, :-1]
@@ -231,11 +231,11 @@ class DecoderModel(nn.Module):
         gen_cfg = {
             "max_new_tokens": max_length,  # 32-token DLC + closing <|bos|>
             "do_sample": True,
-            "top_p": 0.92,
+            "top_p": 1.0,
             "top_k": 50,
             "num_beams": 1,
             "temperature": 1.0,
-            "return_dict_in_generate": False,
+            "return_dict_in_generate": True,
             "pad_token_id": self.tokenizer.pad_token_id,
             "eos_token_id": self.tokenizer.eos_token_id,
             "use_cache": True
@@ -249,6 +249,6 @@ class DecoderModel(nn.Module):
             past_key_values=cache,
             cache_position=cache_position,
             attention_mask=attention_mask
-        )
+        ).sequences
 
         return output

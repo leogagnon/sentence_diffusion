@@ -1,7 +1,7 @@
 defaults:
   - submitit_slurm
 
-mem_gb: 128
+mem_gb: 256
 gpus_per_node: 4
 array_parallelism: 32
 nodes: 1 

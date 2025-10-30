@@ -14,7 +14,7 @@ from torch.utils.data.dataset import Subset
 from transformers import AutoTokenizer
 from transformers.models.auto.modeling_auto import AutoModelForCausalLM
 from peft import get_peft_model
-from data.stories import StoriesDatasetConfig, StoriesDataset
+from data.datasets import StoriesDatasetConfig, StoriesDataset
 from hydra.utils import instantiate
 from model.encoder import EncoderConfig, EncoderModel
 from model.decoder import DecoderConfig, DecoderModel
@@ -23,12 +23,12 @@ import wandb
 import hydra
 from lightning.pytorch.utilities.rank_zero import rank_zero_info, rank_zero_only
 from tasks.autoencoder import AETask, InfiniteDistributedUniformSampler
-from data.wiki import WikipediaDataset
+from data.datasets import WikipediaDataset
 from tqdm import tqdm
 from mauve import compute_mauve, get_features_from_input
 import einx
 from transformers import get_constant_schedule_with_warmup
-from data.wiki import DATA_SEED, InfoLabel
+from data.datasets import DATA_SEED, InfoLabel
 
 
 @dataclass
@@ -38,6 +38,7 @@ class DLCLMTaskConfig:
     batch_size: int
     pretrained_ae_id: str
     pure_ar_baseline: bool = False
+    conditional: bool = False
 
     # If not giving pretrained_ae_id
     decoder: Optional[DecoderConfig] = None
@@ -70,9 +71,10 @@ class DLCLMTask(L.LightningModule):
                 cfg.pretrained_ae_id,
                 "last.ckpt",
             ),
-            strict=True,
+            strict=False,
             map_location=torch.device("cpu"),
         )
+
         self.train_indices = ae_task.train_indices
         self.val_indices = ae_task.val_indices
         self.dataset = ae_task.dataset
@@ -173,7 +175,7 @@ class DLCLMTask(L.LightningModule):
                 n=len(self.train_data), batch_size=self.cfg.batch_size
             ),
             collate_fn=self.dataset.get_collate_and_tokenize_fn(
-                conditional=False,
+                conditional=self.cfg.conditional,
                 dlc_encoder=self.encoder if hasattr(self, "encoder") else None,
                 dec_tokenizer=self.decoder.tokenizer,
             ),
@@ -189,7 +191,7 @@ class DLCLMTask(L.LightningModule):
             batch_size=self.cfg.batch_size,
             sampler=sampler,
             collate_fn=self.dataset.get_collate_and_tokenize_fn(
-                conditional=False,
+                conditional=self.cfg.conditional,
                 dlc_encoder=self.encoder if hasattr(self, "encoder") else None,
                 dec_tokenizer=self.decoder.tokenizer,
             ),
@@ -224,14 +226,15 @@ class DLCLMTask(L.LightningModule):
         )
 
         # p(x|z) only, more like the reconstruction loss
-        cond_loss = loss[info_mask_dec == InfoLabel.CONT.value].mean()
-        self.log(
-            "train/cond_loss",
-            cond_loss,
-            on_epoch=False,
-            on_step=True,
-            sync_dist=True,
-        )
+        if not self.cfg.pure_ar_baseline:
+            cond_loss = loss[info_mask_dec == InfoLabel.CONT.value].mean()
+            self.log(
+                "train/cond_loss",
+                cond_loss,
+                on_epoch=False,
+                on_step=True,
+                sync_dist=True,
+            )
 
         return full_loss
 
@@ -259,8 +262,8 @@ class DLCLMTask(L.LightningModule):
         self.log(
             "val/full_loss",
             full_loss,
-            on_epoch=False,
-            on_step=True,
+            on_epoch=True,
+            on_step=False,
             sync_dist=True,
         )
 
@@ -270,47 +273,48 @@ class DLCLMTask(L.LightningModule):
             self.log(
                 "val/cond_loss",
                 cond_loss,
-                on_epoch=False,
-                on_step=True,
+                on_epoch=True,
+                on_step=False,
                 sync_dist=True,
             )
 
         if (
             (batch_idx == 0)
             and (rank_zero_only.rank == 0)
-            and (not self.cfg.pure_ar_baseline)
         ):
-            # Reconstruct text from DLC
-            dlc = torch.stack(
-                [
-                    batch["input_ids_dec"][i][
-                        batch["info_mask_dec"][i] == InfoLabel.DLC.value
-                    ]
-                    for i in range(5)
-                ]
-            )
-            reconstruction = self.decoder.tokenizer.batch_decode(
-                self.decoder.generate(
-                    dlc=dlc,
-                    max_length=self.dataset.cfg.max_length,
-                ),
-                skip_special_tokens=True,
-            )
-
-            # Put in table and log
-            table_clean = wandb.Table(columns=["Original", "Reconstructed"])
-            for original, reconstructed in zip(
-                batch["input_str"][:5],
-                reconstruction,
-            ):
-                table_clean.add_data(original, reconstructed)
-            wandb.log({"val/clean_samples": table_clean})
-            del table_clean
-
             # Log MAUVE score every 5 validation steps (takes a few minutes)
             if self.val_epoch_counter % 5 == 0:
                 mauve = self.eval_mauve()
                 wandb.log({"val/MAUVE": mauve})
+                torch.cuda.empty_cache()
+
+            if not self.cfg.pure_ar_baseline:
+                # Reconstruct text from DLC
+                dlc = torch.stack(
+                    [
+                        batch["input_ids_dec"][i][
+                            batch["info_mask_dec"][i] == InfoLabel.DLC.value
+                        ]
+                        for i in range(5)
+                    ]
+                )
+                reconstruction = self.decoder.tokenizer.batch_decode(
+                    self.decoder.generate(
+                        dlc=dlc,
+                        max_length=self.dataset.cfg.max_length,
+                    ),
+                    skip_special_tokens=True,
+                )
+
+                # Put in table and log
+                table_clean = wandb.Table(columns=["Original", "Reconstructed"])
+                for original, reconstructed in zip(
+                    batch["input_str"][:5],
+                    reconstruction,
+                ):
+                    table_clean.add_data(original, reconstructed)
+                wandb.log({"val/clean_samples": table_clean})
+                del table_clean
 
     def eval_mauve(
         self,
@@ -338,7 +342,7 @@ class DLCLMTask(L.LightningModule):
                                 else None
                             ),
                             gen_kwargs=gen_kwargs,
-                            gen_kwargs_dlc=gen_kwargs_dlc
+                            gen_kwargs_dlc=gen_kwargs_dlc,
                         ),
                         skip_special_tokens=True,
                     )

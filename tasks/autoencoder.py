@@ -14,7 +14,6 @@ from torch.utils.data.dataset import Subset
 from transformers import AutoTokenizer
 from transformers.models.auto.modeling_auto import AutoModelForCausalLM
 from peft import get_peft_model
-from data.stories import StoriesDatasetConfig, StoriesDataset
 from hydra.utils import instantiate
 from model.encoder import EncoderConfig, EncoderModel
 from model.decoder import DecoderConfig, DecoderModel
@@ -25,7 +24,7 @@ from lightning.pytorch.utilities.rank_zero import rank_zero_info, rank_zero_only
 from tqdm import tqdm
 from mauve import compute_mauve, get_features_from_input
 from transformers import get_constant_schedule_with_warmup
-from data.wiki import DATA_SEED
+from data.datasets import DATA_SEED
 import einx
 import os
 import torch
@@ -108,7 +107,7 @@ class AETaskConfig:
     val_size: int
     lr_warmup: bool = False
     sub_p: float = 0.3
-    delta_ent: Optional[float] = None
+    delta_ent: float = 0.0
     delta_ent_warmup: bool = False
 
     name: Optional[str] = None
@@ -272,23 +271,34 @@ class AETask(L.LightningModule):
             sync_dist=True,
         )
 
-        if self.cfg.delta_ent is not None:
+        if self.cfg.delta_ent > 0.0:
             # Compute normalized entropy
             if isinstance(dlc_probs, list):
-                norm_ent = sum(
+                # Flatten levels l1 = p(x_0), l2 = p(x_0, x_1), ...
+                levels = [einx.rearrange("b L N V -> b L (N V)", l) for l in dlc_probs]
+                ent_penalty = sum(
                     [
                         compute_entropy(
-                            einx.rearrange("b L N V -> b L (N V)", level),
+                            level,
                             normalized=True,
                         ).mean()
-                        for level in dlc_probs
+                        for level in levels
                     ]
-                ) / len(dlc_probs)
+                ) / len(levels)
+                marginal_ent_penalty = sum(
+                    [
+                        1 - compute_entropy(level.mean(0), normalized=True).mean()
+                        for level in levels
+                    ]
+                ) / len(levels)
             else:
-                norm_ent = compute_entropy(dlc_probs, normalized=True).mean()
+                ent_penalty = compute_entropy(dlc_probs, normalized=True).mean()
+                marginal_ent_penalty = (
+                    1 - compute_entropy(dlc_probs.mean(0), normalized=True).mean()
+                )
 
+            # Compute coefficient
             delta = self.cfg.delta_ent
-            # Maybe warmup entropy regularization coefficient
             if self.cfg.delta_ent_warmup:
                 # Cosine warmup
                 if self.global_step < 15000:
@@ -297,15 +307,7 @@ class AETask(L.LightningModule):
                     )
 
             # Apply regularization
-            loss = loss + delta * norm_ent
-
-            self.log(
-                "train/sem_entropy",
-                norm_ent.detach().item(),
-                on_epoch=False,
-                on_step=True,
-                sync_dist=True,
-            )
+            loss = loss + delta * (ent_penalty + marginal_ent_penalty)
 
         return loss
 
