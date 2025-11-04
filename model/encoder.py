@@ -250,7 +250,7 @@ class SONARTransformer(nn.Module):
 @dataclass
 class EncoderConfig:
     name: str
-    sem: dict
+    sem: Optional[dict] = None
     lora_cfg: Optional[dict] = None
     dropout_p: float = 0.0
     train: bool = True
@@ -302,9 +302,10 @@ class EncoderModel(nn.Module):
                 "Tried to use flash attention in encoder, but it is not available."
             )
 
-        cfg.sem["input_dim"] = self.latent_dim
-        self.sem = hydra.utils.instantiate(cfg.sem)
-        self.sem: SEMHead | HSEMHead
+        if cfg.sem is not None:
+            cfg.sem["input_dim"] = self.latent_dim
+            self.sem = hydra.utils.instantiate(cfg.sem)
+            self.sem: SEMHead | HSEMHead
 
         if cfg.lora_cfg != None:
             self.transformer = get_peft_model(
@@ -316,7 +317,8 @@ class EncoderModel(nn.Module):
 
     def compile(self):
         # Only compile the SEM
-        self.sem.compile()
+        if self.cfg.sem is not None:
+            self.sem.compile()
 
     @property
     def latent_dim(self):
@@ -337,6 +339,9 @@ class EncoderModel(nn.Module):
         sentence_embedding = batch["sentence_embedding"]
 
         # Run through SEM
-        x_out, x_intern = self.sem(sentence_embedding, return_dlc=return_dlc, step=step)
-        x_out = x_out[:, None]
-        return x_out, x_intern
+        if self.cfg.sem is not None:
+            x_out, x_intern = self.sem(sentence_embedding, return_dlc=return_dlc, step=step)
+            x_out = x_out[:, None]
+            return x_out, x_intern
+        else:
+            return sentence_embedding

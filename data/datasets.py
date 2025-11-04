@@ -29,13 +29,16 @@ class InfoLabel(Enum):
 def collate_fn(
     batch,
     max_length,
-    dec_tokenizer: PreTrainedTokenizerFast,
+    dec_tokenizer: Optional[PreTrainedTokenizerFast] = None,
     enc_tokenizer: Optional[PreTrainedTokenizerFast] = None,
+    teacher_tokenizer: Optional[PreTrainedTokenizerFast] = None,
     dlc_encoder: Optional[EncoderModel] = None,
 ):
+    out = {}
 
     # Compute the input_ids for the decoder
     if "input_ids" in batch:
+        assert dec_tokenizer is not None
         lens = torch.Tensor([len(x) for x in batch["input_ids"]])
         window_len = torch.randint(
             low=32, high=max_length - 32, size=(len(batch["input_ids"]),)
@@ -56,65 +59,76 @@ def collate_fn(
         )["input_ids"]
         input_str = dec_tokenizer.batch_decode(input_ids_dec, skip_special_tokens=True)
     elif "input_str" in batch:
-        input_ids_dec = dec_tokenizer.batch_encode_plus(
-            batch["input_str"],
-            truncation=True,
-            padding="max_length",
-            max_length=max_length,
-            return_tensors="pt",
-            add_special_tokens=True,
-            return_attention_mask=False,
-        )["input_ids"]
+        if dec_tokenizer is None:
+            input_ids_dec = dec_tokenizer.batch_encode_plus(
+                batch["input_str"],
+                truncation=True,
+                padding="max_length",
+                max_length=max_length,
+                return_tensors="pt",
+                add_special_tokens=True,
+                return_attention_mask=False,
+            )["input_ids"]
+        else:
+            input_ids_dec = None
         input_str = batch["input_str"]
+    
+    out.update({"input_str": input_str})
 
-    if dlc_encoder is None:
-        info_mask_dec = torch.full_like(
-            input_ids_dec, fill_value=InfoLabel.CONT.value, dtype=torch.int32
-        )
-        info_mask_dec[input_ids_dec == dec_tokenizer.pad_token_id] = InfoLabel.PAD.value
-    else:
-        device = dlc_encoder.transformer.auto_model.device
-        # Compute DLC
-        batch_enc = dlc_encoder.tokenizer.batch_encode_plus(
-            input_str,
-            truncation=True,
-            padding="max_length",
-            max_length=max_length,
-            return_tensors="pt",
-        ).to(device=device)
-        dlc_ids = dlc_encoder(
-            batch_enc["input_ids"],
-            batch_enc["attention_mask"].bool(),
-            return_dlc=True,
-        )[1] + len(dec_tokenizer)
+    if dec_tokenizer is not None:
+        if dlc_encoder is None:
+            info_mask_dec = torch.full_like(
+                input_ids_dec, fill_value=InfoLabel.CONT.value, dtype=torch.int32
+            )
+            info_mask_dec[input_ids_dec == dec_tokenizer.pad_token_id] = (
+                InfoLabel.PAD.value
+            )
+        else:
+            device = dlc_encoder.transformer.auto_model.device
+            # Compute DLC
+            batch_enc = dlc_encoder.tokenizer.batch_encode_plus(
+                input_str,
+                truncation=True,
+                padding="max_length",
+                max_length=max_length,
+                return_tensors="pt",
+            ).to(device=device)
+            dlc_ids = dlc_encoder(
+                batch_enc["input_ids"],
+                batch_enc["attention_mask"].bool(),
+                return_dlc=True,
+            )[1] + len(dec_tokenizer)
 
-        # Preprend "<|think|> DLC" to input_ids_dec
-        think_token = torch.full(
-            size=(dlc_ids.shape[0], 1),
-            fill_value=dec_tokenizer.think_token_id,
-            dtype=dlc_ids.dtype,
-            device=device,
-        )
-        input_ids_dec = torch.cat(
-            [think_token, dlc_ids, input_ids_dec.to(device=device)], dim=1
-        )
+            # Preprend "<|think|> DLC" to input_ids_dec
+            think_token = torch.full(
+                size=(dlc_ids.shape[0], 1),
+                fill_value=dec_tokenizer.think_token_id,
+                dtype=dlc_ids.dtype,
+                device=device,
+            )
+            input_ids_dec = torch.cat(
+                [think_token, dlc_ids, input_ids_dec.to(device=device)], dim=1
+            )
 
-        # Build the info mask
-        info_mask_dec = torch.full_like(
-            input_ids_dec,
-            fill_value=InfoLabel.CONT.value,
-            dtype=torch.int32,
-            device=device,
-        )
-        info_mask_dec[input_ids_dec == dec_tokenizer.pad_token_id] = InfoLabel.PAD.value
-        info_mask_dec[:, : dlc_ids.shape[1] + 1] = InfoLabel.DLC.value
-        info_mask_dec[:, 0] = InfoLabel.PROMPT.value
+            # Build the info mask
+            info_mask_dec = torch.full_like(
+                input_ids_dec,
+                fill_value=InfoLabel.CONT.value,
+                dtype=torch.int32,
+                device=device,
+            )
+            info_mask_dec[input_ids_dec == dec_tokenizer.pad_token_id] = (
+                InfoLabel.PAD.value
+            )
+            info_mask_dec[:, : dlc_ids.shape[1] + 1] = InfoLabel.DLC.value
+            info_mask_dec[:, 0] = InfoLabel.PROMPT.value
 
-    out = {
-        "input_ids_dec": input_ids_dec,
-        "info_mask_dec": info_mask_dec,
-        "input_str": input_str,
-    }
+        out.update(
+            {
+                "input_ids_dec": input_ids_dec,
+                "info_mask_dec": info_mask_dec,
+            }
+        )
 
     # Compute the input ids for the encoder if any
     if enc_tokenizer is not None:
@@ -129,6 +143,22 @@ def collate_fn(
             {
                 "input_ids_enc": batch_enc["input_ids"],
                 "attention_mask_enc": batch_enc["attention_mask"].bool(),
+            }
+        )
+
+    # Compute the input ids for the teacher encoder if any
+    if teacher_tokenizer is not None:
+        batch_teacher = teacher_tokenizer.batch_encode_plus(
+            input_str,
+            truncation=True,
+            padding="max_length",
+            max_length=max_length,
+            return_tensors="pt",
+        )
+        out.update(
+            {
+                "input_ids_teacher": batch_teacher["input_ids"],
+                "attention_mask_teacher": batch_teacher["attention_mask"].bool(),
             }
         )
 
