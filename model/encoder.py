@@ -30,6 +30,7 @@ import hydra
 from torch.distributions import Gamma
 from entmax import entmax15
 
+
 def sem_dirichlet_noise(z, eta=1.0, eps=1e-3):
     """
     Add Dirichlet noise to SEM probabilities.
@@ -46,7 +47,7 @@ def sem_dirichlet_noise(z, eta=1.0, eps=1e-3):
     B, L, V = z.shape
     # Compute kappa from target η using the uniform variance formula
     # Var ≈ 1 / [V * (kappa + 1)]  =>  κ ≈ V / η² - 1
-    kappa = max(V / (eta ** 2) - 1.0, 1e-3)
+    kappa = max(V / (eta**2) - 1.0, 1e-3)
 
     alpha = kappa * z + eps
     g = Gamma(alpha, torch.ones_like(alpha)).rsample()  # reparameterized Dirichlet
@@ -106,9 +107,7 @@ class SEMHead(nn.Module):
         if (self.cfg.postsoft_noise > 0.0) and self.training:
             sigma = self.cfg.postsoft_noise
             if step < 15000:
-                sigma *= 0.5 * (
-                            1 - math.cos(math.pi * math.pow(step / 15000, 2))
-                        )
+                sigma *= 0.5 * (1 - math.cos(math.pi * math.pow(step / 15000, 2)))
             eta = torch.randn_like(probs) * sigma
             probs = probs * (1 + eta)
             probs = torch.clamp(probs, 1e-6, None)
@@ -276,7 +275,7 @@ class EncoderModel(nn.Module):
             self._latent_dim = self.transformer.get_sentence_embedding_dimension()
         else:
             backbone = sentence_transformers.SentenceTransformer(
-                cfg.name,
+                cfg.name, #model_kwargs={"attn_implementation": "flash_attention_2"}
             )
 
             self.transformer = backbone[0]
@@ -340,7 +339,9 @@ class EncoderModel(nn.Module):
 
         # Run through SEM
         if self.cfg.sem is not None:
-            x_out, x_intern = self.sem(sentence_embedding, return_dlc=return_dlc, step=step)
+            x_out, x_intern = self.sem(
+                sentence_embedding, return_dlc=return_dlc, step=step
+            )
             x_out = x_out[:, None]
             return x_out, x_intern
         else:

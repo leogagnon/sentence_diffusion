@@ -1,0 +1,17 @@
+defaults:
+  - submitit_slurm
+
+mem_gb: 256
+gres: gpu:h100:4
+array_parallelism: 32
+nodes: 1 
+tasks_per_node: 4
+cpus_per_task: 4
+timeout_min: 719 # 360
+account: rrg-bengioy-ad
+additional_parameters:
+  no-requeue: true
+
+setup:
+  - "export NCCL_DEBUG=INFO"
+  - "source ~/sentence_diffusion/venv/bin/activate"

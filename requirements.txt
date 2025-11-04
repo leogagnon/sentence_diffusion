@@ -13,3 +13,9 @@ ipykernel
 hydra-submitit-launcher
 einx
 einops
+matplotlib
+pandas
+datasets
+entmax
+flash-attn
+triton

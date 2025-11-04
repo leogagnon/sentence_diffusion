@@ -11,10 +11,11 @@ from lightning.pytorch.loggers import WandbLogger
 from omegaconf import MISSING, DictConfig, OmegaConf, SCMode
 from tasks.autoencoder import AETask, AETaskConfig
 from tasks.dlclm import DLCLMTask, DLCLMTaskConfig
+from tasks.distill_cse import DCSETask, DCSETaskConfig
 from lightning.pytorch.callbacks import EarlyStopping
 from lightning.pytorch.utilities.rank_zero import rank_zero_info, rank_zero_only
 
-torch.set_float32_matmul_precision("medium")
+torch.backends.cudnn.conv.fp32_precision = 'tf32'
 torch._dynamo.config.capture_scalar_outputs = True
 
 
@@ -22,6 +23,7 @@ torch._dynamo.config.capture_scalar_outputs = True
 class TaskConfig:
     ae: Optional[AETaskConfig] = None
     dlclm: Optional[DLCLMTaskConfig] = None
+    distill_cse: Optional[DCSETaskConfig] = None
 
 
 @dataclass
@@ -115,12 +117,21 @@ def main(cfg: Optional[TrainConfig] = None, run_id: Optional[str] = None):
         run = wandb.Api().run(
             f"guillaume-lajoie/dlc_lm/{cfg.task.dlclm.pretrained_ae_id}"
         )
-        cfg.task.ae = OmegaConf.merge(
-            OmegaConf.structured(AETaskConfig), run.config["task"]["ae"]
-        )
+        if "ae" in run.config["task"]:
+            cfg.task.ae = OmegaConf.merge(
+                OmegaConf.structured(AETaskConfig), run.config["task"]["ae"]
+            )
+        elif "distill_cse" in run.config["task"]:
+            cfg.task.distill_cse = OmegaConf.merge(
+                OmegaConf.structured(DCSETaskConfig),
+                run.config["task"]["distill_cse"],
+            )
     elif cfg.task.ae != None:
         task = AETask(cfg.task.ae)
         cfg.task.ae = task.cfg
+    elif cfg.task.distill_cse != None:
+        task = DCSETask(cfg.task.distill_cse)
+        cfg.task.distill_cse = task.cfg
     else:
         raise ValueError("No task specified in config!")
 

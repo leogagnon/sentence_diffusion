@@ -8,7 +8,6 @@ from typing import Any, List, Optional
 from peft import LoraConfig
 import torch
 import random
-import numpy as np
 from torch.utils.data import DataLoader, random_split
 from torch.utils.data.dataset import Subset
 from transformers import AutoTokenizer
@@ -33,11 +32,10 @@ from copy import deepcopy
 import torch.nn.functional as F
 
 
-def cosine_sim_mat(x, y):
+def cosine_sim_mat(x):
     # x: [B, D], y: [B, D]
-    x = F.normalize(x, p=2, dim=-1)
-    y = F.normalize(y, p=2, dim=-1)
-    return x @ y.T
+    x_ = F.normalize(x, p=2, dim=-1)
+    return x_ @ x_.T
 
 
 @dataclass
@@ -49,6 +47,7 @@ class DCSETaskConfig:
     dataset: dict
     val_size: int
     lr_warmup: bool = False
+    temp: float = 0.01
 
     name: Optional[str] = None
 
@@ -96,7 +95,7 @@ class DCSETask(L.LightningModule):
         if hasattr(self, "encoder"):
             self.teacher.eval()
         return self
-    
+
     def compile(self):
         self.encoder.compile()
 
@@ -115,6 +114,7 @@ class DCSETask(L.LightningModule):
             collate_fn=self.dataset.get_collate_and_tokenize_fn(
                 conditional=False,
                 enc_tokenizer=self.encoder.tokenizer,
+                teacher_tokenizer=self.teacher.tokenizer,
             ),
         )
 
@@ -131,6 +131,7 @@ class DCSETask(L.LightningModule):
             collate_fn=self.dataset.get_collate_and_tokenize_fn(
                 conditional=False,
                 enc_tokenizer=self.encoder.tokenizer,
+                teacher_tokenizer=self.teacher.tokenizer,
             ),
         )
 
@@ -175,22 +176,29 @@ class DCSETask(L.LightningModule):
 
         with torch.no_grad():
             z_teacher = self.teacher(
-                batch["input_ids_enc"],
-                batch["attention_mask_enc"],
+                batch["input_ids_teacher"],
+                batch["attention_mask_teacher"],
                 step=self.global_step,
             )
 
-        enc_sim = cosine_sim_mat(z_enc, z_enc).fill_diagonal_(-torch.inf)
-        teacher_sim = cosine_sim_mat(z_teacher, z_teacher).fill_diagonal_(-torch.inf)
+        enc_sim = cosine_sim_mat(z_enc.squeeze(1))
+        teacher_sim = cosine_sim_mat(z_teacher.squeeze(1))
 
+        # Remove the diagonal elements (self-similarity)
+        N = enc_sim.size(0)
+        offdiag_mask = ~torch.eye(N, dtype=bool)
+        enc_sim = enc_sim[offdiag_mask].reshape(N, N-1)
+        teacher_sim = teacher_sim[offdiag_mask].reshape(N, N-1)
+
+        # Loss is cross-entropy between teacher and student similarity distributions
         loss = -(
-            torch.softmax(teacher_sim / 0.01, dim=-1)
-            * torch.log_softmax(enc_sim / 0.01, dim=1).fill_diagonal_(0.0)
-        )
+            torch.softmax(teacher_sim / self.cfg.temp, dim=-1)
+            * torch.log_softmax(enc_sim / self.cfg.temp, dim=1)
+        ).mean(-1).mean()
 
         self.log(
             "train/loss",
-            loss.mean(),
+            loss,
             on_epoch=False,
             on_step=True,
             sync_dist=True,
@@ -209,18 +217,25 @@ class DCSETask(L.LightningModule):
 
         with torch.no_grad():
             z_teacher = self.teacher(
-                batch["input_ids_enc"],
-                batch["attention_mask_enc"],
+                batch["input_ids_teacher"],
+                batch["attention_mask_teacher"],
                 step=self.global_step,
             )
 
-        enc_sim = cosine_sim_mat(z_enc, z_enc).fill_diagonal_(-torch.inf)
-        teacher_sim = cosine_sim_mat(z_teacher, z_teacher).fill_diagonal_(-torch.inf)
+        enc_sim = cosine_sim_mat(z_enc.squeeze(1))
+        teacher_sim = cosine_sim_mat(z_teacher.squeeze(1))
 
+        # Remove the diagonal elements (self-similarity)
+        N = enc_sim.size(0)
+        offdiag_mask = ~torch.eye(N, dtype=bool)
+        enc_sim = enc_sim[offdiag_mask].reshape(N, N-1)
+        teacher_sim = teacher_sim[offdiag_mask].reshape(N, N-1)
+
+        # Loss is cross-entropy between teacher and student similarity distributions
         loss = -(
-            torch.softmax(teacher_sim / 0.01, dim=-1)
-            * torch.log_softmax(enc_sim / 0.01, dim=1).fill_diagonal_(0.0)
-        )
+            torch.softmax(teacher_sim / self.cfg.temp, dim=-1)
+            * torch.log_softmax(enc_sim / self.cfg.temp, dim=1)
+        ).mean(-1).mean()
 
         self.log("val/loss", loss, on_epoch=True, sync_dist=True)
 

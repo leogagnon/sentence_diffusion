@@ -59,7 +59,7 @@ def collate_fn(
         )["input_ids"]
         input_str = dec_tokenizer.batch_decode(input_ids_dec, skip_special_tokens=True)
     elif "input_str" in batch:
-        if dec_tokenizer is None:
+        if dec_tokenizer is not None:
             input_ids_dec = dec_tokenizer.batch_encode_plus(
                 batch["input_str"],
                 truncation=True,
@@ -72,7 +72,7 @@ def collate_fn(
         else:
             input_ids_dec = None
         input_str = batch["input_str"]
-    
+
     out.update({"input_str": input_str})
 
     if dec_tokenizer is not None:
@@ -260,7 +260,12 @@ class WikipediaDataset(Dataset):
         self.cfg = cfg
 
     def get_collate_and_tokenize_fn(
-        self, conditional: bool, dec_tokenizer, enc_tokenizer=None, dlc_encoder=None
+        self,
+        conditional: bool,
+        dec_tokenizer=None,
+        enc_tokenizer=None,
+        dlc_encoder=None,
+        teacher_tokenizer=None,
     ):
         f = collate_fn_conditional if conditional else collate_fn
         f = partial(
@@ -269,6 +274,7 @@ class WikipediaDataset(Dataset):
             dec_tokenizer=dec_tokenizer,
             enc_tokenizer=enc_tokenizer,
             dlc_encoder=dlc_encoder,
+            teacher_tokenizer=teacher_tokenizer,
         )
         return f
 
@@ -291,11 +297,18 @@ class FineWebDataset(Dataset):
     def __init__(self, cfg: Optional[FineWebDatasetConfig] = None, **kwargs):
         if cfg == None:
             cfg = FineWebDatasetConfig(**kwargs)
-        self.dataset = load_from_disk("data/fineweb_tokenized")
+        self.dataset = load_dataset(
+            "leogagnon/fineweb_100BT_tokenized_gpt2", split="train"
+        )
         self.cfg = cfg
 
     def get_collate_and_tokenize_fn(
-        self, conditional: bool, dec_tokenizer, enc_tokenizer=None, dlc_encoder=None
+        self,
+        conditional: bool,
+        dec_tokenizer=None,
+        enc_tokenizer=None,
+        dlc_encoder=None,
+        teacher_tokenizer=None,
     ):
         f = collate_fn_conditional if conditional else collate_fn
         f = partial(
@@ -304,6 +317,7 @@ class FineWebDataset(Dataset):
             dec_tokenizer=dec_tokenizer,
             enc_tokenizer=enc_tokenizer,
             dlc_encoder=dlc_encoder,
+            teacher_tokenizer=teacher_tokenizer,
         )
         return f
 
