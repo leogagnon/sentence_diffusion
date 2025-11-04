@@ -28,6 +28,7 @@ from einops import rearrange
 from torch.utils.checkpoint import checkpoint
 import hydra
 from torch.distributions import Gamma
+from entmax import entmax15
 
 def sem_dirichlet_noise(z, eta=1.0, eps=1e-3):
     """
@@ -59,6 +60,10 @@ class SEMHeadConfig:
     V: int
     temp: float
     dirichlet_eta: float = 0.0
+    noise_delta: float = 0.0
+    scale_noise: bool = False
+    postsoft_noise: float = 0.0
+    entmax: bool = False
     l2_norm: bool = False
     input_dim: Optional[int] = None
 
@@ -80,12 +85,34 @@ class SEMHead(nn.Module):
     def dlc_len(self):
         return self.cfg.L
 
-    def forward(self, x, return_dlc=False):
+    def forward(self, x, return_dlc=False, step=None):
         # Compute DLC probs
         x = self.proj_in(x)
         x = self.norm(x)
         x = einx.rearrange("b (l v) -> b l v", x, l=self.cfg.L, v=self.cfg.V)
-        probs = torch.softmax(x / self.cfg.temp, dim=-1)
+
+        if self.cfg.noise_delta > 0.0:
+            if self.cfg.scale_noise:
+                std = x.detach().std(dim=-1, keepdim=True)
+            else:
+                std = 1.0
+            x = x + self.cfg.noise_delta * std * torch.randn_like(x)
+
+        if self.cfg.entmax:
+            probs = entmax15(x / self.cfg.temp, dim=-1)
+        else:
+            probs = torch.softmax(x / self.cfg.temp, dim=-1)
+
+        if (self.cfg.postsoft_noise > 0.0) and self.training:
+            sigma = self.cfg.postsoft_noise
+            if step < 15000:
+                sigma *= 0.5 * (
+                            1 - math.cos(math.pi * math.pow(step / 15000, 2))
+                        )
+            eta = torch.randn_like(probs) * sigma
+            probs = probs * (1 + eta)
+            probs = torch.clamp(probs, 1e-6, None)
+            probs = probs / probs.sum(dim=-1, keepdim=True)
 
         if (self.cfg.dirichlet_eta > 0.0) and self.training:
             probs = sem_dirichlet_noise(probs, self.cfg.dirichlet_eta)
@@ -135,7 +162,7 @@ class HSEMHead(nn.Module):
     def dlc_len(self):
         return self.cfg.D * self.cfg.L
 
-    def forward(self, x: torch.Tensor, return_dlc=False):
+    def forward(self, x: torch.Tensor, return_dlc=False, step=None):
         bs = x.shape[0]
 
         # Compute conditional probabilities
@@ -299,7 +326,7 @@ class EncoderModel(nn.Module):
     def latent_len(self):
         return 1
 
-    def forward(self, input_ids, attention_mask, return_dlc=False):
+    def forward(self, input_ids, attention_mask, return_dlc=False, step=None):
 
         # Make the batch dict expected by sentence_transformers models
         batch = {"input_ids": input_ids, "attention_mask": attention_mask}
@@ -310,6 +337,6 @@ class EncoderModel(nn.Module):
         sentence_embedding = batch["sentence_embedding"]
 
         # Run through SEM
-        x_out, x_intern = self.sem(sentence_embedding, return_dlc=return_dlc)
+        x_out, x_intern = self.sem(sentence_embedding, return_dlc=return_dlc, step=step)
         x_out = x_out[:, None]
         return x_out, x_intern

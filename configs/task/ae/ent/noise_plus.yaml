@@ -6,6 +6,7 @@ sub_p: 0.3
 delta_ent: 0.0
 delta_ent_warmup: False
 
+
 encoder:
   name: SONAR 
   sem:
@@ -15,6 +16,10 @@ encoder:
     temp: 0.5
     dirichlet_eta: 0.00
     l2_norm: False
+    noise_delta: 0.0
+    scale_noise: false
+    entmax: false
+    postsoft_noise: 0.5 
 
 decoder:
   name: gpt2-large # 1.5B params
@@ -23,7 +28,7 @@ decoder:
     n_heads: 12
     k: 8
 
-name: sonar_sem
+name: noise_plus
 
 defaults:
   - dataset: wiki

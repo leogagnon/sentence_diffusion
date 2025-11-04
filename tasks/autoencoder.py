@@ -109,6 +109,7 @@ class AETaskConfig:
     sub_p: float = 0.3
     delta_ent: float = 0.0
     delta_ent_warmup: bool = False
+    delta_ent_warmup_steps: int = 15000
 
     name: Optional[str] = None
 
@@ -249,6 +250,7 @@ class AETask(L.LightningModule):
         z, dlc_probs = self.encoder(
             self.random_substitution(batch["input_ids_enc"]),
             batch["attention_mask_enc"],
+            step=self.global_step,
         )
 
         # Compute decoder likelihood of input_ids (no need for attention mask cuz causal)
@@ -287,23 +289,29 @@ class AETask(L.LightningModule):
                 ) / len(levels)
                 marginal_ent_penalty = sum(
                     [
-                        1 - compute_entropy(level.mean(0), normalized=True).mean()
+                        -compute_entropy(level.mean(0), normalized=True).mean()
                         for level in levels
                     ]
                 ) / len(levels)
             else:
                 ent_penalty = compute_entropy(dlc_probs, normalized=True).mean()
-                marginal_ent_penalty = (
-                    1 - compute_entropy(dlc_probs.mean(0), normalized=True).mean()
-                )
+                marginal_ent_penalty = -compute_entropy(
+                    dlc_probs.mean(0), normalized=True
+                ).mean()
 
             # Compute coefficient
             delta = self.cfg.delta_ent
             if self.cfg.delta_ent_warmup:
                 # Cosine warmup
-                if self.global_step < 15000:
+                if self.global_step < self.cfg.delta_ent_warmup_steps:
                     delta *= 0.5 * (
-                        1 - math.cos(math.pi * math.pow(self.global_step / 15000, 2))
+                        1
+                        - math.cos(
+                            math.pi
+                            * math.pow(
+                                self.global_step / self.cfg.delta_ent_warmup_steps, 2
+                            )
+                        )
                     )
 
             # Apply regularization
@@ -314,24 +322,41 @@ class AETask(L.LightningModule):
     @torch.no_grad()
     def validation_step(self, batch, batch_idx):
 
-        z, dlc_probs = self.encoder(batch["input_ids_enc"], batch["attention_mask_enc"])
+        z, dlc_probs = self.encoder(
+            batch["input_ids_enc"], batch["attention_mask_enc"], step=self.global_step
+        )
 
         if isinstance(dlc_probs, list):
+            # Flatten levels l1 = p(x_0), l2 = p(x_0, x_1), ...
+            levels = [einx.rearrange("b L N V -> b L (N V)", l) for l in dlc_probs]
             ent = sum(
                 [
                     compute_entropy(
-                        einx.rearrange("b L N V -> b L (N V)", level),
+                        level,
                         normalized=True,
                     ).mean()
-                    for level in dlc_probs
+                    for level in levels
                 ]
-            ) / len(dlc_probs)
+            ) / len(levels)
+            m_ent = sum(
+                [
+                    compute_entropy(level.mean(0), normalized=True).mean()
+                    for level in levels
+                ]
+            ) / len(levels)
         else:
             ent = compute_entropy(dlc_probs, normalized=True).mean()
+            m_ent = compute_entropy(dlc_probs.mean(0), normalized=True).mean()
 
         self.log(
             "val/sem_entropy",
             ent.detach().item(),
+            on_epoch=True,
+            sync_dist=True,
+        )
+        self.log(
+            "val/sem_marginal_entropy",
+            m_ent.detach().item(),
             on_epoch=True,
             sync_dist=True,
         )

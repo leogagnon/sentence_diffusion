@@ -5,6 +5,7 @@ val_size: 16384
 sub_p: 0.3
 delta_ent: 0.0
 delta_ent_warmup: False
+delta_ent_warmup_steps: 15000
 
 encoder:
   name: SONAR 

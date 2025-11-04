@@ -10,12 +10,12 @@ delta_ent_warmup_steps: 15000
 encoder:
   name: SONAR 
   sem:
-    _target_: model.encoder.HSEMHead
-    L: 32
-    V: 48
-    D: 2
-    dirichlet_eta: 0.00
+    _target_: model.encoder.SEMHead
+    L: 64
+    V: 128
     temp: 0.5
+    dirichlet_eta: 0.00
+    l2_norm: False
 
 decoder:
   name: gpt2-large # 1.5B params

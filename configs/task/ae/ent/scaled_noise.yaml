@@ -5,17 +5,22 @@ val_size: 16384
 sub_p: 0.3
 delta_ent: 0.0
 delta_ent_warmup: False
-delta_ent_warmup_steps: 15000
+
 
 encoder:
   name: SONAR 
   sem:
-    _target_: model.encoder.HSEMHead
-    L: 32
-    V: 48
-    D: 2
-    dirichlet_eta: 0.00
+    _target_: model.encoder.SEMHead
+    L: 64
+    V: 512
     temp: 0.5
+    dirichlet_eta: 0.00
+    l2_norm: False
+    noise_delta: 0.25
+    scale_noise: true
+    entmax: false
+    postsoft_noise: 0.5
+
 
 decoder:
   name: gpt2-large # 1.5B params
@@ -24,7 +29,7 @@ decoder:
     n_heads: 12
     k: 8
 
-name: sonar_sem
+name: scaled_noise
 
 defaults:
   - dataset: wiki

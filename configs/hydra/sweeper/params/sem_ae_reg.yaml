@@ -1,4 +1,4 @@
-task/ae: sem/sonar_big #sem/sonar_h1
+task/ae: sem/sonar_shallow, sem/sonar_h1_big, sem/sonar_h2_big, sem/sonar_h3_big
 model_checkpoint: base
 effective_batch_size: 1024
 task.ae.batch_size: 32 
@@ -7,15 +7,16 @@ task.ae.lr_warmup: true
 precision: bf16-mixed
 
 task.ae.encoder.sem.temp: 1.0
-task.ae.delta_ent: 0.0
+task.ae.delta_ent: 0.5, 1.0
 task.ae.delta_ent_warmup: true
-task.ae.encoder.sem.dirichlet_eta: 1.0
+task.ae.delta_ent_warmup_steps: 10000
+task.ae.encoder.sem.dirichlet_eta: 0.0
 
 compile: true
-max_steps: 30000
+max_steps: 15000
 
 limit_val_batches: 4
 val_check_interval: 256
 
-sweep_id: sem_big_1
+sweep_id: sem_ent_plz
 
