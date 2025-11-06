@@ -8,7 +8,6 @@ from typing import Any, List, Optional
 from peft import LoraConfig
 import torch
 import random
-import numpy as np
 from torch.utils.data import DataLoader, random_split
 from torch.utils.data.dataset import Subset
 from transformers import AutoTokenizer

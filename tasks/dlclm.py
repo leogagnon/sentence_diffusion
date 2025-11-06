@@ -8,7 +8,6 @@ from typing import Any, List, Optional
 from peft import LoraConfig
 import torch
 import random
-import numpy as np
 from torch.utils.data import DataLoader, random_split
 from torch.utils.data.dataset import Subset
 from transformers import AutoTokenizer
@@ -29,6 +28,7 @@ from mauve import compute_mauve, get_features_from_input
 import einx
 from transformers import get_constant_schedule_with_warmup
 from data.datasets import DATA_SEED, InfoLabel
+from tasks.distill_cse import DCSETask, DCSETaskConfig
 
 
 @dataclass
@@ -36,7 +36,8 @@ class DLCLMTaskConfig:
     lr: float
     lr_warmup: bool
     batch_size: int
-    pretrained_ae_id: str
+    pretrained_ae_id: Optional[str] = None
+    pretrained_dcse_id: Optional[str] = None
     pure_ar_baseline: bool = False
     conditional: bool = False
 
@@ -63,26 +64,38 @@ class DLCLMTask(L.LightningModule):
                 )
             )
 
-        # Extract encoder, decoder and dataset from pretrained autoencoder
-        ae_task = AETask.load_from_checkpoint(
-            os.path.join(
-                os.environ["LOG_DIR"],
-                "checkpoints/",
-                cfg.pretrained_ae_id,
-                "last.ckpt",
-            ),
-            strict=False,
-            map_location=torch.device("cpu"),
-        )
+        if cfg.pretrained_ae_id is not None:
+            # Extract encoder, decoder and dataset from pretrained autoencoder
+            pretraining_task = AETask.load_from_checkpoint(
+                os.path.join(
+                    os.environ["LOG_DIR"],
+                    "checkpoints/",
+                    cfg.pretrained_ae_id,
+                    "last.ckpt",
+                ),
+                strict=False,
+                map_location=torch.device("cpu"),
+            )
+        elif cfg.pretrained_dcse_id is not None:
+            pretraining_task = DCSETask.load_from_checkpoint(
+                os.path.join(
+                    os.environ["LOG_DIR"],
+                    "checkpoints/",
+                    cfg.pretrained_dcse_id,
+                    "last.ckpt",
+                ),
+                strict=False,
+                map_location=torch.device("cpu"),
+            )
 
-        self.train_indices = ae_task.train_indices
-        self.val_indices = ae_task.val_indices
-        self.dataset = ae_task.dataset
+        self.train_indices = pretraining_task.train_indices
+        self.val_indices = pretraining_task.val_indices
+        self.dataset = pretraining_task.dataset
         self.dataset: WikipediaDataset
 
         # If decoder is not given, start from the DAE's decoder
         if cfg.decoder is None:
-            self.decoder = ae_task.decoder
+            self.decoder = pretraining_task.decoder
             if self.decoder.cfg.lora_cfg != None:
                 self.decoder.backbone = self.decoder.backbone.merge_and_unload()
             del self.decoder.prompt_generator
@@ -91,10 +104,10 @@ class DLCLMTask(L.LightningModule):
             self.decoder = DecoderModel(cfg.decoder).train().requires_grad_(True)
 
         if not cfg.pure_ar_baseline:
-            assert ae_task.encoder.cfg.sem is not None
+            assert pretraining_task.encoder.cfg.sem is not None
 
             # Load encoder and freeze it
-            self.encoder = ae_task.encoder.eval().requires_grad_(False)
+            self.encoder = pretraining_task.encoder.eval().requires_grad_(False)
 
             # Turn on DLC mode on decoder
             self.decoder.is_dlc = True
@@ -278,10 +291,7 @@ class DLCLMTask(L.LightningModule):
                 sync_dist=True,
             )
 
-        if (
-            (batch_idx == 0)
-            and (rank_zero_only.rank == 0)
-        ):
+        if (batch_idx == 0) and (rank_zero_only.rank == 0):
             # Log MAUVE score every 5 validation steps (takes a few minutes)
             if self.val_epoch_counter % 5 == 0:
                 mauve = self.eval_mauve()

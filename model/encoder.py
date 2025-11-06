@@ -274,8 +274,14 @@ class EncoderModel(nn.Module):
             self.tokenizer.src_lang = "eng_Latn"
             self._latent_dim = self.transformer.get_sentence_embedding_dimension()
         else:
+            model_kwargs = {}
+            
+            # Some model-specific kwargs
+            if "roberta" in cfg.name.lower():
+                model_kwargs.update({"add_pooling_layer": False})
+
             backbone = sentence_transformers.SentenceTransformer(
-                cfg.name, #model_kwargs={"attn_implementation": "flash_attention_2"}
+                cfg.name, model_kwargs=model_kwargs
             )
 
             self.transformer = backbone[0]

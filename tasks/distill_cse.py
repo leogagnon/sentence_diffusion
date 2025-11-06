@@ -181,20 +181,22 @@ class DCSETask(L.LightningModule):
                 step=self.global_step,
             )
 
-        enc_sim = cosine_sim_mat(z_enc.squeeze(1))
-        teacher_sim = cosine_sim_mat(z_teacher.squeeze(1))
+        # We put this in float32 autocast to avoid numerical issues with softmax
+        with torch.autocast(device_type="cuda", dtype=torch.float32):
+            enc_sim = cosine_sim_mat(z_enc.squeeze(1))
+            teacher_sim = cosine_sim_mat(z_teacher.squeeze(1))
 
-        # Remove the diagonal elements (self-similarity)
-        N = enc_sim.size(0)
-        offdiag_mask = ~torch.eye(N, dtype=bool)
-        enc_sim = enc_sim[offdiag_mask].reshape(N, N-1)
-        teacher_sim = teacher_sim[offdiag_mask].reshape(N, N-1)
+            # Remove the diagonal elements (self-similarity)
+            N = enc_sim.size(0)
+            offdiag_mask = ~torch.eye(N, dtype=bool)
+            enc_sim = enc_sim[offdiag_mask].reshape(N, N - 1)
+            teacher_sim = teacher_sim[offdiag_mask].reshape(N, N - 1)
 
-        # Loss is cross-entropy between teacher and student similarity distributions
-        loss = -(
-            torch.softmax(teacher_sim / self.cfg.temp, dim=-1)
-            * torch.log_softmax(enc_sim / self.cfg.temp, dim=1)
-        ).mean(-1).mean()
+            enc_log_p = torch.log_softmax(enc_sim / self.cfg.temp, dim=1)
+            teacher_p = torch.softmax(teacher_sim / self.cfg.temp, dim=-1)
+
+            # Loss is cross-entropy between teacher and student similarity distributions
+            loss = -(teacher_p * enc_log_p).nansum(-1).mean()
 
         self.log(
             "train/loss",
@@ -222,20 +224,21 @@ class DCSETask(L.LightningModule):
                 step=self.global_step,
             )
 
-        enc_sim = cosine_sim_mat(z_enc.squeeze(1))
-        teacher_sim = cosine_sim_mat(z_teacher.squeeze(1))
+        with torch.autocast(device_type="cuda", dtype=torch.float32):
+            enc_sim = cosine_sim_mat(z_enc.squeeze(1))
+            teacher_sim = cosine_sim_mat(z_teacher.squeeze(1))
 
-        # Remove the diagonal elements (self-similarity)
-        N = enc_sim.size(0)
-        offdiag_mask = ~torch.eye(N, dtype=bool)
-        enc_sim = enc_sim[offdiag_mask].reshape(N, N-1)
-        teacher_sim = teacher_sim[offdiag_mask].reshape(N, N-1)
+            # Remove the diagonal elements (self-similarity)
+            N = enc_sim.size(0)
+            offdiag_mask = ~torch.eye(N, dtype=bool)
+            enc_sim = enc_sim[offdiag_mask].reshape(N, N - 1)
+            teacher_sim = teacher_sim[offdiag_mask].reshape(N, N - 1)
 
-        # Loss is cross-entropy between teacher and student similarity distributions
-        loss = -(
-            torch.softmax(teacher_sim / self.cfg.temp, dim=-1)
-            * torch.log_softmax(enc_sim / self.cfg.temp, dim=1)
-        ).mean(-1).mean()
+            enc_log_p = torch.log_softmax(enc_sim / self.cfg.temp, dim=1)
+            teacher_p = torch.softmax(teacher_sim / self.cfg.temp, dim=-1)
+
+            # Loss is cross-entropy between teacher and student similarity distributions
+            loss = -(teacher_p * enc_log_p).nansum(-1).mean()
 
         self.log("val/loss", loss, on_epoch=True, sync_dist=True)
 

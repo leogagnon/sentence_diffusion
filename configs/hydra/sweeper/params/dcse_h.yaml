@@ -1,0 +1,20 @@
+task/distill_cse: h2, h2_long, h3
+model_checkpoint: base
+effective_batch_size: 1024
+task.distill_cse.batch_size: 32
+task.distill_cse.lr: 1e-4
+task.distill_cse.lr_warmup: true
+precision: bf16-mixed
+
+task.distill_cse.encoder.sem.temp: 0.25
+task.distill_cse.encoder.name: Qwen/Qwen3-Embedding-0.6B, FacebookAI/roberta-large
+task.distill_cse.temp: 0.01
+
+compile: true
+max_steps: 30000
+
+limit_val_batches: 4
+val_check_interval: 256
+
+sweep_id: distill_cse_h
+

@@ -16,6 +16,7 @@ from lightning.pytorch.callbacks import EarlyStopping
 from lightning.pytorch.utilities.rank_zero import rank_zero_info, rank_zero_only
 
 torch.backends.cudnn.conv.fp32_precision = 'tf32'
+torch.set_float32_matmul_precision('high')
 torch._dynamo.config.capture_scalar_outputs = True
 
 
@@ -114,14 +115,17 @@ def main(cfg: Optional[TrainConfig] = None, run_id: Optional[str] = None):
         cfg.task.dlclm = task.cfg
 
         # Add the autoencoder config to cfg
-        run = wandb.Api().run(
-            f"guillaume-lajoie/dlc_lm/{cfg.task.dlclm.pretrained_ae_id}"
-        )
-        if "ae" in run.config["task"]:
+        if cfg.task.dlclm.pretrained_ae_id is not None:
+            run = wandb.Api().run(
+                f"guillaume-lajoie/dlc_lm/{cfg.task.dlclm.pretrained_ae_id}"
+            )
             cfg.task.ae = OmegaConf.merge(
                 OmegaConf.structured(AETaskConfig), run.config["task"]["ae"]
             )
-        elif "distill_cse" in run.config["task"]:
+        elif cfg.task.dlclm.pretrained_dcse_id is not None:
+            run = wandb.Api().run(
+                f"guillaume-lajoie/dlc_lm/{cfg.task.dlclm.pretrained_dcse_id}"
+            )
             cfg.task.distill_cse = OmegaConf.merge(
                 OmegaConf.structured(DCSETaskConfig),
                 run.config["task"]["distill_cse"],

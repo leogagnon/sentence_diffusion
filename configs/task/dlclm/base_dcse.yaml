@@ -1,0 +1,8 @@
+lr: 1e-4
+lr_warmup: true
+batch_size: 32
+pretrained_dcse_id: welf502v
+decoder:
+  name: gpt2-large # 0.7B params
+
+name: dlclm
