@@ -2,7 +2,6 @@ from abc import ABC, abstractmethod
 from functools import partial
 import os
 from peft.mapping_func import get_peft_model
-from peft.tuners.lora.config import LoraConfig
 from sentence_transformers.models import InputModule
 import torch.nn as nn
 from dataclasses import dataclass
@@ -31,41 +30,11 @@ from torch.distributions import Gamma
 from entmax import entmax15
 
 
-def sem_dirichlet_noise(z, eta=1.0, eps=1e-3):
-    """
-    Add Dirichlet noise to SEM probabilities.
-
-    Args:
-        z: Tensor [B, L, V] (already softmaxed, each simplex sums to 1)
-        eta: target relative std at uniform (η/V ≈ std)
-             smaller η -> stronger noise (discourages fine variations)
-        eps: small constant for numerical stability
-
-    Returns:
-        z_tilde: noisy probabilities, same shape as z
-    """
-    B, L, V = z.shape
-    # Compute kappa from target η using the uniform variance formula
-    # Var ≈ 1 / [V * (kappa + 1)]  =>  κ ≈ V / η² - 1
-    kappa = max(V / (eta**2) - 1.0, 1e-3)
-
-    alpha = kappa * z + eps
-    g = Gamma(alpha, torch.ones_like(alpha)).rsample()  # reparameterized Dirichlet
-    z_tilde = g / g.sum(dim=-1, keepdim=True)
-    return z_tilde.clamp_min(1e-8)
-
-
 @dataclass
 class SEMHeadConfig:
     L: int
     V: int
     temp: float
-    dirichlet_eta: float = 0.0
-    noise_delta: float = 0.0
-    scale_noise: bool = False
-    postsoft_noise: float = 0.0
-    entmax: bool = False
-    l2_norm: bool = False
     input_dim: Optional[int] = None
 
 
@@ -86,42 +55,18 @@ class SEMHead(nn.Module):
     def dlc_len(self):
         return self.cfg.L
 
-    def forward(self, x, return_dlc=False, step=None):
-        # Compute DLC probs
+    def forward(self, x, return_dlc=False):
+        # Proj in DLC space
         x = self.proj_in(x)
         x = self.norm(x)
         x = einx.rearrange("b (l v) -> b l v", x, l=self.cfg.L, v=self.cfg.V)
 
-        if self.cfg.noise_delta > 0.0:
-            if self.cfg.scale_noise:
-                std = x.detach().std(dim=-1, keepdim=True)
-            else:
-                std = 1.0
-            x = x + self.cfg.noise_delta * std * torch.randn_like(x)
-
-        if self.cfg.entmax:
-            probs = entmax15(x / self.cfg.temp, dim=-1)
-        else:
-            probs = torch.softmax(x / self.cfg.temp, dim=-1)
-
-        if (self.cfg.postsoft_noise > 0.0) and self.training:
-            sigma = self.cfg.postsoft_noise
-            if step < 15000:
-                sigma *= 0.5 * (1 - math.cos(math.pi * math.pow(step / 15000, 2)))
-            eta = torch.randn_like(probs) * sigma
-            probs = probs * (1 + eta)
-            probs = torch.clamp(probs, 1e-6, None)
-            probs = probs / probs.sum(dim=-1, keepdim=True)
-
-        if (self.cfg.dirichlet_eta > 0.0) and self.training:
-            probs = sem_dirichlet_noise(probs, self.cfg.dirichlet_eta)
+        # Compute Softmax
+        probs = torch.softmax(x / self.cfg.temp, dim=-1)
 
         # Compute output
         out = einx.rearrange("b l v -> b (l v)", probs)
         out = self.proj_out(out)
-
-        if self.cfg.l2_norm:
-            out = F.normalize(out, p=2, dim=1)
 
         if return_dlc:
             return out, self.encode(probs)
@@ -139,7 +84,6 @@ class HSEMHeadConfig:
     V: int
     D: int
     temp: float
-    dirichlet_eta: float = 0.0
     input_dim: Optional[int] = None
 
 
@@ -161,7 +105,7 @@ class HSEMHead(nn.Module):
     def dlc_len(self):
         return self.cfg.D * self.cfg.L
 
-    def forward(self, x: torch.Tensor, return_dlc=False, step=None):
+    def forward(self, x: torch.Tensor, return_dlc=False):
         bs = x.shape[0]
 
         # Compute conditional probabilities
@@ -191,12 +135,6 @@ class HSEMHead(nn.Module):
             # Update parent and go down a level
             parent_probs = einx.rearrange("b L n V -> b L (n V)", level)
             start = end
-
-        if (self.cfg.dirichlet_eta > 0.0) and self.training:
-            probs = [
-                sem_dirichlet_noise(level_probs, self.cfg.dirichlet_eta)
-                for level_probs in probs
-            ]
 
         # Compute output
         out = torch.cat(probs, dim=2)
@@ -248,11 +186,9 @@ class SONARTransformer(nn.Module):
 
 @dataclass
 class EncoderConfig:
-    name: str
+    model_name: str
     sem: Optional[dict] = None
-    lora_cfg: Optional[dict] = None
-    dropout_p: float = 0.0
-    train: bool = True
+    prompt: Optional[str] = None
 
 
 class EncoderModel(nn.Module):
@@ -263,7 +199,7 @@ class EncoderModel(nn.Module):
             cfg = EncoderConfig(**kwargs)
 
         # Initialize backbone
-        if "SONAR" in cfg.name:
+        if "SONAR" in cfg.model_name:
             self.transformer = SONARTransformer()
             self.pooling = sentence_transformers.models.Pooling(
                 self.transformer.get_sentence_embedding_dimension(), pooling_mode="mean"
@@ -275,13 +211,16 @@ class EncoderModel(nn.Module):
             self._latent_dim = self.transformer.get_sentence_embedding_dimension()
         else:
             model_kwargs = {}
-            
+
             # Some model-specific kwargs
-            if "roberta" in cfg.name.lower():
+            if "roberta" in cfg.model_name.lower():
                 model_kwargs.update({"add_pooling_layer": False})
 
+            if "qwen" in cfg.model_name.lower():
+                model_kwargs.update({"attn_implementation": "flash_attention_2"})
+
             backbone = sentence_transformers.SentenceTransformer(
-                cfg.name, model_kwargs=model_kwargs
+                cfg.model_name, model_kwargs=model_kwargs
             )
 
             self.transformer = backbone[0]
@@ -299,24 +238,10 @@ class EncoderModel(nn.Module):
                 self.transformer.auto_model.get_input_embeddings().weight.shape[1]
             )
 
-        # Use FlashAttention2 on transformer if possible
-        try:
-            self.transformer.auto_model.set_attn_implementation("flash_attention_2")
-        except:
-            rank_zero_info(
-                "Tried to use flash attention in encoder, but it is not available."
-            )
-
         if cfg.sem is not None:
             cfg.sem["input_dim"] = self.latent_dim
             self.sem = hydra.utils.instantiate(cfg.sem)
             self.sem: SEMHead | HSEMHead
-
-        if cfg.lora_cfg != None:
-            self.transformer = get_peft_model(
-                self.transformer,
-                LoraConfig(**cfg.lora_cfg),
-            )
 
         self.cfg = cfg
 
@@ -333,7 +258,7 @@ class EncoderModel(nn.Module):
     def latent_len(self):
         return 1
 
-    def forward(self, input_ids, attention_mask, return_dlc=False, step=None):
+    def forward(self, input_ids, attention_mask, return_dlc=False):
 
         # Make the batch dict expected by sentence_transformers models
         batch = {"input_ids": input_ids, "attention_mask": attention_mask}
@@ -345,10 +270,7 @@ class EncoderModel(nn.Module):
 
         # Run through SEM
         if self.cfg.sem is not None:
-            x_out, x_intern = self.sem(
-                sentence_embedding, return_dlc=return_dlc, step=step
-            )
-            x_out = x_out[:, None]
+            x_out, x_intern = self.sem(sentence_embedding, return_dlc=return_dlc)
             return x_out, x_intern
         else:
             return sentence_embedding

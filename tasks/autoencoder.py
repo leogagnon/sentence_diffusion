@@ -29,71 +29,8 @@ import os
 import torch
 from torch.utils.data import Sampler
 from typing import Iterator, Optional
-
-
-def compute_entropy(probs, normalized=False):
-    ent = -(probs * torch.clamp(probs, min=1e-12).log()).sum(-1)
-    if normalized:
-        return ent / math.log(probs.shape[-1])
-    return ent
-
-
-class InfiniteDistributedUniformSampler(Sampler[int]):
-    """
-    Infinite, per-rank independent uniform sampling *with replacement*.
-
-    - No epoch notion (no set_epoch).
-    - Works in single-process and DDP.
-    - Yields indices forever → use max_steps / manual break in training loop.
-    - Deterministic if `seed` is set; otherwise non-deterministic.
-
-    Args:
-        dataset: map-style dataset (needs __len__).
-        seed: optional base seed; if None, a random 64-bit seed is used.
-        chunk_size: draw this many indices per RNG call (perf tweak).
-    """
-
-    def __init__(
-        self,
-        n: int,
-        batch_size: int,
-        seed: Optional[int] = None,
-        chunk_size: int = 4096,
-    ):
-
-        self.n = n
-        self.batch_size = batch_size
-
-        # Rank/world
-        if torch.distributed.is_available() and torch.distributed.is_initialized():
-            self.rank = torch.distributed.get_rank()
-        else:
-            self.rank = 0
-
-        # Base seed (None → random)
-        if seed is None:
-            seed = int.from_bytes(os.urandom(8), "little", signed=False)
-
-        # Mix in rank to get independent streams per process
-        mixed = (int(seed) ^ (0x9E3779B97F4A7C15 * (self.rank + 1))) & ((1 << 63) - 1)
-
-        self._g = torch.Generator()
-        self._g.manual_seed(mixed)
-        self._chunk = int(chunk_size)
-
-    def __len__(self) -> int:
-        # Sentinel for frameworks that read len(); loader never actually exhausts.
-        return 2**31 - 1
-
-    def __iter__(self) -> Iterator[int]:
-        while True:
-            # Vectorized draw, then yield scalars
-            idx = torch.randint(
-                0, self.n, (self._chunk, self.batch_size), generator=self._g
-            )
-            # Yield as Python lists (fast path in DataLoader)
-            for row in idx:
-                yield row.tolist()
+from tasks.utils import *
+from data.datasets import WikipediaDataset, FineWebDataset
 
 
 @dataclass
@@ -104,11 +41,10 @@ class AETaskConfig:
     decoder: DecoderConfig
     dataset: dict
     val_size: int
-    lr_warmup: bool = False
+    lr_warmup_steps: int = 1500
     sub_p: float = 0.3
     delta_ent: float = 0.0
-    delta_ent_warmup: bool = False
-    delta_ent_warmup_steps: int = 15000
+    delta_ent_warmup_steps: int = 0
 
     name: Optional[str] = None
 
@@ -136,14 +72,12 @@ class AETask(L.LightningModule):
 
         # Setup dataset
         self.dataset = hydra.utils.instantiate(cfg.dataset)
+        self.dataset: WikipediaDataset | FineWebDataset
 
         # This is with a fixed seed to make sure validation set never changes
-        indices = torch.randperm(
-            len(self.dataset),
-            generator=torch.Generator().manual_seed(DATA_SEED),
+        self.train_indices, self.val_indices = self.dataset.get_train_val_indices(
+            val_size=cfg.val_size
         )
-        self.train_indices = indices[: -cfg.val_size]
-        self.val_indices = indices[-cfg.val_size :]
 
         self.cfg = cfg
 
@@ -189,11 +123,7 @@ class AETask(L.LightningModule):
             batch_sampler=InfiniteDistributedUniformSampler(
                 n=len(self.train_data), batch_size=self.cfg.batch_size
             ),
-            collate_fn=self.dataset.get_collate_and_tokenize_fn(
-                conditional=False,
-                enc_tokenizer=self.encoder.tokenizer,
-                dec_tokenizer=self.decoder.tokenizer,
-            ),
+            collate_fn=self.get_collate_fn(),
         )
 
     def val_dataloader(self):
@@ -206,11 +136,7 @@ class AETask(L.LightningModule):
             self.val_data,
             batch_size=self.cfg.batch_size,
             sampler=sampler,
-            collate_fn=self.dataset.get_collate_and_tokenize_fn(
-                conditional=False,
-                enc_tokenizer=self.encoder.tokenizer,
-                dec_tokenizer=self.decoder.tokenizer,
-            ),
+            collate_fn=self.get_collate_fn(),
         )
 
     def configure_optimizers(self):
@@ -234,9 +160,9 @@ class AETask(L.LightningModule):
             },
         ]
         optimizer = torch.optim.AdamW(optimizer_grouped_parameters, lr=self.cfg.lr)
-        if self.cfg.lr_warmup:
+        if self.cfg.lr_warmup_steps > 0:
             scheduler = get_constant_schedule_with_warmup(
-                optimizer, num_warmup_steps=2000
+                optimizer, num_warmup_steps=self.cfg.lr_warmup_steps
             )
             scheduler = {"scheduler": scheduler, "interval": "step", "frequency": 1}
 
@@ -244,12 +170,61 @@ class AETask(L.LightningModule):
         else:
             return optimizer
 
+    def get_collate_fn(self):
+        dec_tokenizer = self.decoder.tokenizer
+        max_length = self.dataset.cfg.max_length
+
+        def fn(batch):
+
+            input_str = batch["input_str"]
+
+            # Compute input_ids of the decoder if not already there
+            # If is there we still need to add BOS
+            if "input_ids" not in batch:
+                input_ids_dec = dec_tokenizer.batch_encode_plus(
+                    batch["input_str"],
+                    truncation=True,
+                    padding=True,
+                    max_length=max_length,
+                    return_tensors="pt",
+                    add_special_tokens=True,
+                    return_attention_mask=False,
+                )["input_ids"]
+            else:
+                input_ids_dec = [
+                    [dec_tokenizer.bos_token_id] + seq for seq in batch["input_ids"]
+                ]
+                input_ids_dec = dec_tokenizer.pad(
+                    {"input_ids": input_ids_dec},
+                    padding=True,
+                    truncation=True,
+                    return_tensors="pt",
+                    max_length=max_length,
+                    return_attention_mask=False,
+                )["input_ids"]
+
+            # Compute input_ids of encoder
+            batch_enc = self.encoder.tokenizer.batch_encode_plus(
+                input_str,
+                truncation=True,
+                padding="max_length",
+                max_length=max_length,
+                return_tensors="pt",
+            )
+
+            return {
+                "input_ids_dec": input_ids_dec,
+                "input_ids_enc": batch_enc["input_ids"],
+                "attention_mask_enc": batch_enc["attention_mask"].bool(),
+            }
+
+        return fn
+
     def training_step(self, batch, batch_idx):
 
         z, dlc_probs = self.encoder(
             self.random_substitution(batch["input_ids_enc"]),
             batch["attention_mask_enc"],
-            step=self.global_step,
         )
 
         # Compute decoder likelihood of input_ids (no need for attention mask cuz causal)
@@ -273,48 +248,15 @@ class AETask(L.LightningModule):
         )
 
         if self.cfg.delta_ent > 0.0:
-            # Compute normalized entropy
-            if isinstance(dlc_probs, list):
-                # Flatten levels l1 = p(x_0), l2 = p(x_0, x_1), ...
-                levels = [einx.rearrange("b L N V -> b L (N V)", l) for l in dlc_probs]
-                ent_penalty = sum(
-                    [
-                        compute_entropy(
-                            level,
-                            normalized=True,
-                        ).mean()
-                        for level in levels
-                    ]
-                ) / len(levels)
-                marginal_ent_penalty = sum(
-                    [
-                        -compute_entropy(level.mean(0), normalized=True).mean()
-                        for level in levels
-                    ]
-                ) / len(levels)
-            else:
-                ent_penalty = compute_entropy(dlc_probs, normalized=True).mean()
-                marginal_ent_penalty = -compute_entropy(
-                    dlc_probs.mean(0), normalized=True
-                ).mean()
+            ent, m_ent = sem_entropy(dlc_probs)
 
-            # Compute coefficient
-            delta = self.cfg.delta_ent
-            if self.cfg.delta_ent_warmup:
-                # Cosine warmup
-                if self.global_step < self.cfg.delta_ent_warmup_steps:
-                    delta *= 0.5 * (
-                        1
-                        - math.cos(
-                            math.pi
-                            * math.pow(
-                                self.global_step / self.cfg.delta_ent_warmup_steps, 2
-                            )
-                        )
-                    )
+            delta = cosine_warmup_get_value(
+                self.global_step,
+                max_value=self.cfg.delta_ent,
+                warmup_steps=self.cfg.delta_ent_warmup_steps,
+            )
 
-            # Apply regularization
-            loss = loss + delta * (ent_penalty + marginal_ent_penalty)
+            loss = loss + delta * (ent - m_ent)
 
         return loss
 
@@ -325,37 +267,17 @@ class AETask(L.LightningModule):
             batch["input_ids_enc"], batch["attention_mask_enc"], step=self.global_step
         )
 
-        if isinstance(dlc_probs, list):
-            # Flatten levels l1 = p(x_0), l2 = p(x_0, x_1), ...
-            levels = [einx.rearrange("b L N V -> b L (N V)", l) for l in dlc_probs]
-            ent = sum(
-                [
-                    compute_entropy(
-                        level,
-                        normalized=True,
-                    ).mean()
-                    for level in levels
-                ]
-            ) / len(levels)
-            m_ent = sum(
-                [
-                    compute_entropy(level.mean(0), normalized=True).mean()
-                    for level in levels
-                ]
-            ) / len(levels)
-        else:
-            ent = compute_entropy(dlc_probs, normalized=True).mean()
-            m_ent = compute_entropy(dlc_probs.mean(0), normalized=True).mean()
+        ent, m_ent = sem_entropy(dlc_probs)
 
         self.log(
             "val/sem_entropy",
-            ent.detach().item(),
+            ent.item(),
             on_epoch=True,
             sync_dist=True,
         )
         self.log(
             "val/sem_marginal_entropy",
-            m_ent.detach().item(),
+            m_ent.item(),
             on_epoch=True,
             sync_dist=True,
         )

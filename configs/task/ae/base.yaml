@@ -1,0 +1,26 @@
+batch_size: 32
+lr: 1e-4
+lr_warmup_steps: 1500
+val_size: 16384
+sub_p: 0.3
+delta_ent: 0.0
+delta_ent_warmup_steps: 10000
+
+dataset:
+  _target_: data.datasets.WikipediaDataset
+  max_length: 128
+
+encoder:
+  model_name: SONAR 
+
+decoder:
+  name: gpt2-large # 1.5B params
+  prompt_generator_cfg:
+    n_layers: 6
+    n_heads: 12
+    k: 8
+
+name: base_ae
+
+defaults:
+  - encoder/sem: flat

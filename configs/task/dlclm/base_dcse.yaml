@@ -1,7 +1,11 @@
 lr: 1e-4
-lr_warmup: true
+lr_warmup_steps: 1500
 batch_size: 32
-pretrained_dcse_id: welf502v
+pretrained_dcse_id: 61wvm518
+conditional: False
+min_cond_split: 32
+max_length: 128
+
 decoder:
   name: gpt2-large # 0.7B params
 

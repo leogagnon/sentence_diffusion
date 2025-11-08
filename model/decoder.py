@@ -4,7 +4,6 @@ import math
 import os
 import einx
 from peft.mapping_func import get_peft_model
-from peft.tuners.lora.config import LoraConfig
 import torch.nn as nn
 from dataclasses import dataclass
 from typing import Optional
@@ -33,12 +32,10 @@ class DecoderConfig:
     name: str
     input_dim: Optional[int] = None
     prompt_generator_cfg: Optional[PromptGeneratorConfig] = None
-    lora_cfg: Optional[dict] = None
     disable_dropout: bool = True
 
 
 class DecoderModel(nn.Module):
-    """Wrapper around a pretrained decoder model (e.g. GPT) with optional LoRA adaptation and soft prompting."""
 
     def __init__(self, cfg: DecoderConfig):
         super().__init__()
@@ -50,7 +47,7 @@ class DecoderModel(nn.Module):
             self.backbone.set_attn_implementation("flash_attention_2")
         except:
             rank_zero_info(
-                "Tried to use flash attention in encoder, but it is not available."
+                "Tried to use flash attention in decoder, but it is not available."
             )
 
         # Disable dropout in the backbone
@@ -59,11 +56,6 @@ class DecoderModel(nn.Module):
                 if isinstance(module, torch.nn.Dropout):
                     module.p = 0.0
 
-        if self.cfg.lora_cfg != None:
-            self.backbone = get_peft_model(
-                self.backbone,
-                LoraConfig(**self.cfg.lora_cfg),
-            )
 
         # Init tokenizer, make it put BOS and EOS tokens around inputs, and add PAD and THINK tokens.
         self.tokenizer = AutoTokenizer.from_pretrained(cfg.name)
@@ -112,7 +104,7 @@ class DecoderModel(nn.Module):
         prompt = self.prompt_generator["z_to_chunk"](z)
         prompt = rearrange(
             prompt,
-            "b 1 (k d) -> b k d",
+            "b (k d) -> b k d",
             k=self.cfg.prompt_generator_cfg.k,
         )
         prompt = self.prompt_generator["chunk_to_embd"](prompt)
