@@ -13,7 +13,7 @@ dataset:
   max_length: 128
 
 teacher:
-  model_name: Qwen/Qwen3-Embedding-4B # 1.5B params
+  model_name: Qwen/Qwen3-Embedding-0.6B 
   prompt: "Represent the text with high-level features. This can include semantic information, type of text, intent, style. Text: "
   
 encoder:

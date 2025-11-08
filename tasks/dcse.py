@@ -100,7 +100,7 @@ class DCSETask(L.LightningModule):
 
     def get_collate_fn(self):
         # Just a big buffer, should never reach that
-        max_length = 150
+        max_length = self.dataset.cfg.max_length + 64
 
         def fn(batch):
 
