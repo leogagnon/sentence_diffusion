@@ -223,12 +223,14 @@ class DLCLMTask(L.LightningModule):
         def fn(batch):
 
             input_str = batch["input_str"]
-            
+
             if "input_ids" not in batch:
                 # Compute input_ids of the decoder if not already there
                 # This adds <|bos|> and <|eos|>
                 input_ids_dec = dec_tokenizer.batch_encode_plus(
                     input_str,
+                    truncation=True,
+                    max_length=max_length + 64,
                     add_special_tokens=True,
                     return_attention_mask=False,
                 )["input_ids"]
@@ -239,7 +241,7 @@ class DLCLMTask(L.LightningModule):
             if self.ar_baseline:
                 input_ids_dec = dec_tokenizer.pad(
                     {"input_ids": input_ids_dec},
-                    padding="longest",
+                    padding=True,
                     return_tensors="pt",
                     return_attention_mask=False,
                 )["input_ids"]
@@ -319,13 +321,15 @@ class DLCLMTask(L.LightningModule):
                 # DLC ==> DLC
                 info_mask_dec[
                     i,
-                    (len(prompt_dec[i])) : (
-                        len(prompt_dec[i]) + dlc_ids.shape[1]
-                    ) :,
+                    (len(prompt_dec[i])) : (len(prompt_dec[i]) + dlc_ids.shape[1]) :,
                 ] = InfoLabel.DLC.value
                 # Rest is CONT
 
-            return {"input_ids_dec": input_ids_dec, "info_mask_dec": info_mask_dec}
+            return {
+                "input_ids_dec": input_ids_dec,
+                "info_mask_dec": info_mask_dec,
+                "input_str": input_str,
+            }
 
         return fn
 

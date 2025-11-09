@@ -1,7 +1,7 @@
 lr: 1e-4
 lr_warmup_steps: 1500
 batch_size: 32
-pretrained_dcse_id: 61wvm518
+pretrained_dcse_id: tc78mop4
 conditional: False
 min_cond_split: 32
 max_length: 128

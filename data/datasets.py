@@ -90,8 +90,8 @@ class FineWebDataset(Dataset):
             torch.rand(len(input_ids)) * torch.clamp(lens - self.cfg.max_length, min=0)
         ).int()
         input_ids = [
-            x[s : s + l]
-            for x, s, l in zip(input_ids, window_start, self.cfg.max_length)
+            x[s : s + self.cfg.max_length]
+            for x, s in zip(input_ids, window_start)
         ]
 
         # Decode input_str

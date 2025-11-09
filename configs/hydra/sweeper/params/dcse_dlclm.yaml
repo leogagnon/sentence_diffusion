@@ -6,13 +6,13 @@ task.dlclm.lr: 1e-4
 task.dlclm.lr_warmup_steps: 1500
 precision: bf16-mixed
 
-task.dlclm.pretrained_dcse_id : 8u3qej3w, hwdxt81m, h17egqdn, gbx67i2e, v99qgmdx, l0zm2726, 61wvm518
+task.dlclm.pretrained_dcse_id : 4tim1wlm, n8ok3xyo, c2n31n72, 2w3w8893, wsb9mw5f, sc1knmkb, uak0afbx, wb4t4jpm, 2mvtgdrz, t2e3u19f, glkrjt13, 1an6d78d, hw41ddm5, tc78mop4, 53811n8s, nbu4aeib
 
-compile: true
-max_steps: 15000
+compile: false
+max_steps: 10000
 
 limit_val_batches: 4
 val_check_interval: 256
 
-sweep_id: dlclm_dcse_h_deberta
+sweep_id: dlclm_dcse_h_qwen_0
 

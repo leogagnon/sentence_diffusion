@@ -3,13 +3,13 @@ lr: 1e-5
 lr_warmup_steps: 1500
 val_size: 16384
 temp: 0.01
-delta_ent: 0.5
-delta_ent_warmup_steps: null
+delta_ent: null
+delta_ent_warmup_steps: 10000
 
 name: base_dcse
 
 dataset:
-  _target_: data.datasets.WikipediaDataset
+  _target_: data.datasets.FineWebDataset #data.datasets.WikipediaDataset
   max_length: 128
 
 teacher:

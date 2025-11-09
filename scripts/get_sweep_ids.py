@@ -12,4 +12,4 @@ filters = {
 }
 runs = api.runs(f"guillaume-lajoie/dlc_lm", filters=filters)
 for run in runs:
-    print(run.id, end=" ")
+    print(run.id, end=", ")
