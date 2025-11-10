@@ -14,7 +14,7 @@ from model.encoder import EncoderModel
 from enum import Enum
 import os
 from transformers import AutoTokenizer
-from typing import List
+from typing import List, Tuple
 
 DATA_SEED = 42
 
@@ -55,7 +55,7 @@ class WikipediaDataset(Dataset):
 
 @dataclass
 class FineWebDatasetConfig:
-    max_length: int
+    length_interval: Tuple[int, int]
 
 
 class FineWebDataset(Dataset):
@@ -85,13 +85,18 @@ class FineWebDataset(Dataset):
         input_ids = self.dataset[indices]["input_ids"]
 
         # Select a random window
-        lens = torch.Tensor([len(x) for x in input_ids])
+        full_len = torch.Tensor([len(x) for x in input_ids])
+        window_len = torch.randint(
+            low=self.cfg.length_interval[0],
+            high=self.cfg.length_interval[1],
+            size=(len(input_ids),)
+        )
         window_start = (
-            torch.rand(len(input_ids)) * torch.clamp(lens - self.cfg.max_length, min=0)
+            torch.rand(len(input_ids))
+            * torch.clamp(full_len - window_len, min=0)
         ).int()
         input_ids = [
-            x[s : s + self.cfg.max_length]
-            for x, s in zip(input_ids, window_start)
+            x[s : s + l] for x, s, l in zip(input_ids, window_start, window_len)
         ]
 
         # Decode input_str

@@ -42,7 +42,7 @@ class DCSETaskConfig:
     val_size: int
     lr_warmup_steps: float = 1500
     temp: float = 0.01
-    delta_ent: Optional[float] = None
+    delta_ent: float = 0.0
     delta_ent_warmup_steps: int = 10000
 
     name: Optional[str] = None
@@ -116,12 +116,15 @@ class DCSETask(L.LightningModule):
                 return_tensors="pt",
             )
 
+            # Because some teacher sentence embedding use instructions
             if self.teacher.cfg.prompt is not None:
-                input_str = [self.teacher.cfg.prompt + s for s in input_str]
+                input_str_teacher = [self.teacher.cfg.prompt + s for s in input_str]
+            else:
+                input_str_teacher = input_str
 
             # Compute the input ids for the teacher
             batch_teacher = self.teacher.tokenizer.batch_encode_plus(
-                input_str,
+                input_str_teacher,
                 truncation=True,
                 padding=True,
                 max_length=max_length,
@@ -243,7 +246,7 @@ class DCSETask(L.LightningModule):
             sync_dist=True,
         )
 
-        if self.cfg.delta_ent is not None:
+        if self.cfg.delta_ent > 0.0:
             ent, m_ent = sem_entropy(dlc_probs)
 
             delta = cosine_warmup_get_value(

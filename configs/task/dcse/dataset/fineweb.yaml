@@ -1,0 +1,3 @@
+dataset:
+  _target_: data.datasets.FineWebDataset
+  length_interval: [32, 96]

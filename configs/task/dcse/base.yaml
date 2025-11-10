@@ -3,21 +3,19 @@ lr: 1e-5
 lr_warmup_steps: 1500
 val_size: 16384
 temp: 0.01
-delta_ent: null
+delta_ent: 0.0
 delta_ent_warmup_steps: 10000
 
 name: base_dcse
 
-dataset:
-  _target_: data.datasets.FineWebDataset #data.datasets.WikipediaDataset
-  max_length: 128
-
 teacher:
   model_name: Qwen/Qwen3-Embedding-0.6B 
-  prompt: "Represent the text with high-level features. This can include semantic information, type of text, intent, style. Text: "
+  prompt: null
+  #prompt: "Represent the text with high-level features. This can include semantic information, type of text, intent, style. Text: "
   
 encoder:
   model_name: microsoft/deberta-v3-large
 
 defaults:
   - encoder/sem: flat
+  - dataset: fineweb

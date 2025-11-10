@@ -12,7 +12,7 @@
             "console": "integratedTerminal",
             "justMyCode": false,
             "args": [
-                "task/dlclm=base_dcse",
+                "task/dcse=base",
                 "num_devices=1"
             ],
         }
