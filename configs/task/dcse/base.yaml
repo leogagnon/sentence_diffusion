@@ -9,7 +9,7 @@ delta_ent_warmup_steps: 10000
 name: base_dcse
 
 teacher:
-  model_name: Qwen/Qwen3-Embedding-0.6B 
+  model_name: SONAR #Qwen/Qwen3-Embedding-0.6B 
   prompt: null
   #prompt: "Represent the text with high-level features. This can include semantic information, type of text, intent, style. Text: "
   

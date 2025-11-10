@@ -217,7 +217,8 @@ class EncoderModel(nn.Module):
                 model_kwargs.update({"add_pooling_layer": False})
 
             if "qwen" in cfg.model_name.lower():
-                model_kwargs.update({"attn_implementation": "flash_attention_2"})
+                pass
+                #model_kwargs.update({"attn_implementation": "flash_attention_2"})
 
             backbone = sentence_transformers.SentenceTransformer(
                 cfg.model_name, model_kwargs=model_kwargs

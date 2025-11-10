@@ -2,7 +2,6 @@ from dataclasses import dataclass
 from typing import Optional
 from datasets.load import load_from_disk, load_dataset
 from hydra.utils import to_absolute_path
-import pandas as pd
 from tokenizers import Tokenizer
 import torch
 from torch.nn.utils.rnn import pad_sequence

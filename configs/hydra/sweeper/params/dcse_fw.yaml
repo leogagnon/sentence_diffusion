@@ -4,8 +4,9 @@ effective_batch_size: 512
 precision: bf16-mixed
 
 task/dcse/dataset: fineweb
+task.dcse.dataset.length_interval: [32, 96]
 task.dcse.encoder.sem.temp: 0.5
-task/dcse/encoder/sem: h2, flat
+task/dcse/encoder/sem: h1, h2, flat
 task.dcse.temp:  0.01
 task.dcse.delta_ent: 0.0, 0.5
 task.dcse.delta_ent_warmup_steps: 10000
