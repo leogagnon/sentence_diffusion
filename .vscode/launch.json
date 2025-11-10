@@ -13,7 +13,7 @@
             "justMyCode": false,
             "args": [
                 "task/dcse=base",
-                "num_devices=1"
+                "num_devices=1",
             ],
         }
     ]

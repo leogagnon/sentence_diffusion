@@ -1,10 +1,10 @@
 lr: 1e-4
 lr_warmup_steps: 1500
 batch_size: 32
-pretrained_dcse_id: tc78mop4
-conditional: False
+pretrained_dcse_id: c0a04mm5
+conditional: True
 min_cond_split: 32
-max_length: 128
+seq_len: 128
 
 decoder:
   name: gpt2-large # 0.7B params

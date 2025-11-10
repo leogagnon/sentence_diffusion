@@ -21,7 +21,7 @@ import wandb
 import hydra
 from lightning.pytorch.utilities.rank_zero import rank_zero_info, rank_zero_only
 from tasks.autoencoder import AETask, InfiniteDistributedUniformSampler, compute_entropy
-from data.datasets import WikipediaDataset
+from data.datasets import WikipediaDataset, FineWebDataset
 from tqdm import tqdm
 from mauve import compute_mauve, get_features_from_input
 import einx
@@ -70,6 +70,7 @@ class DCSETask(L.LightningModule):
 
         # Setup dataset
         self.dataset = hydra.utils.instantiate(cfg.dataset)
+        self.dataset: WikipediaDataset | FineWebDataset
 
         # This is with a fixed seed to make sure validation set never changes
         self.train_indices, self.val_indices = self.dataset.get_train_val_indices(
@@ -100,7 +101,7 @@ class DCSETask(L.LightningModule):
 
     def get_collate_fn(self):
         # Just a big buffer, should never reach that
-        max_length = 160
+        max_length = self.dataset.max_length
 
         def fn(batch):
 

@@ -45,7 +45,7 @@ class DLCLMTaskConfig:
     pretrained_dcse_id: Optional[str] = None
     conditional: bool = False
     min_cond_split: int = 32
-    max_length: int = 128
+    seq_len: int = 128
 
     # If not giving pretrained_ae_id
     decoder: Optional[DecoderConfig] = None
@@ -103,7 +103,8 @@ class DLCLMTask(L.LightningModule):
         self.dataset = pretraining_task.dataset
 
         # Change the max length of the sequences to fit the task config
-        self.dataset.cfg.max_length = cfg.max_length
+        if cfg.conditional:
+            self.dataset.cfg.length_interval = [cfg.seq_len, cfg.seq_len]
 
         # Create/extract decoder
         if cfg.decoder is None:
@@ -217,7 +218,7 @@ class DLCLMTask(L.LightningModule):
 
     def get_collate_fn(self):
         dec_tokenizer = self.decoder.tokenizer
-        max_length = self.dataset.cfg.max_length
+        max_length = self.dataset.max_length
 
         @torch.no_grad()
         def fn(batch):
@@ -416,25 +417,27 @@ class DLCLMTask(L.LightningModule):
 
         if (batch_idx == 0) and (rank_zero_only.rank == 0):
             # Log MAUVE score every 5 validation steps (takes a few minutes)
-            if self.val_epoch_counter % 5 == 0:
+            if (self.val_epoch_counter % 5 == 0) and not self.cfg.conditional:
                 mauve = self.eval_mauve()
                 wandb.log({"val/MAUVE": mauve})
                 torch.cuda.empty_cache()
 
             if not self.ar_baseline:
-                # Reconstruct text from DLC
-                dlc = torch.stack(
-                    [
-                        batch["input_ids_dec"][i][
-                            batch["info_mask_dec"][i] == InfoLabel.DLC.value
-                        ]
-                        for i in range(5)
-                    ]
-                )
+
+                # Gather prompt <|think|> DLC
+                # prompt may be empty, in which case it's just DLC
+                prompt = [
+                    batch["input_ids_dec"][i][
+                        (batch["info_mask_dec"][i] == InfoLabel.DLC.value)
+                        + (batch["info_mask_dec"][i] == InfoLabel.PROMPT.value)
+                    ].tolist()
+                    for i in range(5)
+                ]
+
                 reconstruction = self.decoder.tokenizer.batch_decode(
                     self.decoder.generate(
-                        dlc=dlc,
-                        max_length=self.dataset.cfg.max_length,
+                        prompt=prompt,
+                        max_length=self.dataset.max_length,
                     ),
                     skip_special_tokens=True,
                 )

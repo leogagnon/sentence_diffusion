@@ -31,6 +31,7 @@ class WikipediaDataset(Dataset):
             "leogagnon/wikipedia-short-paragraphs", split="train"
         )
         self.cfg = cfg
+        self.max_length = self.cfg.max_length
 
     def get_train_val_indices(self, val_size):
         indices = torch.randperm(
@@ -66,6 +67,7 @@ class FineWebDataset(Dataset):
         )
         self.pre_tokenizer = AutoTokenizer.from_pretrained("gpt2-large")
         self.cfg = cfg
+        self.max_length = self.cfg.length_interval[1]
 
     def get_train_val_indices(self, val_size):
         indices = torch.randperm(
@@ -87,7 +89,7 @@ class FineWebDataset(Dataset):
         full_len = torch.Tensor([len(x) for x in input_ids])
         window_len = torch.randint(
             low=self.cfg.length_interval[0],
-            high=self.cfg.length_interval[1],
+            high=self.cfg.length_interval[1]+1,
             size=(len(input_ids),)
         )
         window_start = (
