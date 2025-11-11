@@ -1,7 +1,12 @@
 lr: 1e-4
-lr_warmup: true
-batch_size: 32
-pretrained_ae_id: qcd8dct8 
-pure_ar_baseline: true
+lr_warmup_steps: 1500
+batch_size: 16
+
+decoder:
+  name: gpt2-xl # 0.7B params
+
+dataset:
+  _target_: data.datasets.WikipediaDataset
+  max_length: 128
 
 name: dlclm

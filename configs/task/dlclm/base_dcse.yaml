@@ -1,7 +1,7 @@
 lr: 1e-4
 lr_warmup_steps: 1500
 batch_size: 32
-pretrained_dcse_id: c0a04mm5
+pretrained_dcse_id: zujk3eby
 conditional: True
 min_cond_split: 32
 seq_len: 128

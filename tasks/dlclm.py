@@ -20,7 +20,7 @@ import wandb
 import hydra
 from lightning.pytorch.utilities.rank_zero import rank_zero_info, rank_zero_only
 from tasks.autoencoder import AETask, InfiniteDistributedUniformSampler
-from data.datasets import WikipediaDataset
+from data.datasets import WikipediaDataset, FineWebDataset
 from tqdm import tqdm
 from mauve import compute_mauve, get_features_from_input
 import einx
@@ -49,6 +49,9 @@ class DLCLMTaskConfig:
 
     # If not giving pretrained_ae_id
     decoder: Optional[DecoderConfig] = None
+
+    # If baseline
+    dataset: Optional[dict] = None
 
     name: Optional[str] = None
 
@@ -94,13 +97,20 @@ class DLCLMTask(L.LightningModule):
                 strict=False,
                 map_location=torch.device("cpu"),
             )
+            # Extract dataset
+            self.train_indices = pretraining_task.train_indices
+            self.val_indices = pretraining_task.val_indices
+            self.dataset = pretraining_task.dataset
         else:
             self.ar_baseline = True
+            # Setup dataset
+            self.dataset = hydra.utils.instantiate(cfg.dataset)
+            self.dataset: WikipediaDataset | FineWebDataset
 
-        # Extract dataset
-        self.train_indices = pretraining_task.train_indices
-        self.val_indices = pretraining_task.val_indices
-        self.dataset = pretraining_task.dataset
+            # This is with a fixed seed to make sure validation set never changes
+            self.train_indices, self.val_indices = self.dataset.get_train_val_indices(
+                val_size=16384
+            )
 
         # Change the max length of the sequences to fit the task config
         if cfg.conditional:
@@ -474,7 +484,7 @@ class DLCLMTask(L.LightningModule):
                         self.decoder.generate(
                             max_length=self.dataset.cfg.max_length,
                             batch_size=128,
-                            dlc_len=(
+                            gen_dlc_len=(
                                 self.encoder.sem.dlc_len
                                 if hasattr(self, "encoder")
                                 else None

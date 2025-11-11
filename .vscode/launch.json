@@ -12,8 +12,9 @@
             "console": "integratedTerminal",
             "justMyCode": false,
             "args": [
-                "task/dcse=base",
+                "task/dlclm=base_dcse",
                 "num_devices=1",
+                "val_check_interval=1"
             ],
         }
     ]

@@ -179,7 +179,7 @@ def main(cfg: Optional[TrainConfig] = None, run_id: Optional[str] = None):
         * accumulate_grad_batches,  # to account for accumulation
         gradient_clip_val=cfg.gradient_clip_val,
         num_sanity_val_steps=0,
-        max_steps=cfg.max_steps * accumulate_grad_batches,
+        max_steps=cfg.max_steps,
         log_every_n_steps=50,
         accumulate_grad_batches=accumulate_grad_batches,
         precision=cfg.precision,
