@@ -1,4 +1,4 @@
 _target_: model.encoder.SEMHead
 L: 64
 V: 64
-temp: 1.0
+temp: 0.5

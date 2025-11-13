@@ -3,15 +3,11 @@ lr: 1e-4
 lr_warmup_steps: 1500
 val_size: 16384
 sub_p: 0.3
-delta_ent: 0.0
-delta_ent_warmup_steps: 10000
-
-dataset:
-  _target_: data.datasets.WikipediaDataset
-  max_length: 128
+delta_ent: 0.5
+delta_ent_warmup_steps: 5000
 
 encoder:
-  model_name: SONAR 
+  model_name: microsoft/deberta-v3-large 
 
 decoder:
   name: gpt2-large # 1.5B params
@@ -24,3 +20,4 @@ name: base_ae
 
 defaults:
   - encoder/sem: flat
+  - dataset: fineweb

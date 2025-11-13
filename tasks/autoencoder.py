@@ -172,7 +172,7 @@ class AETask(L.LightningModule):
 
     def get_collate_fn(self):
         dec_tokenizer = self.decoder.tokenizer
-        max_length = self.dataset.cfg.max_length
+        max_length = self.dataset.max_length
 
         def fn(batch):
 
@@ -197,7 +197,6 @@ class AETask(L.LightningModule):
                 input_ids_dec = dec_tokenizer.pad(
                     {"input_ids": input_ids_dec},
                     padding=True,
-                    truncation=True,
                     return_tensors="pt",
                     max_length=max_length,
                     return_attention_mask=False,
@@ -213,6 +212,7 @@ class AETask(L.LightningModule):
             )
 
             return {
+                "input_str": batch["input_str"],
                 "input_ids_dec": input_ids_dec,
                 "input_ids_enc": batch_enc["input_ids"],
                 "attention_mask_enc": batch_enc["attention_mask"].bool(),
@@ -263,9 +263,7 @@ class AETask(L.LightningModule):
     @torch.no_grad()
     def validation_step(self, batch, batch_idx):
 
-        z, dlc_probs = self.encoder(
-            batch["input_ids_enc"], batch["attention_mask_enc"], step=self.global_step
-        )
+        z, dlc_probs = self.encoder(batch["input_ids_enc"], batch["attention_mask_enc"])
 
         ent, m_ent = sem_entropy(dlc_probs)
 
@@ -308,11 +306,10 @@ class AETask(L.LightningModule):
             for original, reconstructed in zip(
                 batch["input_str"][:5],
                 self.decoder.tokenizer.batch_decode(
-                    self.decoder.generate(
-                        z=z[:5], max_length=self.dataset.cfg.max_length
-                    ),
+                    self.decoder.generate(z=z[:5], max_length=self.dataset.max_length),
                     skip_special_tokens=True,
                 ),
             ):
+                print(reconstructed)
                 table_clean.add_data(original, reconstructed)
             wandb.log({"val/samples": table_clean})

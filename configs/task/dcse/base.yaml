@@ -4,7 +4,7 @@ lr_warmup_steps: 1500
 val_size: 16384
 temp: 0.01
 delta_ent: 0.0
-delta_ent_warmup_steps: 10000
+delta_ent_warmup_steps: 0
 
 name: base_dcse
 

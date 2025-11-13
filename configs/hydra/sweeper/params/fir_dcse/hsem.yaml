@@ -1,0 +1,16 @@
+task/dcse: base
+model_checkpoint: base
+effective_batch_size: 512
+
+task/dcse/dataset: fineweb
+task/dcse/encoder/sem: h1, h2, h3, h2_long
+task.dcse.teacher.model_name: SONAR
+
+compile: false
+max_steps: 30000
+
+limit_val_batches: 4
+val_check_interval: 256
+
+sweep_id: fir_dcse/hsem
+

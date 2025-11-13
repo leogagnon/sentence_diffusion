@@ -46,7 +46,7 @@ class DecoderModel(nn.Module):
         # Init causal LM backbone
         self.backbone = AutoModelForCausalLM.from_pretrained(cfg.name)
         try:
-            self.backbone.set_attn_implementation("flash_attention_2")
+            self.backbone.set_attn_implementation("sdpa")
         except:
             rank_zero_info(
                 "Tried to use flash attention in decoder, but it is not available."
@@ -142,6 +142,7 @@ class DecoderModel(nn.Module):
         max_length: int,
         z: Optional[torch.Tensor] = None,
         prompt: Optional[List[int]] = None,
+        dlc: Optional[torch.Tensor] = None,
         gen_dlc_len: Optional[int] = None,
         batch_size: Optional[int] = None,
         gen_kwargs: Optional[dict] = None,
@@ -152,11 +153,13 @@ class DecoderModel(nn.Module):
         Format of the generation is : prompt <|think|> DLC <|bos|> text
         """
         device = next(self.parameters()).device
+
         # If in DLC mode
         if self.is_dlc:
             assert z is None
             batch_size = batch_size if prompt is None else len(prompt)
 
+            # if not prompt, set it to <|think|>
             if prompt is None:
                 prompt = (
                     torch.full(
@@ -171,72 +174,76 @@ class DecoderModel(nn.Module):
                 prompt_mask = None
             else:
                 prompt = self.tokenizer.pad(
-                    {"input_ids": prompt}, padding=True, padding_side="left", return_tensors="pt"
-                )
+                    {"input_ids": prompt},
+                    padding=True,
+                    padding_side="left",
+                    return_tensors="pt",
+                ).to(device=device)
                 prompt, prompt_mask = prompt["input_ids"], prompt["attention_mask"]
-                prompt = prompt.to(device=device)
-                prompt_mask = prompt_mask.to(device=device)
 
-            if gen_dlc_len is not None:
-                # If no DLC is provided, generate it
+            # if no DLC, generate it
+            if dlc is None:
+                assert gen_dlc_len is not None
                 gen_cfg_dlc = {
-                    "max_new_tokens": gen_dlc_len + 1,  # 32-token DLC + closing <|bos|>
+                    "max_new_tokens": gen_dlc_len,
                     "do_sample": True,
                     "top_p": 1.0,
                     "top_k": 50,
                     "num_beams": 1,
                     "temperature": 1.0,
-                    "return_dict_in_generate": True,
                     "pad_token_id": self.tokenizer.pad_token_id,
                     "eos_token_id": self.tokenizer.bos_token_id,
-                    "use_cache": True,
+                    "use_cache": False,
                 }
                 if gen_kwargs_dlc is not None:
                     gen_cfg_dlc.update(gen_kwargs_dlc)
 
-                # Generate DLC from prompt
                 dlc = self.backbone.generate(
                     input_ids=prompt,
                     attention_mask=prompt_mask,
                     generation_config=GenerationConfig(**gen_cfg_dlc),
-                ).sequences
-
-                # Remove closing <|bos|>, will be re-added for continuation generation
-                dlc = dlc[:, :-1]
-
-                # Add DLC to prompt
-                prompt = torch.cat([prompt, dlc], dim=1)
-                prompt_mask = (
-                    torch.ones_like(prompt, dtype=torch.bool)
-                    if prompt_mask is None
-                    else torch.cat([prompt_mask, torch.ones_like(dlc, dtype=torch.bool)])
                 )
 
-            # Compute the cache, cache_position (number of tokens in cache) and attention mask (with added <|bos|>)
+            # Append DLC after prompt => ... <|think|> DLC
+            prompt = torch.cat([prompt, dlc], dim=1)
+            prompt_mask = (
+                torch.ones_like(prompt, dtype=torch.bool)
+                if prompt_mask is None
+                else torch.cat(
+                    [prompt_mask, torch.ones_like(dlc, dtype=torch.bool)]
+                )
+            )
+
+            # Compute the KV cache of the prompt, along with import kwargs for generate
             cache = self.backbone(
                 input_ids=prompt,
                 attention_mask=prompt_mask,
                 use_cache=True,
             ).past_key_values
-            cache_position = torch.IntTensor(
-                [m.sum() for m in prompt_mask]
-            )[:, None].to(device=device)
+            cache_position = torch.tensor([prompt_mask.shape[1]], device=device)
             attention_mask = torch.cat(
                 [prompt_mask, torch.ones_like(prompt_mask[:, [0]])], dim=1
             )
+            position_ids = torch.stack(
+                [
+                    torch.cat([torch.zeros(attention_mask.shape[1] - l), torch.arange(l)])
+                    for l in attention_mask.sum(-1)
+                ]
+            ).to(dtype=torch.long, device=prompt.device)
 
         # If generating from continuous latent (for auto-encoder)
         elif z != None:
+            batch_size = z.shape[0]
             soft_prompt = self.z_to_soft_prompt(z)
             cache = self.backbone(
                 inputs_embeds=soft_prompt,
                 use_cache=True,
             ).past_key_values
-            batch_size = z.shape[0]
             cache_position = torch.tensor([soft_prompt.shape[1]], device=device)
             attention_mask = torch.ones(
-                (soft_prompt.shape[0], soft_prompt.shape[1] + 1), device=device
+                (soft_prompt.shape[0], soft_prompt.shape[1] + 1), device=device, dtype=torch.long
             )
+            position_ids = attention_mask.cumsum(-1) - 1
         # If generating unconditionally (for baseline)
         else:
             assert (
@@ -245,6 +252,7 @@ class DecoderModel(nn.Module):
             cache = None
             cache_position = None
             attention_mask = None
+            position_ids = None
 
         # Autoregressive generation from <|BOS|> token (maybe with cached prefix)
         bos = torch.full(
@@ -254,7 +262,7 @@ class DecoderModel(nn.Module):
             dtype=torch.long,
         )
         gen_cfg = {
-            "max_new_tokens": max_length,  # 32-token DLC + closing <|bos|>
+            "max_new_tokens": max_length, 
             "do_sample": True,
             "top_p": 1.0,
             "top_k": 50,
@@ -267,12 +275,13 @@ class DecoderModel(nn.Module):
         }
         if gen_kwargs is not None:
             gen_cfg.update(gen_kwargs)
+
         output = self.backbone.generate(
             input_ids=bos,
             generation_config=GenerationConfig(**gen_cfg),
             past_key_values=cache,
             cache_position=cache_position,
+            position_ids=position_ids,
             attention_mask=attention_mask,
         ).sequences
-
         return output

@@ -2,4 +2,4 @@ _target_: model.encoder.HSEMHead
 L: 16
 V: 8
 D: 4
-temp: 1.0
+temp: 0.5
