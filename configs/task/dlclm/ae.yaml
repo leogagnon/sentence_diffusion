@@ -3,7 +3,7 @@ lr_warmup_steps: 1500
 batch_size: 32
 pretrained_ae_id: a0acqfq2
 conditional: True
-min_cond_split: 32
+cond_split_bounds: [0.25, 0.75]
 seq_len: 128
 
 decoder:

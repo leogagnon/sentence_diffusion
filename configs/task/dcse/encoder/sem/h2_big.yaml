@@ -1,0 +1,5 @@
+_target_: model.encoder.HSEMHead
+L: 4
+V: 16
+D: 4
+temp: 0.5

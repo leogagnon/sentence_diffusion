@@ -219,8 +219,16 @@ class EncoderModel(nn.Module):
             if "qwen" in cfg.model_name.lower():
                 model_kwargs.update({"attn_implementation": "flash_attention_2"})
 
+            if "nemotron" in cfg.model_name.lower():
+                model_kwargs.update(
+                    {
+                        "attn_implementation": "flash_attention_2",
+                        "dtype": "bfloat16",
+                    }
+                )
+
             backbone = sentence_transformers.SentenceTransformer(
-                cfg.model_name, model_kwargs=model_kwargs
+                cfg.model_name, model_kwargs=model_kwargs,trust_remote_code=True,
             )
 
             self.transformer = backbone[0]
