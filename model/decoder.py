@@ -20,7 +20,7 @@ from torch.nn import ModuleDict
 from tokenizers.processors import TemplateProcessing
 from lightning.pytorch.utilities.rank_zero import rank_zero_info
 from transformers import GenerationConfig
-
+from copy import deepcopy
 
 @dataclass
 class PromptGeneratorConfig:
@@ -202,7 +202,7 @@ class DecoderModel(nn.Module):
                     input_ids=prompt,
                     attention_mask=prompt_mask,
                     generation_config=GenerationConfig(**gen_cfg_dlc),
-                )
+                )[:, prompt.shape[1]:]
 
             # Append DLC after prompt => ... <|think|> DLC
             prompt = torch.cat([prompt, dlc], dim=1)
@@ -210,7 +210,7 @@ class DecoderModel(nn.Module):
                 torch.ones_like(prompt, dtype=torch.bool)
                 if prompt_mask is None
                 else torch.cat(
-                    [prompt_mask, torch.ones_like(dlc, dtype=torch.bool)]
+                    [prompt_mask, torch.ones_like(dlc, dtype=torch.bool)], dim=1
                 )
             )
 
@@ -218,18 +218,19 @@ class DecoderModel(nn.Module):
             cache = self.backbone(
                 input_ids=prompt,
                 attention_mask=prompt_mask,
+                position_ids=(prompt_mask.cumsum(dim=1) - 1).masked_fill(prompt_mask == 0, 1),
                 use_cache=True,
             ).past_key_values
             cache_position = torch.tensor([prompt_mask.shape[1]], device=device)
             attention_mask = torch.cat(
                 [prompt_mask, torch.ones_like(prompt_mask[:, [0]])], dim=1
             )
-            position_ids = torch.stack(
-                [
-                    torch.cat([torch.zeros(attention_mask.shape[1] - l), torch.arange(l)])
-                    for l in attention_mask.sum(-1)
-                ]
-            ).to(dtype=torch.long, device=prompt.device)
+            input_ids = torch.full(
+                (batch_size, 1),
+                self.tokenizer.bos_token_id,
+                device=device,
+                dtype=torch.long,
+            )
 
         # If generating from continuous latent (for auto-encoder)
         elif z != None:
@@ -241,28 +242,43 @@ class DecoderModel(nn.Module):
             ).past_key_values
             cache_position = torch.tensor([soft_prompt.shape[1]], device=device)
             attention_mask = torch.ones(
-                (soft_prompt.shape[0], soft_prompt.shape[1] + 1), device=device, dtype=torch.long
+                (soft_prompt.shape[0], soft_prompt.shape[1] + 1),
+                device=device,
+                dtype=torch.long,
             )
-            position_ids = attention_mask.cumsum(-1) - 1
+            input_ids = torch.full(
+                (batch_size, 1),
+                self.tokenizer.bos_token_id,
+                device=device,
+                dtype=torch.long,
+            )
         # If generating unconditionally (for baseline)
         else:
-            assert (
-                batch_size is not None
-            ), "Must provide batch_size if no conditionning is given"
+            if prompt is not None:
+                prompt = self.tokenizer.pad(
+                    {"input_ids": prompt},
+                    padding=True,
+                    padding_side="left",
+                    return_tensors="pt",
+                ).to(device=device)
+                input_ids, attention_mask = (
+                    prompt["input_ids"],
+                    prompt["attention_mask"],
+                )
+            else:
+                input_ids = torch.full(
+                    (batch_size, 1),
+                    self.tokenizer.bos_token_id,
+                    device=device,
+                    dtype=torch.long,
+                )
+                attention_mask = None
+
             cache = None
             cache_position = None
-            attention_mask = None
-            position_ids = None
 
-        # Autoregressive generation from <|BOS|> token (maybe with cached prefix)
-        bos = torch.full(
-            (batch_size, 1),
-            self.tokenizer.bos_token_id,
-            device=device,
-            dtype=torch.long,
-        )
         gen_cfg = {
-            "max_new_tokens": max_length, 
+            "max_new_tokens": max_length,
             "do_sample": True,
             "top_p": 1.0,
             "top_k": 50,
@@ -277,11 +293,14 @@ class DecoderModel(nn.Module):
             gen_cfg.update(gen_kwargs)
 
         output = self.backbone.generate(
-            input_ids=bos,
+            input_ids=input_ids,
             generation_config=GenerationConfig(**gen_cfg),
-            past_key_values=cache,
+            past_key_values=deepcopy(cache),
             cache_position=cache_position,
-            position_ids=position_ids,
             attention_mask=attention_mask,
         ).sequences
+
+        # Remove the input_ids prefix
+        output = output[:, input_ids.shape[1] :]
+
         return output

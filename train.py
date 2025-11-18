@@ -15,7 +15,7 @@ from tasks.dcse import DCSETask, DCSETaskConfig
 from lightning.pytorch.callbacks import EarlyStopping
 from lightning.pytorch.utilities.rank_zero import rank_zero_info, rank_zero_only
 
-torch.set_float32_matmul_precision('high')
+torch.set_float32_matmul_precision("high")
 torch._dynamo.config.capture_scalar_outputs = True
 
 
@@ -61,7 +61,7 @@ def main(cfg: Optional[TrainConfig] = None, run_id: Optional[str] = None):
         wandb_id = run_id
         api = wandb.Api()
         entity = "guillaume-lajoie"
-        project = "dlc_lm"
+        project = "dlc_lm_0"
         run = api.run(f"{entity}/{project}/{run_id}")
         cfg = OmegaConf.merge(OmegaConf.structured(TrainConfig), run.config)
 
@@ -116,14 +116,14 @@ def main(cfg: Optional[TrainConfig] = None, run_id: Optional[str] = None):
         # Add the autoencoder config to cfg
         if cfg.task.dlclm.pretrained_ae_id is not None:
             run = wandb.Api().run(
-                f"guillaume-lajoie/dlc_lm/{cfg.task.dlclm.pretrained_ae_id}"
+                f"guillaume-lajoie/dlc_lm_0/{cfg.task.dlclm.pretrained_ae_id}"
             )
             cfg.task.ae = OmegaConf.merge(
                 OmegaConf.structured(AETaskConfig), run.config["task"]["ae"]
             )
         elif cfg.task.dlclm.pretrained_dcse_id is not None:
             run = wandb.Api().run(
-                f"guillaume-lajoie/dlc_lm/{cfg.task.dlclm.pretrained_dcse_id}"
+                f"guillaume-lajoie/dlc_lm_0/{cfg.task.dlclm.pretrained_dcse_id}"
             )
             cfg.task.dcse = OmegaConf.merge(
                 OmegaConf.structured(DCSETaskConfig),

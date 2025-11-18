@@ -27,7 +27,9 @@ import einx
 from transformers import get_constant_schedule_with_warmup
 from tasks.dcse import DCSETask, DCSETaskConfig
 from enum import Enum
-
+from tasks.utils import *
+from typing import Tuple, List, ClassVar
+from dataclasses import field
 
 class InfoLabel(Enum):
     CONT = 0
@@ -44,8 +46,9 @@ class DLCLMTaskConfig:
     pretrained_ae_id: Optional[str] = None
     pretrained_dcse_id: Optional[str] = None
     conditional: bool = False
-    min_cond_split: int = 32
     seq_len: int = 128
+    evalppl: bool = True
+    cond_split_bounds: Optional[Tuple[float, float]] = None
 
     # If not giving pretrained_ae_id
     decoder: Optional[DecoderConfig] = None
@@ -86,6 +89,10 @@ class DLCLMTask(L.LightningModule):
                 strict=False,
                 map_location=torch.device("cpu"),
             )
+            # Extract dataset
+            self.train_indices = pretraining_task.train_indices
+            self.val_indices = pretraining_task.val_indices
+            self.dataset = pretraining_task.dataset
         elif cfg.pretrained_dcse_id is not None:
             pretraining_task = DCSETask.load_from_checkpoint(
                 os.path.join(
@@ -116,6 +123,17 @@ class DLCLMTask(L.LightningModule):
         if cfg.conditional:
             self.dataset.cfg.length_interval = [cfg.seq_len, cfg.seq_len]
 
+        if cfg.evalppl:
+            # We put in a list so that it is not treated as a submodule
+            # hence remains on CPU
+            self.ppl_model = [
+                AutoModelForCausalLM.from_pretrained(
+                    "meta-llama/Llama-3.2-3B", dtype=torch.bfloat16
+                ).cpu()
+            ]
+            self.ppl_tok = AutoTokenizer.from_pretrained("meta-llama/Llama-3.2-3B")
+            self.ppl_tok.pad_token = self.ppl_tok.eos_token
+
         # Create/extract decoder
         if cfg.decoder is None:
             assert self.cfg.pretrained_ae_id is not None
@@ -124,6 +142,14 @@ class DLCLMTask(L.LightningModule):
             self.decoder = self.decoder.train().requires_grad_(True)
         else:
             self.decoder = DecoderModel(cfg.decoder).train().requires_grad_(True)
+
+        # Add <|think|> token
+        self.decoder.tokenizer.add_special_tokens(
+            {"additional_special_tokens": ["<|think|>"]}
+        )
+        self.decoder.tokenizer.think_token_id = (
+            self.decoder.tokenizer.convert_tokens_to_ids("<|think|>")
+        )
 
         # Extract encoder and setup decoder vocab
         if not self.ar_baseline:
@@ -134,13 +160,7 @@ class DLCLMTask(L.LightningModule):
 
             # Turn on DLC mode on decoder
             self.decoder.is_dlc = True
-            # Add <|think|> token
-            self.decoder.tokenizer.add_special_tokens(
-                {"additional_special_tokens": ["<|think|>"]}
-            )
-            self.decoder.tokenizer.think_token_id = (
-                self.decoder.tokenizer.convert_tokens_to_ids("<|think|>")
-            )
+
             # Add DLC tokens
             self.decoder.backbone.resize_token_embeddings(
                 len(self.decoder.tokenizer) + self.encoder.sem.cfg.V, mean_resizing=True
@@ -237,7 +257,7 @@ class DLCLMTask(L.LightningModule):
 
             if "input_ids" not in batch:
                 # Compute input_ids of the decoder if not already there
-                # This adds <|bos|> and <|eos|>
+                # This may include <|bos|> and <|eos|> (e.g. for unconditional wiki)
                 input_ids_dec = dec_tokenizer.batch_encode_plus(
                     input_str,
                     truncation=True,
@@ -248,30 +268,19 @@ class DLCLMTask(L.LightningModule):
             else:
                 input_ids_dec = batch["input_ids"]
 
-            # If runnign the AR baseline, simply return
-            if self.ar_baseline:
-                input_ids_dec = dec_tokenizer.pad(
-                    {"input_ids": input_ids_dec},
-                    padding=True,
-                    return_tensors="pt",
-                    return_attention_mask=False,
-                )["input_ids"]
-                info_mask_dec = torch.full_like(
-                    input_ids_dec, fill_value=InfoLabel.CONT.value, dtype=torch.int32
-                )
-                info_mask_dec[input_ids_dec == dec_tokenizer.pad_token_id] = (
-                    InfoLabel.PAD.value
-                )
-                return {"input_ids_dec": input_ids_dec, "info_mask_dec": info_mask_dec}
-
             # If conditional, split sequence in two : prompt, continuation
             # Else consider empty prompt and the whole sequence as continuation
             if self.cfg.conditional:
-                prompt_len = torch.randint(
-                    low=self.cfg.min_cond_split,
-                    high=max_length - self.cfg.min_cond_split,
-                    size=(len(input_ids_dec),),
-                )
+                prompt_len_ratio = (
+                    torch.rand(size=(len(input_ids_dec),))
+                    * (self.cfg.cond_split_bounds[1] - self.cfg.cond_split_bounds[0])
+                ) + self.cfg.cond_split_bounds[0]
+                prompt_len = (
+                    torch.Tensor(
+                        [len(x) for x in input_ids_dec], device=prompt_len_ratio.device
+                    )
+                    * prompt_len_ratio
+                ).int()
                 prompt_dec = [
                     x[:l] + [dec_tokenizer.think_token_id]
                     for x, l in zip(input_ids_dec, prompt_len)
@@ -289,6 +298,33 @@ class DLCLMTask(L.LightningModule):
                 ]
                 continuation_dec = input_ids_dec
                 continuation_str = input_str
+
+            # If runnign the AR baseline, return now
+            if self.ar_baseline:
+                input_ids_dec = dec_tokenizer.pad(
+                    {"input_ids": input_ids_dec},
+                    padding=True,
+                    return_tensors="pt",
+                    return_attention_mask=False,
+                )["input_ids"]
+                info_mask_dec = torch.full_like(
+                    input_ids_dec, fill_value=InfoLabel.CONT.value, dtype=torch.int32
+                )
+                info_mask_dec[input_ids_dec == dec_tokenizer.pad_token_id] = (
+                    InfoLabel.PAD.value
+                )
+                if self.cfg.conditional:
+                    # Identify prompt
+                    info_mask_dec[
+                        torch.arange(info_mask_dec.shape[1]).unsqueeze(0)
+                        < prompt_len.unsqueeze(1)
+                    ] = InfoLabel.PROMPT.value
+
+                return {
+                    "input_ids_dec": input_ids_dec,
+                    "info_mask_dec": info_mask_dec,
+                    "input_str": input_str,
+                }
 
             # Compute DLC of continuation
             with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
@@ -340,6 +376,7 @@ class DLCLMTask(L.LightningModule):
                 "input_ids_dec": input_ids_dec,
                 "info_mask_dec": info_mask_dec,
                 "input_str": input_str,
+                "continuation_str": continuation_str,
             }
 
         return fn
@@ -364,24 +401,24 @@ class DLCLMTask(L.LightningModule):
         ].mean()
 
         # p(z)p(x|z)
-        self.log(
-            "train/full_loss",
-            full_loss,
-            on_epoch=False,
-            on_step=True,
-            sync_dist=True,
-        )
-
-        # p(x|z) only, more like the reconstruction loss
         if not self.ar_baseline:
-            cond_loss = loss[info_mask_dec == InfoLabel.CONT.value].mean()
             self.log(
-                "train/cond_loss",
-                cond_loss,
+                "train/full_loss",
+                full_loss,
                 on_epoch=False,
                 on_step=True,
                 sync_dist=True,
             )
+
+        # p(x|z) only, more like the reconstruction loss
+        cond_loss = loss[info_mask_dec == InfoLabel.CONT.value].mean()
+        self.log(
+            "train/cond_loss",
+            cond_loss,
+            on_epoch=False,
+            on_step=True,
+            sync_dist=True,
+        )
 
         return full_loss
 
@@ -406,61 +443,132 @@ class DLCLMTask(L.LightningModule):
         ].mean()
 
         # p(z)p(x|z)
-        self.log(
-            "val/full_loss",
-            full_loss,
-            on_epoch=True,
-            on_step=False,
-            sync_dist=True,
-        )
-
         if not self.ar_baseline:
-            # p(x|z) only, more like the reconstruction loss
-            cond_loss = loss[info_mask_dec == InfoLabel.CONT.value].mean()
             self.log(
-                "val/cond_loss",
-                cond_loss,
+                "val/full_loss",
+                full_loss,
                 on_epoch=True,
                 on_step=False,
                 sync_dist=True,
             )
 
-        if (batch_idx == 0) and (rank_zero_only.rank == 0):
-            # Log MAUVE score every 5 validation steps (takes a few minutes)
-            if (self.val_epoch_counter % 5 == 0) and not self.cfg.conditional:
-                mauve = self.eval_mauve()
-                wandb.log({"val/MAUVE": mauve})
+        
+        # p(x|z) only, more like the reconstruction loss
+        cond_loss = loss[info_mask_dec == InfoLabel.CONT.value].mean()
+        self.log(
+            "val/cond_loss",
+            cond_loss,
+            on_epoch=True,
+            on_step=False,
+            sync_dist=True,
+        )
+
+        if (batch_idx == 0) and not ((not self.cfg.conditional) and self.ar_baseline):
+            bs = len(batch["input_ids_dec"])
+
+            # Gather prompt and DLC from input_ids
+            prompt = [
+                batch["input_ids_dec"][i][
+                    (batch["info_mask_dec"][i] == InfoLabel.PROMPT.value)
+                ].tolist()
+                for i in range(bs)
+            ]
+            dlc = [
+                batch["input_ids_dec"][i][
+                    (batch["info_mask_dec"][i] == InfoLabel.DLC.value)
+                ]
+                for i in range(bs)
+            ]
+            dlc = torch.stack(dlc) if torch.stack(dlc).shape[1] != 0 else None
+
+            if self.cfg.evalppl:
+                device = batch["input_ids_dec"].device
+
+                prompt_str = self.decoder.tokenizer.batch_decode(
+                    prompt, skip_special_tokens=True
+                )
+
+                continuations = self.decoder.tokenizer.batch_decode(
+                    self.decoder.generate(
+                        prompt=prompt,
+                        max_length=self.dataset.max_length,
+                        gen_dlc_len=(
+                            self.encoder.sem.dlc_len if not self.ar_baseline else None
+                        ),
+                    ),
+                    skip_special_tokens=True,
+                )
+
+                # Tokenize the sequences with perplexity model
+                ppl_batch = self.ppl_tok.batch_encode_plus(
+                    [p + c for p, c in zip(prompt_str, continuations)],
+                    padding=True,
+                    return_tensors="pt",
+                    return_offsets_mapping=True,
+                    add_special_tokens=False,
+                    return_attention_mask=False,
+                ).to(device=device)
+
+                # Compute token index where continuation starts
+                split_idx = split_index_from_offsets(
+                    ppl_batch["offset_mapping"],
+                    [len(p) for p in prompt_str],
+                )
+
+                # Setup labels (-100 for prompt and padding)
+                labels = ppl_batch["input_ids"].clone()
+                labels[labels == self.ppl_tok.pad_token_id] = -100
+                for i in range(len(labels)):
+                    labels[i, : split_idx[i]] = -100
+
+                # Compute conditional perplexity of continuations
+                ppl_model = self.ppl_model[0]
+                ppl_model.to(device)
+                ppl = torch.exp(
+                    ppl_model(input_ids=ppl_batch["input_ids"], labels=labels).loss
+                )
+                ppl_model.cpu()
                 torch.cuda.empty_cache()
 
-            if not self.ar_baseline:
+                self.log(
+                    "val/generativeppl",
+                    ppl,
+                    on_epoch=True,
+                    on_step=False,
+                    sync_dist=True,
+                )
 
-                # Gather prompt <|think|> DLC
-                # prompt may be empty, in which case it's just DLC
-                prompt = [
-                    batch["input_ids_dec"][i][
-                        (batch["info_mask_dec"][i] == InfoLabel.DLC.value)
-                        + (batch["info_mask_dec"][i] == InfoLabel.PROMPT.value)
-                    ].tolist()
-                    for i in range(5)
-                ]
-
+            if (rank_zero_only.rank == 0) and not self.ar_baseline:
+                # Generate from ground truth DLC
                 reconstruction = self.decoder.tokenizer.batch_decode(
                     self.decoder.generate(
                         prompt=prompt,
+                        dlc=dlc,
                         max_length=self.dataset.max_length,
                     ),
                     skip_special_tokens=True,
                 )
 
-                # Put in table and log
                 table_clean = wandb.Table(columns=["Original", "Reconstructed"])
                 for original, reconstructed in zip(
-                    batch["input_str"][:5],
-                    reconstruction,
+                    batch["continuation_str"][:5],
+                    reconstruction[:5],
                 ):
                     table_clean.add_data(original, reconstructed)
                 wandb.log({"val/clean_samples": table_clean})
                 del table_clean
+
+        if (
+            (batch_idx == 0)
+            and (rank_zero_only.rank == 0)
+            and (self.val_epoch_counter % 5 == 0)
+            and (not self.cfg.conditional)
+            and ("wiki" in str(self.dataset.__class__.__name__))
+        ):
+            # Log MAUVE score every 5 validation steps (takes a few minutes)
+            mauve = self.eval_mauve()
+            wandb.log({"val/MAUVE": mauve})
+            torch.cuda.empty_cache()
 
     def eval_mauve(
         self,

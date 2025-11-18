@@ -1,12 +1,16 @@
 lr: 1e-4
 lr_warmup_steps: 1500
 batch_size: 32
-pretrained_dcse_id: zujk3eby
+pretrained_dcse_id: null
 conditional: True
 min_cond_split: 32
 seq_len: 128
 
 decoder:
   name: gpt2-large # 0.7B params
+
+dataset:
+  _target_: data.datasets.FineWebDataset
+  length_interval: [128, 128]
 
 name: dlclm

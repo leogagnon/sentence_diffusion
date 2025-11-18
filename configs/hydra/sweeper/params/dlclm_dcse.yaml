@@ -1,0 +1,14 @@
+task/dlclm: dcse
+model_checkpoint: base
+effective_batch_size: 1024
+
+task.dlclm.pretrained_dcse_id: y7corxb1, 080hvl33, 15zs9jrb, frov5a3g, 8chqtcd8, e0wx3b1t, x6xgw73v, wfix7foe, 3dyv8pps, 7q7kkk78, no5hqvwc, pjrdb8t0
+task.dlclm.decoder.name: gpt2
+
+compile: false
+max_steps: 30000
+
+limit_val_batches: 4
+val_check_interval: 256
+
+sweep_id: dlclm_dcse

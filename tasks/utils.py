@@ -102,3 +102,20 @@ def compute_entropy(probs, normalized=False):
         return ent / math.log(probs.shape[-1])
     return ent
 
+def split_index_from_offsets(
+    batch_offsets,
+    batch_char_prefix_lengths,
+):
+    B = len(batch_offsets)
+    out = []
+
+    for offsets, L in zip(batch_offsets, batch_char_prefix_lengths):
+        split_idx = 0
+        for i, (start, end) in enumerate(offsets):
+            if end < L:
+                split_idx = i + 1
+            else:
+                break
+        out.append(split_idx)
+
+    return out

@@ -10,6 +10,6 @@ args = parser.parse_args()
 filters = {
     "config.sweep_id": args.sweep_id,
 }
-runs = api.runs(f"guillaume-lajoie/dlc_lm", filters=filters)
+runs = api.runs(f"guillaume-lajoie/dlc_lm_0", filters=filters)
 for run in runs:
     print(run.id, end=", ")

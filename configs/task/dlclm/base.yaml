@@ -1,6 +1,0 @@
-lr: 1e-4
-lr_warmup: true
-batch_size: 32
-pretrained_ae_id: p6yn6kc1
-
-name: dlclm

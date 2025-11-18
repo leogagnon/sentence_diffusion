@@ -62,9 +62,7 @@ class FineWebDataset(Dataset):
     def __init__(self, cfg: Optional[FineWebDatasetConfig] = None, **kwargs):
         if cfg == None:
             cfg = FineWebDatasetConfig(**kwargs)
-        self.dataset = load_dataset(
-            "leogagnon/fineweb_100BT_tokenized_gpt2", split="train"
-        )
+        self.dataset = load_dataset("leogagnon/fineweb_100BT_tokenized_gpt2", split="train")
         self.pre_tokenizer = AutoTokenizer.from_pretrained("gpt2-large")
         self.cfg = cfg
         self.max_length = self.cfg.length_interval[1]
