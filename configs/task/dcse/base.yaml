@@ -5,6 +5,7 @@ val_size: 16384
 temp: 0.01
 delta_ent: 0.0
 delta_ent_warmup_steps: 0
+ce_loss: True
 
 name: base_dcse
 

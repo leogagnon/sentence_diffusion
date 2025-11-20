@@ -51,7 +51,7 @@ class AETaskConfig:
 
 class AETask(L.LightningModule):
     """
-    Autoencoder Task.
+    Train a SEM encoder with a denoising Auto-Encoder task
     """
 
     def __init__(self, cfg: Optional[AETaskConfig] = None, **kwargs):

@@ -61,8 +61,7 @@ class DLCLMTaskConfig:
 
 class DLCLMTask(L.LightningModule):
     """
-    Modify a language decoder to sample from p(z)p(x|z)
-    where z is a DLC of a pretrained autoencoder.
+    Finetune a Language Model to use DLCs (DLC-LM)
     """
 
     def __init__(self, cfg: Optional[DLCLMTaskConfig] = None, **kwargs):
@@ -394,17 +393,14 @@ class DLCLMTask(L.LightningModule):
             targets.view(-1),
             reduction="none",
         )
-        loss = loss.view_as(targets)
-        full_loss = loss[
-            (info_mask_dec == InfoLabel.DLC.value)
-            + (info_mask_dec == InfoLabel.CONT.value)
-        ].mean()
+        loss = loss.view_as(targets)        
 
-        # p(z)p(x|z)
+        # p(z)
         if not self.ar_baseline:
+            dlc_loss = loss[info_mask_dec == InfoLabel.DLC.value].mean()
             self.log(
-                "train/full_loss",
-                full_loss,
+                "train/dlc_loss",
+                dlc_loss,
                 on_epoch=False,
                 on_step=True,
                 sync_dist=True,
@@ -419,6 +415,11 @@ class DLCLMTask(L.LightningModule):
             on_step=True,
             sync_dist=True,
         )
+
+        full_loss = loss[
+            (info_mask_dec == InfoLabel.DLC.value)
+            + (info_mask_dec == InfoLabel.CONT.value)
+        ].mean()
 
         return full_loss
 
@@ -437,16 +438,13 @@ class DLCLMTask(L.LightningModule):
             reduction="none",
         )
         loss = loss.view_as(targets)
-        full_loss = loss[
-            (info_mask_dec == InfoLabel.DLC.value)
-            + (info_mask_dec == InfoLabel.CONT.value)
-        ].mean()
-
+        
         # p(z)p(x|z)
         if not self.ar_baseline:
+            dlc_loss = loss[info_mask_dec == InfoLabel.DLC.value].mean()
             self.log(
-                "val/full_loss",
-                full_loss,
+                "val/dlc_loss",
+                dlc_loss,
                 on_epoch=True,
                 on_step=False,
                 sync_dist=True,

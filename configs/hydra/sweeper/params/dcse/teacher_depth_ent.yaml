@@ -1,0 +1,17 @@
+task/dcse: base
+model_checkpoint: base
+effective_batch_size: 512
+
+task/dcse/dataset: fineweb
+task/dcse/encoder/sem: h2
+task.dcse.encoder.sem.V: 8, 16
+task.dcse.delta_ent: 1.0
+task.dcse.teacher.model_name: SONAR, nvidia/llama-embed-nemotron-8b
+
+compile: false
+max_steps: 30000
+
+limit_val_batches: 4
+val_check_interval: 256
+
+sweep_id: dcse/teacher_depth_ent

@@ -44,13 +44,14 @@ class DCSETaskConfig:
     temp: float = 0.01
     delta_ent: float = 0.0
     delta_ent_warmup_steps: int = 10000
+    ce_loss: bool = True
 
     name: Optional[str] = None
 
 
 class DCSETask(L.LightningModule):
     """
-    Autoencoder Task.
+    Train a SEM encoder by Distilling a pretrained Constrative Sentence Embedding (DCSE)
     """
 
     def __init__(self, cfg: Optional[DCSETaskConfig] = None, **kwargs):
@@ -200,7 +201,7 @@ class DCSETask(L.LightningModule):
 
         bs = z_student.size(0)
 
-        # Compute cosine similarity matrices
+        # Compute cosine similarity matrices of teacher/student
         sim_student = torch.nn.functional.cosine_similarity(
             z_student[:, None], z_student[None], dim=-1
         )
@@ -213,14 +214,18 @@ class DCSETask(L.LightningModule):
         sim_student = sim_student[offdiag_mask].reshape(bs, bs - 1)
         sim_teacher = sim_teacher[offdiag_mask].reshape(bs, bs - 1)
 
-        # Compute cross entropy
-        loss = torch.nansum(
-            -(
-                torch.softmax(sim_teacher / self.cfg.temp, dim=-1)
-                * torch.log_softmax(sim_student / self.cfg.temp, dim=-1)
-            ),
-            dim=-1,
-        )
+        if self.cfg.ce_loss:
+            # Compute cross entropy
+            loss = torch.nansum(
+                -(
+                    torch.softmax(sim_teacher / self.cfg.temp, dim=-1)
+                    * torch.log_softmax(sim_student / self.cfg.temp, dim=-1)
+                ),
+                dim=-1,
+            )
+        else:
+            loss = (sim_student - sim_teacher)**2
+
 
         return loss.mean()
 

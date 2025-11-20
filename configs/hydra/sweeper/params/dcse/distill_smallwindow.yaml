@@ -1,0 +1,16 @@
+task/dcse: base
+model_checkpoint: base
+effective_batch_size: 512
+
+task/dcse/dataset: fineweb
+task/dcse/encoder/sem: h2
+task.dcse.teacher.model_name: nvidia/llama-embed-nemotron-8b
+
+task.dcse.dataset.length_interval: [16, 32]
+compile: false
+max_steps: 30000
+
+limit_val_batches: 4
+val_check_interval: 256
+
+sweep_id: dcse/distill_smallwindow
