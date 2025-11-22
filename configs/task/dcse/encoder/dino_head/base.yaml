@@ -1,0 +1,5 @@
+dim: null
+nlayers: 3
+hidden_dim: 2048
+bottleneck_dim: 256
+mlp_bias: True

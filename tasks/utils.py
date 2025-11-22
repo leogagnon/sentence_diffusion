@@ -5,7 +5,7 @@ from torch.utils.data import Sampler
 from typing import Iterator, Optional
 from transformers import AutoTokenizer
 import os
-
+from model.encoder import SEMHead, HSEMHead
 
 class InfiniteDistributedUniformSampler(Sampler[int]):
     """
@@ -119,3 +119,22 @@ def split_index_from_offsets(
         out.append(split_idx)
 
     return out
+
+class SEMUsageTracker:
+    def __init__(self, shape, ema_decay=0.99):
+        self.ema_decay = ema_decay
+        self.usage = None
+
+    @torch.autocast(device_type="cuda", enabled=False)
+    @torch.no_grad()
+    def update(self, batch_counts):
+
+        # Compute relative frequencies
+        batch_freq = batch_counts / batch_counts.sum(-1, keepdims=True)
+
+        if self.usage is None:
+            self.usage = batch_freq.cpu()
+
+        # EMA update
+        self.usage = (self.ema_decay * self.usage
+                      + (1 - self.ema_decay) * batch_freq.cpu())

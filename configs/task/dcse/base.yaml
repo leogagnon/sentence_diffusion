@@ -6,17 +6,19 @@ temp: 0.01
 delta_ent: 0.0
 delta_ent_warmup_steps: 0
 ce_loss: True
+sem_reset_interval: 1
+sem_reset_threshold: 1e-4
 
 name: base_dcse
 
 teacher:
   model_name: nvidia/llama-embed-nemotron-8b #SONAR #Qwen/Qwen3-Embedding-0.6B 
   prompt: null
-  #prompt: "Represent the text with high-level features. This can include semantic information, type of text, intent, style. Text: "
   
 encoder:
   model_name: microsoft/deberta-v3-large
 
 defaults:
   - encoder/sem: flat
+  - encoder/dino_head: null
   - dataset: fineweb

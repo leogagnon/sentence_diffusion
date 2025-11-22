@@ -28,6 +28,8 @@ from torch.utils.checkpoint import checkpoint
 import hydra
 from torch.distributions import Gamma
 from entmax import entmax15
+from torch.nn.init import trunc_normal_
+from torch.nn.utils import weight_norm
 
 
 @dataclass
@@ -36,6 +38,7 @@ class SEMHeadConfig:
     V: int
     temp: float
     input_dim: Optional[int] = None
+    per_simpex_ln: bool = False
 
 
 class SEMHead(nn.Module):
@@ -47,19 +50,26 @@ class SEMHead(nn.Module):
 
         assert cfg.input_dim is not None, "input_dim has to be set"
         self.proj_in = nn.Linear(cfg.input_dim, cfg.L * cfg.V, bias=False)
-        self.norm = nn.LayerNorm(cfg.L * cfg.V, eps=1e-6)
+        if cfg.per_simpex_ln:
+            self.norm = nn.LayerNorm((cfg.V,))
+        else:
+            self.norm = nn.LayerNorm((cfg.L, cfg.V))
         self.proj_out = nn.Linear(cfg.L * cfg.V, cfg.input_dim, bias=False)
         self.cfg = cfg
+
+    @property
+    def usage_shape(self):
+        return (self.cfg.L * self.cfg.V, )
 
     @property
     def dlc_len(self):
         return self.cfg.L
 
-    def forward(self, x, return_dlc=False):
+    def forward(self, x, return_dlc=False, return_count=False):
         # Proj in DLC space
         x = self.proj_in(x)
-        x = self.norm(x)
         x = einx.rearrange("b (l v) -> b l v", x, l=self.cfg.L, v=self.cfg.V)
+        x = self.norm(x)
 
         # Compute Softmax
         probs = torch.softmax(x / self.cfg.temp, dim=-1)
@@ -68,14 +78,26 @@ class SEMHead(nn.Module):
         out = einx.rearrange("b l v -> b (l v)", probs)
         out = self.proj_out(out)
 
-        if return_dlc:
-            return out, self.encode(probs)
-        else:
-            return out, probs
+        out_dict = {"c_out": out, "probs": probs}
 
-    def encode(self, probs):
+        if return_dlc:
+            out_dict.update({"dlc": self._encode(probs)})
+
+        if return_count:
+            out_dict.update({"usage_count": self._usage_count(probs)})
+
+        return out_dict
+
+    def _encode(self, probs):
         dlc = probs.argmax(-1)
         return dlc
+
+    def _usage_count(self, probs):
+        counts = torch.stack(
+            [torch.sum(probs.argmax(-1) == i, dim=0) for i in range(self.cfg.V)], dim=-1
+        )
+        counts = einx.rearrange("L V -> (L V)", counts)
+        return counts
 
 
 @dataclass
@@ -85,6 +107,7 @@ class HSEMHeadConfig:
     D: int
     temp: float
     input_dim: Optional[int] = None
+    per_simpex_ln: bool = False
 
 
 class HSEMHead(nn.Module):
@@ -96,21 +119,27 @@ class HSEMHead(nn.Module):
 
         assert cfg.input_dim is not None, "input_dim has to be set"
         self.N = (cfg.V**cfg.D) // (cfg.V - 1)
-        self.proj_in = nn.Linear(cfg.input_dim, cfg.L * cfg.V * self.N, bias=False)
-        self.norm = nn.LayerNorm(cfg.L * cfg.V * self.N, eps=1e-6)
+        self.proj_in = nn.Linear(cfg.input_dim, cfg.L * self.N * cfg.V, bias=False)
+        if cfg.per_simpex_ln:
+            self.norm = nn.LayerNorm((cfg.V,))
+        else:
+            self.norm = nn.LayerNorm((cfg.L, self.N, cfg.V))
         self.proj_out = nn.Linear(cfg.L * cfg.V * self.N, cfg.input_dim, bias=False)
         self.cfg = cfg
+
+    @property
+    def usage_shape(self):
+        return (self.cfg.L * self.N * self.cfg.V, )
 
     @property
     def dlc_len(self):
         return self.cfg.D * self.cfg.L
 
-    def forward(self, x: torch.Tensor, return_dlc=False):
+    def forward(self, x: torch.Tensor, return_dlc=False, return_count=True):
         bs = x.shape[0]
 
         # Compute conditional probabilities
         x = self.proj_in(x)
-        x = self.norm(x)
         x = einx.rearrange(
             "b (L N V) -> b L N V",
             x,
@@ -118,6 +147,7 @@ class HSEMHead(nn.Module):
             N=self.N,
             V=self.cfg.V,
         )
+        x = self.norm(x)
         x = F.softmax(x / self.cfg.temp, -1)
 
         # Compute DLC probs (i.e. the joint) by going down tree
@@ -141,12 +171,17 @@ class HSEMHead(nn.Module):
         out = einx.rearrange("b L N V -> b (L N V)", out)
         out = self.proj_out(out)
 
-        if return_dlc:
-            return out, self.encode(probs)
-        else:
-            return out, probs
+        out_dict = {"c_out": out, "probs": probs}
 
-    def encode(self, probs):
+        if return_dlc:
+            out_dict.update({"dlc": self._encode(probs)})
+
+        if return_count:
+            out_dict.update({"usage_count": self._usage_count(probs)})
+
+        return out_dict
+
+    def _encode(self, probs):
 
         # Argmax on first level
         dlc = [probs[0].squeeze(2).argmax(-1)]
@@ -166,6 +201,81 @@ class HSEMHead(nn.Module):
         dlc = torch.cat(dlc, dim=1)
 
         return dlc
+
+    def _usage_count(self, probs):
+        counts = torch.concatenate(
+            [
+                torch.stack(
+                    [torch.sum(p.argmax(-1) == i, dim=0) for i in range(self.cfg.V)],
+                    dim=-1,
+                )
+                for p in probs
+            ],
+            dim=1,
+        )
+        counts = einx.rearrange("L N V -> (L N V)", counts)
+        return counts
+
+
+@dataclass
+class DINOHeadConfig:
+    nlayers: int
+    hidden_dim: int
+    bottleneck_dim: int
+    mlp_bias: bool
+    dim: Optional[int] = None
+
+
+class DINOHead(nn.Module):
+    def __init__(self, cfg: Optional[DINOHeadConfig] = None, **kwargs):
+        super().__init__()
+        if cfg == None:
+            cfg = DINOHeadConfig(**kwargs)
+        assert cfg.dim is not None
+        self.mlp = _build_mlp(
+            cfg.nlayers,
+            cfg.dim,
+            cfg.bottleneck_dim,
+            hidden_dim=cfg.hidden_dim,
+            use_bn=False,
+            bias=cfg.mlp_bias,
+        )
+        self.apply(self._init_weights)
+        self.last_layer = weight_norm(
+            nn.Linear(cfg.bottleneck_dim, cfg.dim, bias=False)
+        )
+        self.last_layer.weight_g.data.fill_(1)
+
+    def _init_weights(self, m):
+        if isinstance(m, nn.Linear):
+            trunc_normal_(m.weight, std=0.02)
+            if isinstance(m, nn.Linear) and m.bias is not None:
+                nn.init.constant_(m.bias, 0)
+
+    def forward(self, x):
+        x = self.mlp(x)
+        x = nn.functional.normalize(x, dim=-1, p=2, eps=1e-5)
+        x = self.last_layer(x)
+        return x
+
+
+def _build_mlp(
+    nlayers, in_dim, bottleneck_dim, hidden_dim=None, use_bn=False, bias=True
+):
+    if nlayers == 1:
+        return nn.Linear(in_dim, bottleneck_dim, bias=bias)
+    else:
+        layers = [nn.Linear(in_dim, hidden_dim, bias=bias)]
+        if use_bn:
+            layers.append(nn.BatchNorm1d(hidden_dim))
+        layers.append(nn.GELU())
+        for _ in range(nlayers - 2):
+            layers.append(nn.Linear(hidden_dim, hidden_dim, bias=bias))
+            if use_bn:
+                layers.append(nn.BatchNorm1d(hidden_dim))
+            layers.append(nn.GELU())
+        layers.append(nn.Linear(hidden_dim, bottleneck_dim, bias=bias))
+        return nn.Sequential(*layers)
 
 
 class SONARTransformer(nn.Module):
@@ -188,6 +298,7 @@ class SONARTransformer(nn.Module):
 class EncoderConfig:
     model_name: str
     sem: Optional[dict] = None
+    dino_head: Optional[DINOHeadConfig] = None
     prompt: Optional[str] = None
 
 
@@ -228,7 +339,9 @@ class EncoderModel(nn.Module):
                 )
 
             backbone = sentence_transformers.SentenceTransformer(
-                cfg.model_name, model_kwargs=model_kwargs,trust_remote_code=True,
+                cfg.model_name,
+                model_kwargs=model_kwargs,
+                trust_remote_code=True,
             )
 
             self.transformer = backbone[0]
@@ -251,6 +364,10 @@ class EncoderModel(nn.Module):
             self.sem = hydra.utils.instantiate(cfg.sem)
             self.sem: SEMHead | HSEMHead
 
+        if cfg.dino_head is not None:
+            cfg.dino_head.dim = self.latent_dim
+            self.dino_head = DINOHead(cfg.dino_head).requires_grad_(True)
+
         self.cfg = cfg
 
     def compile(self):
@@ -266,7 +383,7 @@ class EncoderModel(nn.Module):
     def latent_len(self):
         return 1
 
-    def forward(self, input_ids, attention_mask, return_dlc=False):
+    def forward(self, input_ids, attention_mask, return_dlc=False, return_count=False):
 
         # Make the batch dict expected by sentence_transformers models
         batch = {"input_ids": input_ids, "attention_mask": attention_mask}
@@ -274,11 +391,15 @@ class EncoderModel(nn.Module):
         # Run through transformer and pooling
         batch = self.transformer(batch)
         batch = self.pooling(batch)
-        sentence_embedding = batch["sentence_embedding"]
+        z = batch["sentence_embedding"]
 
-        # Run through SEM
-        if self.cfg.sem is not None:
-            x_out, x_intern = self.sem(sentence_embedding, return_dlc=return_dlc)
-            return x_out, x_intern
+        if self.cfg.sem is None:
+            return z
         else:
-            return sentence_embedding
+            sem_out = self.sem(z, return_dlc=return_dlc, return_count=return_count)
+            z = sem_out.pop("c_out")
+
+        if self.cfg.dino_head is not None:
+            z = self.dino_head(z)
+
+        return z, sem_out

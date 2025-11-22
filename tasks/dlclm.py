@@ -31,6 +31,7 @@ from tasks.utils import *
 from typing import Tuple, List, ClassVar
 from dataclasses import field
 
+
 class InfoLabel(Enum):
     CONT = 0
     DLC = 1
@@ -49,6 +50,7 @@ class DLCLMTaskConfig:
     seq_len: int = 128
     evalppl: bool = True
     cond_split_bounds: Optional[Tuple[float, float]] = None
+    cond_suffix_len: Optional[int] = None
 
     # If not giving pretrained_ae_id
     decoder: Optional[DecoderConfig] = None
@@ -270,22 +272,37 @@ class DLCLMTask(L.LightningModule):
             # If conditional, split sequence in two : prompt, continuation
             # Else consider empty prompt and the whole sequence as continuation
             if self.cfg.conditional:
-                prompt_len_ratio = (
-                    torch.rand(size=(len(input_ids_dec),))
-                    * (self.cfg.cond_split_bounds[1] - self.cfg.cond_split_bounds[0])
-                ) + self.cfg.cond_split_bounds[0]
-                prompt_len = (
-                    torch.Tensor(
-                        [len(x) for x in input_ids_dec], device=prompt_len_ratio.device
+                if self.cfg.cond_split_bounds is not None:
+                    assert self.cfg.cond_suffix_len is None
+                    # Maybe split randomly somewhere in between
+                    prompt_len_ratio = (
+                        torch.rand(size=(len(input_ids_dec),))
+                        * (
+                            self.cfg.cond_split_bounds[1]
+                            - self.cfg.cond_split_bounds[0]
+                        )
+                    ) + self.cfg.cond_split_bounds[0]
+                    prompt_len = (
+                        torch.Tensor(
+                            [len(x) for x in input_ids_dec],
+                            device=prompt_len_ratio.device,
+                        )
+                        * prompt_len_ratio
+                    ).int()
+                else:
+                    # Or split a fixed-length suffix
+                    assert self.cfg.cond_suffix_len is not None
+                    prompt_len = torch.full(
+                        size=(len(input_ids_dec),),
+                        fill_value=max_length - self.cfg.cond_suffix_len,
                     )
-                    * prompt_len_ratio
-                ).int()
+
                 prompt_dec = [
                     x[:l] + [dec_tokenizer.think_token_id]
                     for x, l in zip(input_ids_dec, prompt_len)
                 ]
                 continuation_dec = [
-                    [dec_tokenizer.bos_token_id] + x[l : l + max_length]
+                    [dec_tokenizer.bos_token_id] + x[l:]
                     for x, l in zip(input_ids_dec, prompt_len)
                 ]
                 continuation_str = dec_tokenizer.batch_decode(
@@ -338,7 +355,7 @@ class DLCLMTask(L.LightningModule):
                     continuation_enc["input_ids"],
                     continuation_enc["attention_mask"].bool(),
                     return_dlc=True,
-                )[1] + len(dec_tokenizer)
+                )[1]["dlc"] + len(dec_tokenizer)
 
             # Build the final input_ids
             input_ids_dec = [
@@ -393,7 +410,7 @@ class DLCLMTask(L.LightningModule):
             targets.view(-1),
             reduction="none",
         )
-        loss = loss.view_as(targets)        
+        loss = loss.view_as(targets)
 
         # p(z)
         if not self.ar_baseline:
@@ -438,7 +455,7 @@ class DLCLMTask(L.LightningModule):
             reduction="none",
         )
         loss = loss.view_as(targets)
-        
+
         # p(z)p(x|z)
         if not self.ar_baseline:
             dlc_loss = loss[info_mask_dec == InfoLabel.DLC.value].mean()
@@ -450,7 +467,6 @@ class DLCLMTask(L.LightningModule):
                 sync_dist=True,
             )
 
-        
         # p(x|z) only, more like the reconstruction loss
         cond_loss = loss[info_mask_dec == InfoLabel.CONT.value].mean()
         self.log(
@@ -542,7 +558,11 @@ class DLCLMTask(L.LightningModule):
                     self.decoder.generate(
                         prompt=prompt,
                         dlc=dlc,
-                        max_length=self.dataset.max_length,
+                        max_length=(
+                            self.dataset.cfg.max_length
+                            if self.cfg.cond_suffix_len is None
+                            else self.cfg.cond_suffix_len
+                        ),
                     ),
                     skip_special_tokens=True,
                 )
@@ -588,7 +608,11 @@ class DLCLMTask(L.LightningModule):
                 gen_text.extend(
                     self.decoder.tokenizer.batch_decode(
                         self.decoder.generate(
-                            max_length=self.dataset.cfg.max_length,
+                            max_length=(
+                                self.dataset.cfg.max_length
+                                if self.cfg.cond_suffix_len is None
+                                else self.cfg.cond_suffix_len
+                            ),
                             batch_size=128,
                             gen_dlc_len=(
                                 self.encoder.sem.dlc_len

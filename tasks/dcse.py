@@ -30,7 +30,8 @@ from data.datasets import DATA_SEED
 from copy import deepcopy
 import torch.nn.functional as F
 from tasks.utils import *
-
+import torch.distributed as dist
+import torch.nn as nn
 
 @dataclass
 class DCSETaskConfig:
@@ -45,6 +46,8 @@ class DCSETaskConfig:
     delta_ent: float = 0.0
     delta_ent_warmup_steps: int = 10000
     ce_loss: bool = True
+    sem_reset_interval: int = 0
+    sem_reset_threshold: float = 1e-4
 
     name: Optional[str] = None
 
@@ -77,6 +80,9 @@ class DCSETask(L.LightningModule):
         self.train_indices, self.val_indices = self.dataset.get_train_val_indices(
             val_size=cfg.val_size
         )
+
+        if (cfg.sem_reset_interval > 0) and (rank_zero_only.rank == 0):
+            self.sem_usage_ema = SEMUsageTracker(self.encoder.sem.usage_shape)
 
         self.cfg = cfg
 
@@ -224,16 +230,16 @@ class DCSETask(L.LightningModule):
                 dim=-1,
             )
         else:
-            loss = (sim_student - sim_teacher)**2
-
+            loss = (sim_student - sim_teacher) ** 2
 
         return loss.mean()
 
     def training_step(self, batch, batch_idx):
 
-        z_student, dlc_probs = self.encoder(
+        z_student, sem_out = self.encoder(
             batch["input_ids_enc"],
             batch["attention_mask_enc"],
+            return_count=hasattr(self, "sem_usage_ema"),
         )
 
         with torch.no_grad():
@@ -253,7 +259,7 @@ class DCSETask(L.LightningModule):
         )
 
         if self.cfg.delta_ent > 0.0:
-            ent, m_ent = sem_entropy(dlc_probs)
+            ent, m_ent = sem_entropy(sem_out["probs"])
 
             delta = cosine_warmup_get_value(
                 self.global_step,
@@ -263,15 +269,18 @@ class DCSETask(L.LightningModule):
 
             loss = loss + delta * (ent - m_ent)
 
+        if hasattr(self, "sem_usage_ema"):
+            self.sem_usage_ema.update(sem_out["usage_count"])
+
         return loss
 
     @torch.no_grad()
     def validation_step(self, batch, batch_idx):
 
-        z_student, dlc_probs = self.encoder(
-            batch["input_ids_enc"],
-            batch["attention_mask_enc"],
+        z_student, sem_out = self.encoder(
+            batch["input_ids_enc"], batch["attention_mask_enc"]
         )
+        dlc_probs = sem_out["probs"]
 
         z_teacher = self.teacher(
             batch["input_ids_teacher"],
@@ -296,3 +305,25 @@ class DCSETask(L.LightningModule):
             on_epoch=True,
             sync_dist=True,
         )
+
+    def on_train_batch_end(self, outputs, batch, batch_idx):
+        if (
+            hasattr(self, "sem_usage_ema")
+            and (self.global_step % self.cfg.sem_reset_interval == 0)
+            and (self.global_step > 0)
+        ):
+
+            # Compute new weights (with dead vertices reset)
+            new_weight = self.encoder.sem.proj_in.weight.data  
+            bound = 1 / self.encoder.sem.cfg.input_dim**0.5
+            dead_mask = self.sem_usage_ema.usage < self.cfg.sem_reset_threshold
+            new_weight[dead_mask] = new_weight[dead_mask].uniform_(
+                -bound, bound
+            )
+
+            self.encoder.sem.proj_in.weight = nn.Parameter(new_weight)
+
+            # Broadcast the input proj to other ranks (if in DDP)
+            self.trainer.strategy.barrier()
+            for param in self.encoder.sem.parameters():
+                self.trainer.strategy.broadcast(param.data)

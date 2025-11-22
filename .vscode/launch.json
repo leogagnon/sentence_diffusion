@@ -12,9 +12,9 @@
             "console": "integratedTerminal",
             "justMyCode": false,
             "args": [
-                "--wandb_id=j1z96h70"
-                //"task/dlclm=baseline",
-                //"num_devices=1",
+                //"--wandb_id=9fz6p3h6"
+                "task/dcse=base",
+                "num_devices=1",
                 //"val_check_interval=1"
             ],
         }

@@ -31,7 +31,7 @@ from torch.utils.data import Sampler
 from typing import Iterator, Optional
 from tasks.utils import *
 from data.datasets import WikipediaDataset, FineWebDataset
-
+import torch.nn as nn 
 
 @dataclass
 class AETaskConfig:
@@ -45,6 +45,8 @@ class AETaskConfig:
     sub_p: float = 0.3
     delta_ent: float = 0.0
     delta_ent_warmup_steps: int = 0
+    sem_reset_interval: int = 0
+    sem_reset_threshold: float = 1e-4
 
     name: Optional[str] = None
 
@@ -78,6 +80,9 @@ class AETask(L.LightningModule):
         self.train_indices, self.val_indices = self.dataset.get_train_val_indices(
             val_size=cfg.val_size
         )
+
+        if (cfg.sem_reset_interval > 0) and (rank_zero_only.rank == 0):
+            self.sem_usage_ema = SEMUsageTracker(self.encoder.sem.usage_shape)
 
         self.cfg = cfg
 
@@ -222,10 +227,11 @@ class AETask(L.LightningModule):
 
     def training_step(self, batch, batch_idx):
 
-        z, dlc_probs = self.encoder(
+        z, sem_out = self.encoder(
             self.random_substitution(batch["input_ids_enc"]),
             batch["attention_mask_enc"],
         )
+        dlc_probs = sem_out["probs"]
 
         # Compute decoder likelihood of input_ids (no need for attention mask cuz causal)
         logits = self.decoder(input_ids=batch["input_ids_dec"], z=z)
@@ -263,7 +269,8 @@ class AETask(L.LightningModule):
     @torch.no_grad()
     def validation_step(self, batch, batch_idx):
 
-        z, dlc_probs = self.encoder(batch["input_ids_enc"], batch["attention_mask_enc"])
+        z, sem_out = self.encoder(batch["input_ids_enc"], batch["attention_mask_enc"])
+        dlc_probs = sem_out["probs"]
 
         ent, m_ent = sem_entropy(dlc_probs)
 
@@ -310,6 +317,27 @@ class AETask(L.LightningModule):
                     skip_special_tokens=True,
                 ),
             ):
-                print(reconstructed)
                 table_clean.add_data(original, reconstructed)
             wandb.log({"val/samples": table_clean})
+
+    def on_train_batch_end(self, outputs, batch, batch_idx):
+        if (
+            hasattr(self, "sem_usage_ema")
+            and (self.global_step % self.cfg.sem_reset_interval == 0)
+            and (self.global_step > 0)
+        ):
+
+            # Compute new weights (with dead vertices reset)
+            new_weight = self.encoder.sem.proj_in.weight.data  
+            bound = 1 / self.encoder.sem.cfg.input_dim**0.5
+            dead_mask = self.sem_usage_ema.usage < self.cfg.sem_reset_threshold
+            new_weight[dead_mask] = new_weight[dead_mask].uniform_(
+                -bound, bound
+            )
+
+            self.encoder.sem.proj_in.weight = nn.Parameter(new_weight)
+
+            # Broadcast the input proj to other ranks (if in DDP)
+            self.trainer.strategy.barrier()
+            for param in self.encoder.sem.parameters():
+                self.trainer.strategy.broadcast(param.data)
