@@ -51,6 +51,7 @@ class AETaskConfig:
     sem_reset_threshold: float = 1e-4
     delta_margin: float = 0.0
     reg_type: str = 'none'
+    sem_noise: float = 0.0
 
     name: Optional[str] = None
 
@@ -235,6 +236,7 @@ class AETask(L.LightningModule):
             self.random_substitution(batch["input_ids_enc"]),
             batch["attention_mask_enc"],
             return_count=hasattr(self, "sem_usage_ema"),
+            noise=self.cfg.sem_noise
         )
 
         # Compute decoder likelihood of input_ids (no need for attention mask cuz causal)
@@ -281,7 +283,7 @@ class AETask(L.LightningModule):
     def validation_step(self, batch, batch_idx):
 
         z, sem_out = self.encoder(
-            batch["input_ids_enc"], batch["attention_mask_enc"], return_count=True
+            batch["input_ids_enc"], batch["attention_mask_enc"], return_count=True, noise=0.0
         )
 
         ent, m_ent = sem_entropy(sem_out["probs"])
@@ -312,8 +314,12 @@ class AETask(L.LightningModule):
             sync_dist=True,
         )
 
+        hard_z, sem_out = self.encoder(
+            batch["input_ids_enc"], batch["attention_mask_enc"], return_count=True, noise=0.0, temp=1e-4
+        )
+
         # Compute clean reconstruction loss
-        logits = self.decoder(input_ids=batch["input_ids_dec"], z=z)
+        logits = self.decoder(input_ids=batch["input_ids_dec"], z=hard_z)
 
         logits = logits[:, :-1].contiguous()
         targets = batch["input_ids_dec"][:, 1:].contiguous()
@@ -345,7 +351,6 @@ class AETask(L.LightningModule):
             and (self.global_step <= self.cfg.sem_reset_schedule[1])
             and (self.global_step % self.cfg.sem_reset_schedule[-1] == 0)
         ):
-            rank_zero_info("wtf")
             self.trainer.strategy.barrier()
 
             with torch.no_grad():

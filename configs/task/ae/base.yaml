@@ -8,14 +8,15 @@ delta_margin: 0.5
 reg_warmup_steps: 12000
 sem_reset_schedule: [5000, 10000, 1000]
 sem_reset_threshold: 1e-4
-reg_type: margin
-sem_reset: true
+reg_type: none
+sem_reset: false
+sem_noise: 1.0
 
 encoder:
   model_name: microsoft/deberta-v3-large 
 
 decoder:
-  name: gpt2-large # 1.5B params
+  name: gpt2 # 1.5B params
   prompt_generator_cfg:
     n_layers: 4
     n_heads: 12

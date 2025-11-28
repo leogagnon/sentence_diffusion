@@ -32,6 +32,7 @@ from torch.nn.init import trunc_normal_
 from torch.nn.utils import weight_norm
 import torch.nn as nn
 
+
 @dataclass
 class SEMHeadConfig:
     L: int
@@ -61,17 +62,20 @@ class SEMHead(nn.Module):
     def dlc_len(self):
         return self.cfg.L
 
-    def forward(self, x, return_dlc=False, return_count=False):
+    def forward(self, x, return_dlc=False, return_count=False, noise: float = 0.0, temp: Optional[float] = 0.0):
+        temp = self.cfg.temp if temp is None else temp
         # Proj in DLC space
         x = self.proj_in(x)
         x = einx.rearrange("b (l v) -> b l v", x, l=self.cfg.L, v=self.cfg.V)
         x = self.norm(x)
 
         # Compute Softmax
-        probs = torch.softmax(x / self.cfg.temp, dim=-1)
+        probs = torch.softmax(x / temp, dim=-1)
 
         # Compute output
         out = einx.rearrange("b l v -> b (l v)", probs)
+        if noise > 0.0:
+            out = out + (noise * 1 / self.cfg.V) * torch.randn_like(out)
         out = self.proj_out(out)
 
         out_dict = {"c_out": out, "probs": probs}
@@ -104,7 +108,7 @@ class HSEMHeadConfig:
     temp: float
     input_dim: Optional[int] = None
     per_simpex_ln: bool = False
-    out_normalization: str = 'none'
+    out_normalization: str = "none"
 
 
 class HSEMHead(nn.Module):
@@ -118,13 +122,17 @@ class HSEMHead(nn.Module):
         self.N = (cfg.V**cfg.D) // (cfg.V - 1)
         self.proj_in = nn.Linear(cfg.input_dim, cfg.L * self.N * cfg.V, bias=False)
         if cfg.per_simpex_ln:
-            self.norm = nn.LayerNorm((cfg.V,),)
+            self.norm = nn.LayerNorm(
+                (cfg.V,),
+            )
         else:
             self.norm = nn.LayerNorm((cfg.L, self.N, cfg.V))
         self.proj_out = nn.Linear(cfg.L * cfg.V * self.N, cfg.input_dim, bias=False)
-        if cfg.out_normalization == 'spectral':
-            self.proj_out = nn.utils.parametrizations.spectral_norm(self.proj_out, eps=1e-6)
-        elif cfg.out_normalization == 'norm':
+        if cfg.out_normalization == "spectral":
+            self.proj_out = nn.utils.parametrizations.spectral_norm(
+                self.proj_out, eps=1e-6
+            )
+        elif cfg.out_normalization == "norm":
             self.proj_out = nn.utils.parametrizations.weight_norm(self.proj_out)
             self.proj_out.weight_g.data.fill_(1)
         self.cfg = cfg
@@ -133,8 +141,16 @@ class HSEMHead(nn.Module):
     def dlc_len(self):
         return self.cfg.D * self.cfg.L
 
-    def forward(self, x: torch.Tensor, return_dlc=False, return_count=True):
+    def forward(
+        self,
+        x: torch.Tensor,
+        return_dlc=False,
+        return_count=True,
+        noise: float = 0.0,
+        temp: Optional[float] = None,
+    ):
         bs = x.shape[0]
+        temp = self.cfg.temp if temp is None else temp
 
         # Compute conditional probabilities
         x = self.proj_in(x)
@@ -146,7 +162,7 @@ class HSEMHead(nn.Module):
             V=self.cfg.V,
         )
         x = self.norm(x)
-        x = F.softmax(x / self.cfg.temp, -1)
+        x = F.softmax(x / temp, -1)
 
         # Compute DLC probs (i.e. the joint) by going down tree
         # E.g. p(x_0,x_1,x_2) = p(x_0) * p(x_1 | x_0) * p(x_2 | x_0, x_1)
@@ -166,7 +182,15 @@ class HSEMHead(nn.Module):
                 start = end
 
         # Compute output
-        out = torch.cat(probs, dim=2)
+        if noise > 0.0:
+            out = torch.cat(
+                [
+                    p + (noise * 1 / (p.shape[-1] * p.shape[-2])) * torch.randn_like(p)
+                    for p in probs
+                ], dim=2
+            )
+        else:
+            out = torch.cat(probs, dim=2)
         out = einx.rearrange("b L N V -> b (L N V)", out)
         out = self.proj_out(out)
 
@@ -389,7 +413,15 @@ class EncoderModel(nn.Module):
     def latent_len(self):
         return 1
 
-    def forward(self, input_ids, attention_mask, return_dlc=False, return_count=False):
+    def forward(
+        self,
+        input_ids,
+        attention_mask,
+        return_dlc=False,
+        return_count=False,
+        noise: float = 0.0,
+        temp: Optional[float] = None,
+    ):
 
         # Make the batch dict expected by sentence_transformers models
         batch = {"input_ids": input_ids, "attention_mask": attention_mask}
@@ -402,7 +434,13 @@ class EncoderModel(nn.Module):
         if self.cfg.sem is None:
             return z
         else:
-            sem_out = self.sem(z, return_dlc=return_dlc, return_count=return_count)
+            sem_out = self.sem(
+                z,
+                return_dlc=return_dlc,
+                return_count=return_count,
+                noise=noise,
+                temp=temp,
+            )
             z = sem_out.pop("c_out")
 
         if self.cfg.dino_head is not None:
