@@ -31,7 +31,8 @@ from torch.utils.data import Sampler
 from typing import Iterator, Optional
 from tasks.utils import *
 from data.datasets import WikipediaDataset, FineWebDataset
-import torch.nn as nn 
+import torch.nn as nn
+
 
 @dataclass
 class AETaskConfig:
@@ -44,9 +45,12 @@ class AETaskConfig:
     lr_warmup_steps: int = 1500
     sub_p: float = 0.3
     delta_ent: float = 0.0
-    delta_ent_warmup_steps: int = 0
-    sem_reset_interval: int = 0
+    reg_warmup_steps: int = 0
+    sem_reset: bool = False
+    sem_reset_schedule: Optional[List[int]] = None
     sem_reset_threshold: float = 1e-4
+    delta_margin: float = 0.0
+    reg_type: str = 'none'
 
     name: Optional[str] = None
 
@@ -81,8 +85,8 @@ class AETask(L.LightningModule):
             val_size=cfg.val_size
         )
 
-        if (cfg.sem_reset_interval > 0) and (rank_zero_only.rank == 0):
-            self.sem_usage_ema = SEMUsageTracker(self.encoder.sem.usage_shape)
+        if cfg.sem_reset:
+            self.sem_usage_ema = SEMUsageTracker()
 
         self.cfg = cfg
 
@@ -230,8 +234,8 @@ class AETask(L.LightningModule):
         z, sem_out = self.encoder(
             self.random_substitution(batch["input_ids_enc"]),
             batch["attention_mask_enc"],
+            return_count=hasattr(self, "sem_usage_ema"),
         )
-        dlc_probs = sem_out["probs"]
 
         # Compute decoder likelihood of input_ids (no need for attention mask cuz causal)
         logits = self.decoder(input_ids=batch["input_ids_dec"], z=z)
@@ -253,27 +257,34 @@ class AETask(L.LightningModule):
             sync_dist=True,
         )
 
-        if self.cfg.delta_ent > 0.0:
-            ent, m_ent = sem_entropy(dlc_probs)
+        reg = None
+        if (self.cfg.delta_ent > 0.0) and (self.cfg.reg_type == 'ent'):
+            ent, m_ent = sem_entropy(sem_out["probs"])
+            reg = self.cfg.delta_ent * (ent - m_ent)
+        elif (self.cfg.delta_margin > 0.0) and (self.cfg.reg_type == 'margin'):
+            reg = sem_margin(sem_out["probs"], delta=self.cfg.delta_margin)
 
+        if reg is not None:
             delta = cosine_warmup_get_value(
                 self.global_step,
-                max_value=self.cfg.delta_ent,
-                warmup_steps=self.cfg.delta_ent_warmup_steps,
+                max_value=1.0,
+                warmup_steps=self.cfg.reg_warmup_steps,
             )
+            loss = loss + delta * reg
 
-            loss = loss + delta * (ent - m_ent)
+        if hasattr(self, "sem_usage_ema"):
+            self.sem_usage_ema.update(sem_out["usage_count"], batch_size=z.shape[0])
 
         return loss
 
     @torch.no_grad()
     def validation_step(self, batch, batch_idx):
 
-        z, sem_out = self.encoder(batch["input_ids_enc"], batch["attention_mask_enc"])
-        dlc_probs = sem_out["probs"]
+        z, sem_out = self.encoder(
+            batch["input_ids_enc"], batch["attention_mask_enc"], return_count=True
+        )
 
-        ent, m_ent = sem_entropy(dlc_probs)
-
+        ent, m_ent = sem_entropy(sem_out["probs"])
         self.log(
             "val/sem_entropy",
             ent.item(),
@@ -285,6 +296,13 @@ class AETask(L.LightningModule):
             m_ent.item(),
             on_epoch=True,
             sync_dist=True,
+        )
+
+        self.log(
+            "val/dead_words",
+            torch.sum(sem_out["usage_count"] == 0).item() / len(sem_out["usage_count"]),
+            on_epoch=True,
+            sync_dist=True
         )
 
         self.log(
@@ -320,24 +338,34 @@ class AETask(L.LightningModule):
                 table_clean.add_data(original, reconstructed)
             wandb.log({"val/samples": table_clean})
 
-    def on_train_batch_end(self, outputs, batch, batch_idx):
+    def on_before_zero_grad(self, optimizer):
         if (
-            hasattr(self, "sem_usage_ema")
-            and (self.global_step % self.cfg.sem_reset_interval == 0)
-            and (self.global_step > 0)
+            self.cfg.sem_reset
+            and (self.global_step >= self.cfg.sem_reset_schedule[0])
+            and (self.global_step <= self.cfg.sem_reset_schedule[1])
+            and (self.global_step % self.cfg.sem_reset_schedule[-1] == 0)
         ):
-
-            # Compute new weights (with dead vertices reset)
-            new_weight = self.encoder.sem.proj_in.weight.data  
-            bound = 1 / self.encoder.sem.cfg.input_dim**0.5
-            dead_mask = self.sem_usage_ema.usage < self.cfg.sem_reset_threshold
-            new_weight[dead_mask] = new_weight[dead_mask].uniform_(
-                -bound, bound
-            )
-
-            self.encoder.sem.proj_in.weight = nn.Parameter(new_weight)
-
-            # Broadcast the input proj to other ranks (if in DDP)
+            rank_zero_info("wtf")
             self.trainer.strategy.barrier()
-            for param in self.encoder.sem.parameters():
-                self.trainer.strategy.broadcast(param.data)
+
+            with torch.no_grad():
+                if rank_zero_only.rank == 0:
+
+                    # Compute new weights (with dead vertices reset)
+                    bound = 1 / (self.encoder.sem.cfg.input_dim**0.5)
+                    dead_mask = self.sem_usage_ema.usage < self.cfg.sem_reset_threshold
+
+                    self.encoder.sem.proj_in.weight[dead_mask] = (
+                        self.encoder.sem.proj_in.weight[dead_mask].uniform_(
+                            -bound, bound
+                        )
+                    )
+
+                    self.encoder.sem.proj_out.weight[:, dead_mask] = (
+                        self.encoder.sem.proj_out.weight[:, dead_mask].uniform_(
+                            -bound, bound
+                        )
+                    )
+
+                for param in self.encoder.sem.parameters():
+                    self.trainer.strategy.broadcast(param.data, src=0)

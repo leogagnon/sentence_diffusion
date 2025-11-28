@@ -7,6 +7,7 @@ from transformers import AutoTokenizer
 import os
 from model.encoder import SEMHead, HSEMHead
 
+
 class InfiniteDistributedUniformSampler(Sampler[int]):
     """
     Infinite, per-rank independent uniform sampling *with replacement*.
@@ -64,6 +65,7 @@ class InfiniteDistributedUniformSampler(Sampler[int]):
             for row in idx:
                 yield row.tolist()
 
+
 def sem_entropy(dlc_probs) -> tuple[torch.Tensor, torch.Tensor]:
     if isinstance(dlc_probs, list):
         # Flatten levels l1 = p(x_0), l2 = p(x_0, x_1), ...
@@ -87,7 +89,30 @@ def sem_entropy(dlc_probs) -> tuple[torch.Tensor, torch.Tensor]:
     return ent, marginal_ent
 
 
-def cosine_warmup_get_value(step, max_value, warmup_steps, exp=2):
+def sem_margin(dlc_probs, delta):
+    if isinstance(dlc_probs, list):
+        # Flatten levels l1 = p(x_0), l2 = p(x_0, x_1), ...
+        levels = [einx.rearrange("b L N V -> b L (N V)", l) for l in dlc_probs]
+        reg = sum(
+            [
+                compute_margin_reg(level, delta)
+                for level in levels
+            ]
+        ) / len(levels)
+    else:
+        reg = compute_margin_reg(dlc_probs, delta)
+
+    return reg
+
+def compute_margin_reg(dlc_probs, delta):
+    sorted_probs = torch.sort(dlc_probs, dim=-1, descending=True)[0]
+    margin = sorted_probs[..., 0] - sorted_probs[..., 1]
+    reg = torch.mean(torch.clamp(delta - margin, min=0.0) * (1 / delta))
+    return reg
+
+
+
+def cosine_warmup_get_value(step, max_value, warmup_steps, exp=3):
     value = max_value
 
     if step < warmup_steps:
@@ -101,6 +126,7 @@ def compute_entropy(probs, normalized=False):
     if normalized:
         return ent / math.log(probs.shape[-1])
     return ent
+
 
 def split_index_from_offsets(
     batch_offsets,
@@ -120,21 +146,23 @@ def split_index_from_offsets(
 
     return out
 
+
 class SEMUsageTracker:
-    def __init__(self, shape, ema_decay=0.99):
+    def __init__(self, ema_decay=0.99):
         self.ema_decay = ema_decay
         self.usage = None
 
     @torch.autocast(device_type="cuda", enabled=False)
     @torch.no_grad()
-    def update(self, batch_counts):
+    def update(self, batch_counts, batch_size):
 
         # Compute relative frequencies
-        batch_freq = batch_counts / batch_counts.sum(-1, keepdims=True)
+        batch_freq = batch_counts / batch_size
 
         if self.usage is None:
             self.usage = batch_freq.cpu()
-
-        # EMA update
-        self.usage = (self.ema_decay * self.usage
-                      + (1 - self.ema_decay) * batch_freq.cpu())
+        else:
+            # EMA update
+            self.usage = (
+                self.ema_decay * self.usage + (1 - self.ema_decay) * batch_freq.cpu()
+            )

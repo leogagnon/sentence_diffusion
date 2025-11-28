@@ -1,0 +1,24 @@
+task/dcse: base
+model_checkpoint: base
+effective_batch_size: 1024
+task.dcse.batch_size: 64
+task.dcse.lr_warmup_steps: 1000
+task.dcse.lr: 2e-5
+task/dcse/dataset: fineweb_long
+task/dcse/encoder/sem: h2
+task.dcse.encoder.sem.per_simpex_ln: true
+#task/dcse/encoder/dino_head: reg
+task.dcse.encoder.sem.temp: 0.3
+task.dcse.encoder.sem.out_normalization: spectral, none
+
+task.dcse.sem_reset: false
+task.dcse.reg_type: none
+
+compile: false
+max_steps: 15000
+
+limit_val_batches: 4
+val_check_interval: 256
+
+sweep_id: dcse/long_reg_2
+

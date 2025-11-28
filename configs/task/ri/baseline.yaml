@@ -1,0 +1,15 @@
+lr: 1e-4
+lr_warmup_steps: 1500
+batch_size: 64
+#pretrained_dcse_id: vq0w5ykd
+suffix_len: 32
+prefix_len: 32
+
+dataset:
+  _target_: data.datasets.FineWebDataset
+  length_interval: [64, 64]
+
+decoder:
+  name: gpt2 # 0.7B params
+
+name: dir

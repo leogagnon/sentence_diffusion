@@ -40,17 +40,16 @@ class InfoLabel(Enum):
 
 
 @dataclass
-class DLCLMTaskConfig:
+class RITaskConfig:
     lr: float
     batch_size: int
     lr_warmup_steps: int = 1500
     pretrained_ae_id: Optional[str] = None
     pretrained_dcse_id: Optional[str] = None
-    conditional: bool = False
-    seq_len: int = 128
+
+    suffix_len: int = 32
+    prefix_len: int = 32
     evalppl: bool = True
-    cond_split_bounds: Optional[Tuple[float, float]] = None
-    cond_suffix_len: Optional[int] = None
 
     # If not giving pretrained_ae_id
     decoder: Optional[DecoderConfig] = None
@@ -61,18 +60,15 @@ class DLCLMTaskConfig:
     name: Optional[str] = None
 
 
-class DLCLMTask(L.LightningModule):
-    """
-    Finetune a Language Model to use DLCs (DLC-LM)
-    """
+class RITask(L.LightningModule):
 
-    def __init__(self, cfg: Optional[DLCLMTaskConfig] = None, **kwargs):
+    def __init__(self, cfg: Optional[RITaskConfig] = None, **kwargs):
         super().__init__()
 
         if cfg == None:
             cfg = OmegaConf.to_object(
                 OmegaConf.merge(
-                    OmegaConf.create(DLCLMTaskConfig),
+                    OmegaConf.create(RITaskConfig),
                     OmegaConf.create(kwargs),
                 )
             )
@@ -121,8 +117,13 @@ class DLCLMTask(L.LightningModule):
             )
 
         # Change the max length of the sequences to fit the task config
-        if cfg.conditional:
-            self.dataset.cfg.length_interval = [cfg.seq_len, cfg.seq_len]
+        assert (
+            self.dataset.cfg.length_interval[0] == self.dataset.cfg.length_interval[1]
+        )
+        if not self.ar_baseline:
+            self.long_prefix_len = self.dataset.cfg.length_interval[0]
+            new_length = self.dataset.cfg.length_interval[0] + cfg.suffix_len
+            self.dataset.cfg.length_interval = [new_length, new_length]
 
         if cfg.evalppl:
             # We put in a list so that it is not treated as a submodule
@@ -269,72 +270,34 @@ class DLCLMTask(L.LightningModule):
             else:
                 input_ids_dec = batch["input_ids"]
 
-            # If conditional, split sequence in two : prompt, continuation
-            # Else consider empty prompt and the whole sequence as continuation
-            if self.cfg.conditional:
-                if self.cfg.cond_split_bounds is not None:
-                    assert self.cfg.cond_suffix_len is None
-                    # Maybe split randomly somewhere in between
-                    prompt_len_ratio = (
-                        torch.rand(size=(len(input_ids_dec),))
-                        * (
-                            self.cfg.cond_split_bounds[1]
-                            - self.cfg.cond_split_bounds[0]
-                        )
-                    ) + self.cfg.cond_split_bounds[0]
-                    prompt_len = (
-                        torch.Tensor(
-                            [len(x) for x in input_ids_dec],
-                            device=prompt_len_ratio.device,
-                        )
-                        * prompt_len_ratio
-                    ).int()
-                else:
-                    # Or split a fixed-length suffix
-                    assert self.cfg.cond_suffix_len is not None
-                    prompt_len = torch.full(
-                        size=(len(input_ids_dec),),
-                        fill_value=max_length - self.cfg.cond_suffix_len,
-                    )
-
-                prompt_dec = [
-                    x[:l] + [dec_tokenizer.think_token_id]
-                    for x, l in zip(input_ids_dec, prompt_len)
-                ]
-                continuation_dec = [
-                    [dec_tokenizer.bos_token_id] + x[l:]
-                    for x, l in zip(input_ids_dec, prompt_len)
-                ]
-                continuation_str = dec_tokenizer.batch_decode(
-                    continuation_dec, skip_special_tokens=True
-                )
-            else:
-                prompt_dec = [
-                    [dec_tokenizer.think_token_id] for _ in range(len(input_ids_dec))
-                ]
-                continuation_dec = input_ids_dec
-                continuation_str = input_str
-
             # If runnign the AR baseline, return now
             if self.ar_baseline:
+                input_ids_dec = [
+                    x[-(self.cfg.prefix_len + self.cfg.suffix_len) :]
+                    for x in input_ids_dec
+                ]
+                prefix_len = torch.Tensor(
+                    [len(x[: -self.cfg.suffix_len]) for x in input_ids_dec]
+                ).int()
+
                 input_ids_dec = dec_tokenizer.pad(
                     {"input_ids": input_ids_dec},
                     padding=True,
                     return_tensors="pt",
                     return_attention_mask=False,
                 )["input_ids"]
+
                 info_mask_dec = torch.full_like(
                     input_ids_dec, fill_value=InfoLabel.CONT.value, dtype=torch.int32
                 )
                 info_mask_dec[input_ids_dec == dec_tokenizer.pad_token_id] = (
                     InfoLabel.PAD.value
                 )
-                if self.cfg.conditional:
-                    # Identify prompt
-                    info_mask_dec[
-                        torch.arange(info_mask_dec.shape[1]).unsqueeze(0)
-                        < prompt_len.unsqueeze(1)
-                    ] = InfoLabel.PROMPT.value
+                # Identify prompt
+                info_mask_dec[
+                    torch.arange(info_mask_dec.shape[1]).unsqueeze(0)
+                    < prefix_len.unsqueeze(1)
+                ] = InfoLabel.PROMPT.value
 
                 return {
                     "input_ids_dec": input_ids_dec,
@@ -342,18 +305,33 @@ class DLCLMTask(L.LightningModule):
                     "input_str": input_str,
                 }
 
-            # Compute DLC of continuation
+            prompt_dec = [
+                x[-(self.cfg.prefix_len + self.cfg.suffix_len) : -self.cfg.suffix_len]
+                + [dec_tokenizer.think_token_id]
+                for x in input_ids_dec
+            ]
+            continuation_dec = [
+                [dec_tokenizer.bos_token_id] + x[-self.cfg.suffix_len :]
+                for x in input_ids_dec
+            ]
+            long_context = [x[: self.long_prefix_len] for x in input_ids_dec]
+
+            long_context_str = dec_tokenizer.batch_decode(
+                long_context, skip_special_tokens=True
+            )
+
+            # Compute DLC long context
             with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
-                continuation_enc = self.encoder.tokenizer.batch_encode_plus(
-                    continuation_str,
+                long_context_enc = self.encoder.tokenizer.batch_encode_plus(
+                    long_context_str,
                     truncation=True,
                     padding="max_length",
                     max_length=max_length,
                     return_tensors="pt",
                 ).to("cuda")
                 dlc_ids = self.encoder(
-                    continuation_enc["input_ids"],
-                    continuation_enc["attention_mask"].bool(),
+                    long_context_enc["input_ids"],
+                    long_context_enc["attention_mask"].bool(),
                     return_dlc=True,
                 )[1]["dlc"] + len(dec_tokenizer)
 
@@ -392,7 +370,6 @@ class DLCLMTask(L.LightningModule):
                 "input_ids_dec": input_ids_dec,
                 "info_mask_dec": info_mask_dec,
                 "input_str": input_str,
-                "continuation_str": continuation_str,
             }
 
         return fn
@@ -483,7 +460,7 @@ class DLCLMTask(L.LightningModule):
             sync_dist=True,
         )
 
-        if (batch_idx == 0) and not ((not self.cfg.conditional) and self.ar_baseline):
+        if (batch_idx == 0):
             bs = len(batch["input_ids_dec"])
 
             # Gather prompt and DLC from input_ids
@@ -511,7 +488,7 @@ class DLCLMTask(L.LightningModule):
                 continuations = self.decoder.tokenizer.batch_decode(
                     self.decoder.generate(
                         prompt=prompt,
-                        max_length=self.cfg.cond_suffix_len,
+                        max_length=self.cfg.suffix_len,
                         gen_dlc_len=(
                             self.encoder.sem.dlc_len if not self.ar_baseline else None
                         ),
@@ -564,92 +541,16 @@ class DLCLMTask(L.LightningModule):
                     self.decoder.generate(
                         prompt=prompt,
                         dlc=dlc,
-                        max_length=(
-                            self.dataset.cfg.max_length
-                            if self.cfg.cond_suffix_len is None
-                            else self.cfg.cond_suffix_len
-                        ),
+                        max_length=self.cfg.suffix_len,
                     ),
                     skip_special_tokens=True,
                 )
 
                 table_clean = wandb.Table(columns=["Original", "Reconstructed"])
                 for original, reconstructed in zip(
-                    batch["continuation_str"][:5],
+                    batch["input_str"][:5],
                     reconstruction[:5],
                 ):
                     table_clean.add_data(original, reconstructed)
                 wandb.log({"val/clean_samples": table_clean})
                 del table_clean
-
-        if (
-            (batch_idx == 0)
-            and (rank_zero_only.rank == 0)
-            and (self.val_epoch_counter % 5 == 0)
-            and (not self.cfg.conditional)
-            and ("wiki" in str(self.dataset.__class__.__name__))
-        ):
-            # Log MAUVE score every 5 validation steps (takes a few minutes)
-            mauve = self.eval_mauve()
-            wandb.log({"val/MAUVE": mauve})
-            torch.cuda.empty_cache()
-
-    def eval_mauve(
-        self,
-        seed: int = 1337,
-        gen_kwargs: Optional[dict] = None,
-        gen_kwargs_dlc: Optional[dict] = None,
-    ):
-        # Load reference features (5120 sequences pre-featurized with GPT2-large)
-        ref_feats = torch.load(
-            "MAUVE_eval_feats_wiki.pt", map_location=torch.device("cpu")
-        )
-
-        # Generate unconditionally
-        with torch.inference_mode():
-            gen_text = []
-            for _ in tqdm(
-                range(len(ref_feats) // 128), desc=f"Generating paragraphs..."
-            ):
-                gen_text.extend(
-                    self.decoder.tokenizer.batch_decode(
-                        self.decoder.generate(
-                            max_length=(
-                                self.dataset.cfg.max_length
-                                if self.cfg.cond_suffix_len is None
-                                else self.cfg.cond_suffix_len
-                            ),
-                            batch_size=128,
-                            gen_dlc_len=(
-                                self.encoder.sem.dlc_len
-                                if hasattr(self, "encoder")
-                                else None
-                            ),
-                            gen_kwargs=gen_kwargs,
-                            gen_kwargs_dlc=gen_kwargs_dlc,
-                        ),
-                        skip_special_tokens=True,
-                    )
-                )
-
-        # Featurize generated text
-        gen_feats = get_features_from_input(
-            None, None, gen_text, "gpt2-large", 150, 0, "generated paragraphs", 64
-        )
-
-        # Comput MAUVE against reference features (remove AMP since it caused errors that I don't wanna debug)
-        with torch.autocast(device_type="cuda", enabled=False):
-            mauve = compute_mauve(
-                p_features=gen_feats,
-                q_features=ref_feats,
-                max_text_length=self.dataset.cfg.max_length,
-                batch_size=64,
-                device_id=0,
-                featurize_model_name="gpt2-large",
-                seed=seed,
-            )
-
-        # Avoid CUDA memory leaks
-        torch.cuda.empty_cache()
-
-        return mauve.mauve

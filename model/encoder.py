@@ -30,7 +30,7 @@ from torch.distributions import Gamma
 from entmax import entmax15
 from torch.nn.init import trunc_normal_
 from torch.nn.utils import weight_norm
-
+import torch.nn as nn
 
 @dataclass
 class SEMHeadConfig:
@@ -56,10 +56,6 @@ class SEMHead(nn.Module):
             self.norm = nn.LayerNorm((cfg.L, cfg.V))
         self.proj_out = nn.Linear(cfg.L * cfg.V, cfg.input_dim, bias=False)
         self.cfg = cfg
-
-    @property
-    def usage_shape(self):
-        return (self.cfg.L * self.cfg.V, )
 
     @property
     def dlc_len(self):
@@ -108,6 +104,7 @@ class HSEMHeadConfig:
     temp: float
     input_dim: Optional[int] = None
     per_simpex_ln: bool = False
+    out_normalization: str = 'none'
 
 
 class HSEMHead(nn.Module):
@@ -121,15 +118,16 @@ class HSEMHead(nn.Module):
         self.N = (cfg.V**cfg.D) // (cfg.V - 1)
         self.proj_in = nn.Linear(cfg.input_dim, cfg.L * self.N * cfg.V, bias=False)
         if cfg.per_simpex_ln:
-            self.norm = nn.LayerNorm((cfg.V,))
+            self.norm = nn.LayerNorm((cfg.V,),)
         else:
             self.norm = nn.LayerNorm((cfg.L, self.N, cfg.V))
         self.proj_out = nn.Linear(cfg.L * cfg.V * self.N, cfg.input_dim, bias=False)
+        if cfg.out_normalization == 'spectral':
+            self.proj_out = nn.utils.parametrizations.spectral_norm(self.proj_out, eps=1e-6)
+        elif cfg.out_normalization == 'norm':
+            self.proj_out = nn.utils.parametrizations.weight_norm(self.proj_out)
+            self.proj_out.weight_g.data.fill_(1)
         self.cfg = cfg
-
-    @property
-    def usage_shape(self):
-        return (self.cfg.L * self.N * self.cfg.V, )
 
     @property
     def dlc_len(self):
@@ -152,19 +150,20 @@ class HSEMHead(nn.Module):
 
         # Compute DLC probs (i.e. the joint) by going down tree
         # E.g. p(x_0,x_1,x_2) = p(x_0) * p(x_1 | x_0) * p(x_2 | x_0, x_1)
-        parent_probs = torch.ones(
-            size=(bs, self.cfg.L, 1), device=x.device, dtype=x.dtype
-        )
-        start = 0
-        probs = []
-        for d in range(self.cfg.D):
-            # Compute probs at level d by multiplying with parent probs
-            end = start + self.cfg.V**d
-            level = x[:, :, start:end] * parent_probs[..., None]
-            probs.append(level)
-            # Update parent and go down a level
-            parent_probs = einx.rearrange("b L n V -> b L (n V)", level)
-            start = end
+        with torch.autocast(device_type="cuda", dtype=torch.float32):
+            parent_probs = torch.ones(
+                size=(bs, self.cfg.L, 1), device=x.device, dtype=x.dtype
+            )
+            start = 0
+            probs = []
+            for d in range(self.cfg.D):
+                # Compute probs at level d by multiplying with parent probs
+                end = start + self.cfg.V**d
+                level = x[:, :, start:end] * parent_probs[..., None]
+                probs.append(level)
+                # Update parent and go down a level
+                parent_probs = einx.rearrange("b L n V -> b L (n V)", level)
+                start = end
 
         # Compute output
         out = torch.cat(probs, dim=2)
@@ -221,9 +220,10 @@ class HSEMHead(nn.Module):
 class DINOHeadConfig:
     nlayers: int
     hidden_dim: int
-    bottleneck_dim: int
     mlp_bias: bool
     dim: Optional[int] = None
+    bottleneck_dim: Optional[int] = None
+    normalize: bool = False
 
 
 class DINOHead(nn.Module):
@@ -235,16 +235,21 @@ class DINOHead(nn.Module):
         self.mlp = _build_mlp(
             cfg.nlayers,
             cfg.dim,
-            cfg.bottleneck_dim,
+            cfg.dim if cfg.bottleneck_dim is None else cfg.bottleneck_dim,
             hidden_dim=cfg.hidden_dim,
             use_bn=False,
             bias=cfg.mlp_bias,
         )
         self.apply(self._init_weights)
-        self.last_layer = weight_norm(
-            nn.Linear(cfg.bottleneck_dim, cfg.dim, bias=False)
-        )
-        self.last_layer.weight_g.data.fill_(1)
+        if cfg.bottleneck_dim is not None:
+            self.last_layer = weight_norm(
+                nn.Linear(cfg.bottleneck_dim, cfg.dim, bias=False)
+            )
+            self.last_layer.weight_g.data.fill_(1)
+        else:
+            self.last_layer = nn.Identity()
+
+        self.cfg = cfg
 
     def _init_weights(self, m):
         if isinstance(m, nn.Linear):
@@ -254,7 +259,8 @@ class DINOHead(nn.Module):
 
     def forward(self, x):
         x = self.mlp(x)
-        x = nn.functional.normalize(x, dim=-1, p=2, eps=1e-5)
+        if self.cfg.normalize:
+            x = nn.functional.normalize(x, dim=-1, p=2, eps=1e-5)
         x = self.last_layer(x)
         return x
 

@@ -33,6 +33,7 @@ from tasks.utils import *
 import torch.distributed as dist
 import torch.nn as nn
 
+
 @dataclass
 class DCSETaskConfig:
     lr: float
@@ -44,10 +45,13 @@ class DCSETaskConfig:
     lr_warmup_steps: float = 1500
     temp: float = 0.01
     delta_ent: float = 0.0
-    delta_ent_warmup_steps: int = 10000
+    delta_margin: float = 0.0
+    reg_warmup_steps: int = 10000
     ce_loss: bool = True
-    sem_reset_interval: int = 0
+    sem_reset: bool = False
+    sem_reset_schedule: Optional[List[int]] = None
     sem_reset_threshold: float = 1e-4
+    reg_type: str = "none"
 
     name: Optional[str] = None
 
@@ -81,8 +85,8 @@ class DCSETask(L.LightningModule):
             val_size=cfg.val_size
         )
 
-        if (cfg.sem_reset_interval > 0) and (rank_zero_only.rank == 0):
-            self.sem_usage_ema = SEMUsageTracker(self.encoder.sem.usage_shape)
+        if cfg.sem_reset:
+            self.sem_usage_ema = SEMUsageTracker()
 
         self.cfg = cfg
 
@@ -202,37 +206,42 @@ class DCSETask(L.LightningModule):
         else:
             return optimizer
 
-    @torch.autocast(device_type="cuda", dtype=torch.float32)
+    
     def dcse_loss(self, z_student, z_teacher):
 
-        bs = z_student.size(0)
+        with torch.autocast(device_type="cuda", enabled=False):
 
-        # Compute cosine similarity matrices of teacher/student
-        sim_student = torch.nn.functional.cosine_similarity(
-            z_student[:, None], z_student[None], dim=-1
-        )
-        sim_teacher = torch.nn.functional.cosine_similarity(
-            z_teacher[:, None], z_teacher[None], dim=-1
-        )
+            bs = z_student.size(0)
+            
+            # Make sure everything is in float32 for stability
+            z_student = z_student.to(dtype=torch.float32)
+            z_teacher = z_teacher.to(dtype=torch.float32)
 
-        # Remove the diagonal elements (self-similarity)
-        offdiag_mask = ~torch.eye(bs, dtype=bool)
-        sim_student = sim_student[offdiag_mask].reshape(bs, bs - 1)
-        sim_teacher = sim_teacher[offdiag_mask].reshape(bs, bs - 1)
-
-        if self.cfg.ce_loss:
-            # Compute cross entropy
-            loss = torch.nansum(
-                -(
-                    torch.softmax(sim_teacher / self.cfg.temp, dim=-1)
-                    * torch.log_softmax(sim_student / self.cfg.temp, dim=-1)
-                ),
-                dim=-1,
+            # Compute cosine similarity matrices of teacher/student
+            sim_student = torch.nn.functional.cosine_similarity(
+                z_student[:, None], z_student[None], dim=-1
             )
-        else:
-            loss = (sim_student - sim_teacher) ** 2
+            sim_teacher = torch.nn.functional.cosine_similarity(
+                z_teacher[:, None], z_teacher[None], dim=-1,
+            )
 
-        return loss.mean()
+            if self.cfg.ce_loss:
+                # Remove the diagonal elements (self-similarity)
+                offdiag_mask = ~torch.eye(bs, dtype=bool)
+                sim_student = sim_student[offdiag_mask].reshape(bs, bs - 1)
+                sim_teacher = sim_teacher[offdiag_mask].reshape(bs, bs - 1)
+                # Compute cross entropy
+                loss = torch.nansum(
+                    -(
+                        torch.softmax(sim_teacher / self.cfg.temp, dim=-1)
+                        * torch.log_softmax(sim_student / self.cfg.temp, dim=-1)
+                    ),
+                    dim=-1,
+                )
+            else:
+                torch.triu((sim_student - sim_teacher) ** 2)
+
+            return loss.mean()
 
     def training_step(self, batch, batch_idx):
 
@@ -258,19 +267,25 @@ class DCSETask(L.LightningModule):
             sync_dist=True,
         )
 
-        if self.cfg.delta_ent > 0.0:
+        reg = None
+        if (self.cfg.delta_ent > 0.0) and (self.cfg.reg_type == "ent"):
             ent, m_ent = sem_entropy(sem_out["probs"])
+            reg = self.cfg.delta_ent * (ent - 0.5*m_ent)
+        elif (self.cfg.delta_margin > 0.0) and (self.cfg.reg_type == "margin"):
+            reg = sem_margin(sem_out["probs"], delta=self.cfg.delta_margin)
 
+        if reg is not None:
             delta = cosine_warmup_get_value(
                 self.global_step,
-                max_value=self.cfg.delta_ent,
-                warmup_steps=self.cfg.delta_ent_warmup_steps,
+                max_value=1.0,
+                warmup_steps=self.cfg.reg_warmup_steps,
             )
-
-            loss = loss + delta * (ent - m_ent)
+            loss = loss + delta * reg
 
         if hasattr(self, "sem_usage_ema"):
-            self.sem_usage_ema.update(sem_out["usage_count"])
+            self.sem_usage_ema.update(
+                sem_out["usage_count"], batch_size=z_student.shape[0]
+            )
 
         return loss
 
@@ -278,9 +293,8 @@ class DCSETask(L.LightningModule):
     def validation_step(self, batch, batch_idx):
 
         z_student, sem_out = self.encoder(
-            batch["input_ids_enc"], batch["attention_mask_enc"]
+            batch["input_ids_enc"], batch["attention_mask_enc"], return_count=True
         )
-        dlc_probs = sem_out["probs"]
 
         z_teacher = self.teacher(
             batch["input_ids_teacher"],
@@ -291,7 +305,7 @@ class DCSETask(L.LightningModule):
 
         self.log("val/loss", loss, on_epoch=True, sync_dist=True)
 
-        ent, m_ent = sem_entropy(dlc_probs)
+        ent, m_ent = sem_entropy(sem_out["probs"])
 
         self.log(
             "val/sem_entropy",
@@ -306,24 +320,47 @@ class DCSETask(L.LightningModule):
             sync_dist=True,
         )
 
-    def on_train_batch_end(self, outputs, batch, batch_idx):
+        self.log(
+            "val/dead_words",
+            torch.sum(sem_out["usage_count"] == 0).item() / len(sem_out["usage_count"]),
+            on_epoch=True,
+            sync_dist=True,
+        )
+
+        self.log(
+            "val/latent_norm",
+            z_student.norm(p=2, dim=-1).mean().detach().item(),
+            on_epoch=True,
+            sync_dist=True,
+        )
+
+    def on_before_zero_grad(self, optimizer):
         if (
-            hasattr(self, "sem_usage_ema")
-            and (self.global_step % self.cfg.sem_reset_interval == 0)
-            and (self.global_step > 0)
+            self.cfg.sem_reset
+            and (self.global_step >= self.cfg.sem_reset_schedule[0])
+            and (self.global_step <= self.cfg.sem_reset_schedule[1])
+            and (self.global_step % self.cfg.sem_reset_schedule[-1] == 0)
         ):
-
-            # Compute new weights (with dead vertices reset)
-            new_weight = self.encoder.sem.proj_in.weight.data  
-            bound = 1 / self.encoder.sem.cfg.input_dim**0.5
-            dead_mask = self.sem_usage_ema.usage < self.cfg.sem_reset_threshold
-            new_weight[dead_mask] = new_weight[dead_mask].uniform_(
-                -bound, bound
-            )
-
-            self.encoder.sem.proj_in.weight = nn.Parameter(new_weight)
-
-            # Broadcast the input proj to other ranks (if in DDP)
             self.trainer.strategy.barrier()
-            for param in self.encoder.sem.parameters():
-                self.trainer.strategy.broadcast(param.data)
+
+            with torch.no_grad():
+                if rank_zero_only.rank == 0:
+
+                    # Compute new weights (with dead vertices reset)
+                    bound = 1 / (self.encoder.sem.cfg.input_dim**0.5)
+                    dead_mask = self.sem_usage_ema.usage < self.cfg.sem_reset_threshold
+
+                    self.encoder.sem.proj_in.weight[dead_mask] = (
+                        self.encoder.sem.proj_in.weight[dead_mask].uniform_(
+                            -bound, bound
+                        )
+                    )
+
+                    self.encoder.sem.proj_out.weight[:, dead_mask] = (
+                        self.encoder.sem.proj_out.weight[:, dead_mask].uniform_(
+                            -bound, bound
+                        )
+                    )
+
+                for param in self.encoder.sem.parameters():
+                    self.trainer.strategy.broadcast(param.data, src=0)

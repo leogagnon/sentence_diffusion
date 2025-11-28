@@ -1,12 +1,13 @@
 lr: 1e-4
 lr_warmup_steps: 1500
-batch_size: 32
-pretrained_ae_id: a0acqfq2
+batch_size: 64
+pretrained_ae_id: mteehhfy
 conditional: True
-cond_split_bounds: [0.25, 0.75]
-seq_len: 128
+cond_split_bounds: null
+cond_suffix_len: 32
+seq_len: 64
 
 decoder:
-  name: gpt2-large # 0.7B params
+  name: gpt2 # 0.7B params
 
 name: dlclm

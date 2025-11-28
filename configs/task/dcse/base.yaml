@@ -1,13 +1,16 @@
 batch_size: 64
-lr: 1e-5
+lr: 1e-4
 lr_warmup_steps: 1500
 val_size: 16384
 temp: 0.01
-delta_ent: 0.0
-delta_ent_warmup_steps: 0
+delta_ent: 1.0
+reg_warmup_steps: 10000
 ce_loss: True
-sem_reset_interval: 1
+sem_reset_schedule: [1, 20000, 5]
 sem_reset_threshold: 1e-4
+delta_margin: 0.5
+reg_type: ent
+sem_reset: false
 
 name: base_dcse
 
@@ -19,6 +22,6 @@ encoder:
   model_name: microsoft/deberta-v3-large
 
 defaults:
-  - encoder/sem: flat
+  - encoder/sem: h2
   - encoder/dino_head: null
-  - dataset: fineweb
+  - dataset: fineweb_long

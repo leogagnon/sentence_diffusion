@@ -12,6 +12,7 @@ from omegaconf import MISSING, DictConfig, OmegaConf, SCMode
 from tasks.autoencoder import AETask, AETaskConfig
 from tasks.dlclm import DLCLMTask, DLCLMTaskConfig
 from tasks.dcse import DCSETask, DCSETaskConfig
+from tasks.ri import RITask, RITaskConfig
 from lightning.pytorch.callbacks import EarlyStopping
 from lightning.pytorch.utilities.rank_zero import rank_zero_info, rank_zero_only
 
@@ -24,6 +25,7 @@ class TaskConfig:
     ae: Optional[AETaskConfig] = None
     dlclm: Optional[DLCLMTaskConfig] = None
     dcse: Optional[DCSETaskConfig] = None
+    ri: Optional[RITaskConfig] = None
 
 
 @dataclass
@@ -135,6 +137,9 @@ def main(cfg: Optional[TrainConfig] = None, run_id: Optional[str] = None):
     elif cfg.task.dcse != None:
         task = DCSETask(cfg.task.dcse)
         cfg.task.dcse = task.cfg
+    elif cfg.task.ri != None:
+        task = RITask(cfg.task.ri)
+        cfg.task.ri = task.cfg
     else:
         raise ValueError("No task specified in config!")
 
@@ -175,7 +180,7 @@ def main(cfg: Optional[TrainConfig] = None, run_id: Optional[str] = None):
         accelerator="gpu",
         enable_checkpointing=True if cfg.model_checkpoint else False,
         callbacks=callbacks,
-        val_check_interval=10, #cfg.val_check_interval * accumulate_grad_batches,  # to account for accumulation
+        val_check_interval=cfg.val_check_interval * accumulate_grad_batches,  # to account for accumulation
         gradient_clip_val=cfg.gradient_clip_val,
         num_sanity_val_steps=0,
         max_steps=cfg.max_steps+100,
@@ -183,7 +188,7 @@ def main(cfg: Optional[TrainConfig] = None, run_id: Optional[str] = None):
         accumulate_grad_batches=accumulate_grad_batches,
         precision=cfg.precision,
         limit_val_batches=cfg.limit_val_batches if cfg.limit_val_batches else 1.0,
-        devices= 1, #num_devices,
+        devices= num_devices,
         strategy=cfg.strategy,
         num_nodes=1,
         use_distributed_sampler=False,

@@ -6,6 +6,7 @@ defaults:
   - task/ae: null
   - task/dcse: null
   - task/dlclm: null
+  - task/ri: null
   - model_checkpoint: null
   - early_stopping: null
   - hydra/sweeper/params : null

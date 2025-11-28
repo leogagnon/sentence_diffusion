@@ -1,12 +1,15 @@
-task/dlclm: dcse, baseline
+task/ae: base
 model_checkpoint: base
 effective_batch_size: 1024
 
-task.dlclm.decoder.name: gpt2
+task/ae/dataset: fineweb
+task/ae/encoder/sem: h2, flat
+task.ae.delta_ent: 1.0
 compile: false
 max_steps: 30000
 
 limit_val_batches: 4
 val_check_interval: 256
 
-sweep_id: dlclm_dcse_small
+sweep_id: ae/ent
+

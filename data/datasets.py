@@ -65,7 +65,10 @@ class FineWebDataset(Dataset):
         self.dataset = load_dataset("leogagnon/fineweb_100BT_tokenized_gpt2", split="train")
         self.pre_tokenizer = AutoTokenizer.from_pretrained("gpt2-large")
         self.cfg = cfg
-        self.max_length = self.cfg.length_interval[1]
+
+    @property
+    def max_length(self):
+        return self.cfg.length_interval[1]
 
     def get_train_val_indices(self, val_size):
         indices = torch.randperm(
