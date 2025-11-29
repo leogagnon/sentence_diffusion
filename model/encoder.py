@@ -27,7 +27,6 @@ from einops import rearrange
 from torch.utils.checkpoint import checkpoint
 import hydra
 from torch.distributions import Gamma
-from entmax import entmax15
 from torch.nn.init import trunc_normal_
 from torch.nn.utils import weight_norm
 import torch.nn as nn
