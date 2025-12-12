@@ -3,11 +3,11 @@ model_checkpoint: base
 effective_batch_size: 1024
 
 task.dlclm.lr: 5e-5
-task.dlclm.pretrained_ae_id: by695baa, qw5g8eb8
+task.dlclm.pretrained_ae_id: c2gm320l, v899uxzz
 task.dlclm.decoder.name: gpt2
 task.dlclm.cond_suffix_len: 32
 task.dlclm.seq_len: 64
-task.dlclm.dropout_p: 0.0
+task.dlclm.dropout_p: 0.3
 
 compile: false
 max_steps: 30000
@@ -15,4 +15,4 @@ max_steps: 30000
 limit_val_batches: 4
 val_check_interval: 256
 
-sweep_id: dlclm_ae_bigger
+sweep_id: dlclm_ae_dropout

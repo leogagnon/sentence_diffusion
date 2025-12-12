@@ -4,3 +4,5 @@ V: 8
 D: 4
 temp: 1.0
 per_simpex_ln: True
+ln: True
+dropout_p: 0.0

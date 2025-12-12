@@ -50,8 +50,9 @@ class AETaskConfig:
     sem_reset_schedule: Optional[List[int]] = None
     sem_reset_threshold: float = 1e-4
     delta_margin: float = 0.0
-    reg_type: str = 'none'
+    reg_type: str = "none"
     sem_noise: float = 0.0
+    sem_noise_warmup_steps: int = 0
 
     name: Optional[str] = None
 
@@ -236,7 +237,12 @@ class AETask(L.LightningModule):
             self.random_substitution(batch["input_ids_enc"]),
             batch["attention_mask_enc"],
             return_count=hasattr(self, "sem_usage_ema"),
-            noise=self.cfg.sem_noise
+            noise=cosine_warmup_get_value(
+                step=self.global_step,
+                max_value=self.cfg.sem_noise,
+                warmup_steps=self.cfg.sem_noise_warmup_steps,
+                exp=2,
+            ),
         )
 
         # Compute decoder likelihood of input_ids (no need for attention mask cuz causal)
@@ -260,10 +266,10 @@ class AETask(L.LightningModule):
         )
 
         reg = None
-        if (self.cfg.delta_ent > 0.0) and (self.cfg.reg_type == 'ent'):
+        if (self.cfg.delta_ent > 0.0) and (self.cfg.reg_type == "ent"):
             ent, m_ent = sem_entropy(sem_out["probs"])
             reg = self.cfg.delta_ent * (ent - m_ent)
-        elif (self.cfg.delta_margin > 0.0) and (self.cfg.reg_type == 'margin'):
+        elif (self.cfg.delta_margin > 0.0) and (self.cfg.reg_type == "margin"):
             reg = sem_margin(sem_out["probs"], delta=self.cfg.delta_margin)
 
         if reg is not None:
@@ -283,7 +289,10 @@ class AETask(L.LightningModule):
     def validation_step(self, batch, batch_idx):
 
         z, sem_out = self.encoder(
-            batch["input_ids_enc"], batch["attention_mask_enc"], return_count=True, noise=0.0
+            batch["input_ids_enc"],
+            batch["attention_mask_enc"],
+            return_count=True,
+            noise=0.0,
         )
 
         ent, m_ent = sem_entropy(sem_out["probs"])
@@ -304,7 +313,7 @@ class AETask(L.LightningModule):
             "val/dead_words",
             torch.sum(sem_out["usage_count"] == 0).item() / len(sem_out["usage_count"]),
             on_epoch=True,
-            sync_dist=True
+            sync_dist=True,
         )
 
         self.log(
@@ -315,7 +324,11 @@ class AETask(L.LightningModule):
         )
 
         hard_z, sem_out = self.encoder(
-            batch["input_ids_enc"], batch["attention_mask_enc"], return_count=True, noise=0.0, temp=1e-4
+            batch["input_ids_enc"],
+            batch["attention_mask_enc"],
+            return_count=True,
+            noise=0.0,
+            temp=1e-4,
         )
 
         # Compute clean reconstruction loss

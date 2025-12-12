@@ -1,9 +1,9 @@
-task/ri: dcse
+task/ri: ae
 model_checkpoint: base
 effective_batch_size: 1024
 
 task.ri.lr: 5e-5
-task.ri.pretrained_dcse_id: 1ywuh505, j87j7b12, vq0w5ykd
+task.ri.pretrained_ae_id: 6b1f30og, t7lv9iwu
 task.ri.decoder.name: gpt2
 
 compile: false
@@ -12,4 +12,4 @@ max_steps: 30000
 limit_val_batches: 4
 val_check_interval: 256
 
-sweep_id: ri_dcse_v1
+sweep_id: ri_ae_bigger

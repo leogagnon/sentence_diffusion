@@ -11,4 +11,4 @@ max_steps: 30000
 limit_val_batches: 4
 val_check_interval: 256
 
-sweep_id: ri_dcse_v1
+sweep_id: ri_dcse_good

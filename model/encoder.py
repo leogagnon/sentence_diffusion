@@ -38,7 +38,9 @@ class SEMHeadConfig:
     V: int
     temp: float
     input_dim: Optional[int] = None
+    ln: bool = True
     per_simpex_ln: bool = False
+    dropout_p: float = 0.0
 
 
 class SEMHead(nn.Module):
@@ -50,10 +52,13 @@ class SEMHead(nn.Module):
 
         assert cfg.input_dim is not None, "input_dim has to be set"
         self.proj_in = nn.Linear(cfg.input_dim, cfg.L * cfg.V, bias=False)
-        if cfg.per_simpex_ln:
-            self.norm = nn.LayerNorm((cfg.V,))
+        if cfg.ln:
+            if cfg.per_simpex_ln:
+                self.norm = nn.LayerNorm((cfg.V,))
+            else:
+                self.norm = nn.LayerNorm((cfg.L, cfg.V))
         else:
-            self.norm = nn.LayerNorm((cfg.L, cfg.V))
+            self.norm = nn.Identity()
         self.proj_out = nn.Linear(cfg.L * cfg.V, cfg.input_dim, bias=False)
         self.cfg = cfg
 
@@ -61,7 +66,14 @@ class SEMHead(nn.Module):
     def dlc_len(self):
         return self.cfg.L
 
-    def forward(self, x, return_dlc=False, return_count=False, noise: float = 0.0, temp: Optional[float] = 0.0):
+    def forward(
+        self,
+        x,
+        return_dlc=False,
+        return_count=False,
+        noise: float = 0.0,
+        temp: Optional[float] = 0.0,
+    ):
         temp = self.cfg.temp if temp is None else temp
         # Proj in DLC space
         x = self.proj_in(x)
@@ -72,9 +84,18 @@ class SEMHead(nn.Module):
         probs = torch.softmax(x / temp, dim=-1)
 
         # Compute output
-        out = einx.rearrange("b l v -> b (l v)", probs)
         if noise > 0.0:
-            out = out + (noise * 1 / self.cfg.V) * torch.randn_like(out)
+            out = probs + noise * torch.randn_like(probs)
+        else:
+            out = probs
+
+        if self.training and (self.cfg.dropout_p > 0.0):
+            dropout_mask = torch.rand_like(out[:, :, 0]) < self.cfg.dropout_p
+            dropout_mask = einx.rearrange(
+                "b l -> b l v", dropout_mask, v=out.shape[-1]
+            )
+            out = out.masked_fill(dropout_mask, 0.0)
+        out = einx.rearrange("b l v -> b (l v)", out)
         out = self.proj_out(out)
 
         out_dict = {"c_out": out, "probs": probs}
@@ -107,7 +128,9 @@ class HSEMHeadConfig:
     temp: float
     input_dim: Optional[int] = None
     per_simpex_ln: bool = False
+    ln: bool = True
     out_normalization: str = "none"
+    dropout_p: float = 0.0
 
 
 class HSEMHead(nn.Module):
@@ -120,12 +143,15 @@ class HSEMHead(nn.Module):
         assert cfg.input_dim is not None, "input_dim has to be set"
         self.N = (cfg.V**cfg.D) // (cfg.V - 1)
         self.proj_in = nn.Linear(cfg.input_dim, cfg.L * self.N * cfg.V, bias=False)
-        if cfg.per_simpex_ln:
-            self.norm = nn.LayerNorm(
-                (cfg.V,),
-            )
+        if cfg.ln:
+            if cfg.per_simpex_ln:
+                self.norm = nn.LayerNorm(
+                    (cfg.V,),
+                )
+            else:
+                self.norm = nn.LayerNorm((cfg.L, self.N, cfg.V))
         else:
-            self.norm = nn.LayerNorm((cfg.L, self.N, cfg.V))
+            self.norm = nn.Identity()
         self.proj_out = nn.Linear(cfg.L * cfg.V * self.N, cfg.input_dim, bias=False)
         if cfg.out_normalization == "spectral":
             self.proj_out = nn.utils.parametrizations.spectral_norm(
@@ -182,14 +208,17 @@ class HSEMHead(nn.Module):
 
         # Compute output
         if noise > 0.0:
-            out = torch.cat(
-                [
-                    p + (noise * 1 / (p.shape[-1] * p.shape[-2])) * torch.randn_like(p)
-                    for p in probs
-                ], dim=2
-            )
+            out = torch.cat([p + noise * torch.randn_like(p) for p in probs], dim=2)
         else:
             out = torch.cat(probs, dim=2)
+
+        if self.training and (self.cfg.dropout_p > 0.0):
+            dropout_mask = torch.rand_like(out[:, :, 0, 0]) < self.cfg.dropout_p
+            dropout_mask = einx.rearrange(
+                "b l -> b l n v", dropout_mask, n=out.shape[-2], v=out.shape[-1]
+            )
+            out = out.masked_fill(dropout_mask, 0.0)
+
         out = einx.rearrange("b L N V -> b (L N V)", out)
         out = self.proj_out(out)
 

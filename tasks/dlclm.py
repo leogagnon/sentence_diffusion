@@ -51,6 +51,7 @@ class DLCLMTaskConfig:
     evalppl: bool = True
     cond_split_bounds: Optional[Tuple[float, float]] = None
     cond_suffix_len: Optional[int] = None
+    dropout_p: float = 0.0
 
     # If not giving pretrained_ae_id
     decoder: Optional[DecoderConfig] = None
@@ -231,7 +232,7 @@ class DLCLMTask(L.LightningModule):
             batch_sampler=InfiniteDistributedUniformSampler(
                 n=len(self.train_data), batch_size=self.cfg.batch_size
             ),
-            collate_fn=self.get_collate_fn(),
+            collate_fn=self.get_collate_fn(dropout=True),
         )
 
     def val_dataloader(self):
@@ -247,7 +248,7 @@ class DLCLMTask(L.LightningModule):
             collate_fn=self.get_collate_fn(),
         )
 
-    def get_collate_fn(self):
+    def get_collate_fn(self, dropout: bool = False):
         dec_tokenizer = self.decoder.tokenizer
         max_length = self.dataset.max_length
 
@@ -356,6 +357,15 @@ class DLCLMTask(L.LightningModule):
                     continuation_enc["attention_mask"].bool(),
                     return_dlc=True,
                 )[1]["dlc"] + len(dec_tokenizer)
+
+            if dropout and (self.cfg.dropout_p > 0.0):
+                dlc_rand = torch.randint_like(
+                    dlc_ids, low=0, high=self.encoder.sem.cfg.V
+                ) + len(dec_tokenizer)
+                dropout_mask = (
+                    torch.rand_like(dlc_rand, dtype=torch.float32) < self.cfg.dropout_p
+                )
+                dlc_ids = torch.where(dropout_mask, dlc_rand, dlc_ids)
 
             # Build the final input_ids
             input_ids_dec = [
@@ -508,55 +518,73 @@ class DLCLMTask(L.LightningModule):
                     prompt, skip_special_tokens=True
                 )
 
-                continuations = self.decoder.tokenizer.batch_decode(
+                continuations_hot = self.decoder.tokenizer.batch_decode(
                     self.decoder.generate(
                         prompt=prompt,
                         max_length=self.cfg.cond_suffix_len,
                         gen_dlc_len=(
                             self.encoder.sem.dlc_len if not self.ar_baseline else None
                         ),
+                        gen_kwargs_dlc={"temperature": 1.0},
+                        gen_kwargs={"temperature": 1.0},
                     ),
                     skip_special_tokens=True,
                 )
 
-                # Tokenize the sequences with perplexity model
-                ppl_batch = self.ppl_tok.batch_encode_plus(
-                    [p + c for p, c in zip(prompt_str, continuations)],
-                    padding=True,
-                    return_tensors="pt",
-                    return_offsets_mapping=True,
-                    add_special_tokens=False,
-                    return_attention_mask=False,
-                ).to(device=device)
-
-                # Compute token index where continuation starts
-                split_idx = split_index_from_offsets(
-                    ppl_batch["offset_mapping"],
-                    [len(p) for p in prompt_str],
+                continuations_cold = self.decoder.tokenizer.batch_decode(
+                    self.decoder.generate(
+                        prompt=prompt,
+                        max_length=self.cfg.cond_suffix_len,
+                        gen_dlc_len=(
+                            self.encoder.sem.dlc_len if not self.ar_baseline else None
+                        ),
+                        gen_kwargs_dlc={"temperature": 0.1},
+                        gen_kwargs={"temperature": 0.1},
+                    ),
+                    skip_special_tokens=True,
                 )
 
-                # Setup labels (-100 for prompt and padding)
-                labels = ppl_batch["input_ids"].clone()
-                labels[labels == self.ppl_tok.pad_token_id] = -100
-                for i in range(len(labels)):
-                    labels[i, : split_idx[i]] = -100
-
-                # Compute conditional perplexity of continuations
                 ppl_model = self.ppl_model[0]
                 ppl_model.to(device)
-                ppl = torch.exp(
-                    ppl_model(input_ids=ppl_batch["input_ids"], labels=labels).loss
-                )
-                ppl_model.cpu()
-                torch.cuda.empty_cache()
+                for c_type, continuations in zip(
+                    ["cold", "hot"], [continuations_cold, continuations_hot]
+                ):
+                    # Tokenize the sequences with perplexity model
+                    ppl_batch = self.ppl_tok.batch_encode_plus(
+                        [p + c for p, c in zip(prompt_str, continuations)],
+                        padding=True,
+                        return_tensors="pt",
+                        return_offsets_mapping=True,
+                        add_special_tokens=False,
+                        return_attention_mask=False,
+                    ).to(device=device)
 
-                self.log(
-                    "val/generativeppl",
-                    ppl,
-                    on_epoch=True,
-                    on_step=False,
-                    sync_dist=True,
-                )
+                    # Compute token index where continuation starts
+                    split_idx = split_index_from_offsets(
+                        ppl_batch["offset_mapping"],
+                        [len(p) for p in prompt_str],
+                    )
+
+                    # Setup labels (-100 for prompt and padding)
+                    labels = ppl_batch["input_ids"].clone()
+                    labels[labels == self.ppl_tok.pad_token_id] = -100
+                    for i in range(len(labels)):
+                        labels[i, : split_idx[i]] = -100
+
+                    # Compute conditional perplexity of continuations
+                    ppl = torch.exp(
+                        ppl_model(input_ids=ppl_batch["input_ids"], labels=labels).loss
+                    )
+                    torch.cuda.empty_cache()
+
+                    self.log(
+                        f"val/generativeppl_{c_type}",
+                        ppl,
+                        on_epoch=True,
+                        on_step=False,
+                        sync_dist=True,
+                    )
+                ppl_model.cpu()
 
             if (rank_zero_only.rank == 0) and not self.ar_baseline:
                 # Generate from ground truth DLC

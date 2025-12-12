@@ -5,12 +5,13 @@ val_size: 16384
 sub_p: 0.3
 delta_ent: 1.0
 delta_margin: 0.5
-reg_warmup_steps: 12000
-sem_reset_schedule: [5000, 10000, 1000]
+reg_warmup_steps: 10000
+sem_reset_schedule: [1000, 10000, 500]
 sem_reset_threshold: 1e-4
-reg_type: none
+reg_type: ent
 sem_reset: false
-sem_noise: 1.0
+sem_noise: 0.3
+sem_noise_warmup_steps: 10000
 
 encoder:
   model_name: microsoft/deberta-v3-large 
@@ -25,5 +26,5 @@ decoder:
 name: base_ae
 
 defaults:
-  - encoder/sem: h2
+  - encoder/sem: flat
   - dataset: fineweb

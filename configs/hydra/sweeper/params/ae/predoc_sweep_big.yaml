@@ -1,0 +1,30 @@
+task/ae: base
+model_checkpoint: base
+effective_batch_size: 1024
+task.ae.batch_size: 32
+task.ae.lr_warmup_steps: 1000
+task.ae.lr: 3e-5
+task/ae/dataset: fineweb
+task/ae/encoder/sem: flat
+task.ae.encoder.sem.dropout_p: 0.3, 0.0
+task.ae.sem_noise: 0.3
+task.ae.decoder.name: gpt2-large
+task.ae.sem_noise_warmup_steps: 10000
+task.ae.encoder.sem.ln: false
+task.ae.delta_margin: 0.5
+task.ae.delta_ent: 1.0
+task.ae.reg_warmup_steps: 10000
+task.ae.sem_reset_threshold: 1e-4
+task.ae.sem_reset_schedule: [1000, 10000, 500]
+
+task.ae.sem_reset: false
+task.ae.reg_type: none
+
+compile: false
+max_steps: 20000
+
+limit_val_batches: 4
+val_check_interval: 256
+
+sweep_id: ae/predoc_sweep_big
+

@@ -22,6 +22,6 @@ encoder:
   model_name: microsoft/deberta-v3-large
 
 defaults:
-  - encoder/sem: h2
+  - encoder/sem: flat
   - encoder/dino_head: null
-  - dataset: fineweb_long
+  - dataset: fineweb

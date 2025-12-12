@@ -121,10 +121,11 @@ class DecoderModel(nn.Module):
         self,
         input_ids,
         z: Optional[torch.Tensor] = None,
+        attention_mask : Optional[torch.Tensor] = None
     ):
         if z == None:
             assert hasattr(self, "prompt_generator") == False
-            return self.backbone(input_ids=input_ids).logits
+            return self.backbone(input_ids=input_ids, attention_mask=attention_mask).logits
         else:
             # Compute input embeddings
             prompt = self.z_to_soft_prompt(z)
