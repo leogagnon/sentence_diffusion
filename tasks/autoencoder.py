@@ -30,8 +30,9 @@ import torch
 from torch.utils.data import Sampler
 from typing import Iterator, Optional
 from tasks.utils import *
-from data.datasets import WikipediaDataset, FineWebDataset
+from data.datasets import WikipediaDataset, FineWebDataset, get_dataloader, InfoLabel
 import torch.nn as nn
+import numpy as np
 
 
 @dataclass
@@ -43,16 +44,15 @@ class AETaskConfig:
     dataset: dict
     val_size: int
     lr_warmup_steps: int = 1500
-    sub_p: float = 0.3
+    denoising: bool = True
     delta_ent: float = 0.0
     reg_warmup_steps: int = 0
-    sem_reset: bool = False
-    sem_reset_schedule: Optional[List[int]] = None
-    sem_reset_threshold: float = 1e-4
     delta_margin: float = 0.0
     reg_type: str = "none"
     sem_noise: float = 0.0
     sem_noise_warmup_steps: int = 0
+    prefix_length: int = 0
+    suffix_length: int = 128
 
     name: Optional[str] = None
 
@@ -74,9 +74,9 @@ class AETask(L.LightningModule):
             )
 
         # Load encoder and decoder and make sure they are trainable
-        self.encoder = EncoderModel(cfg.encoder).train().requires_grad_(True)
-        cfg.decoder.input_dim = self.encoder.latent_dim
         self.decoder = DecoderModel(cfg.decoder).train().requires_grad_(True)
+        cfg.encoder.latent_dim = self.decoder.dim
+        self.encoder = EncoderModel(cfg.encoder).train().requires_grad_(True)
 
         # Setup dataset
         self.dataset = hydra.utils.instantiate(cfg.dataset)
@@ -87,36 +87,11 @@ class AETask(L.LightningModule):
             val_size=cfg.val_size
         )
 
-        if cfg.sem_reset:
-            self.sem_usage_ema = SEMUsageTracker()
-
         self.cfg = cfg
 
         self.save_hyperparameters(
             OmegaConf.to_container(OmegaConf.structured(cfg)), logger=False
         )
-
-    def random_substitution(self, input_ids):
-        """
-        Randomly subtitute token with some random word with some probablity
-        """
-        input_ids = input_ids.clone()
-
-        probability = torch.full_like(
-            input_ids, fill_value=self.cfg.sub_p, dtype=torch.float32
-        )
-        masked_indices = torch.bernoulli(probability).bool()
-        vocab_size = len(self.encoder.tokenizer) - len(
-            self.encoder.tokenizer.all_special_ids
-        )
-        random_words = torch.randint_like(input_ids, low=0, high=vocab_size)
-
-        # Don't sub the first token (language token in SONAR)
-        masked_indices[:, 0] = False
-
-        input_ids[masked_indices] = random_words[masked_indices]
-
-        return input_ids
 
     def compile(self):
         self.encoder.compile()
@@ -128,26 +103,29 @@ class AETask(L.LightningModule):
         self.val_data = Subset(self.dataset, indices=self.val_indices)
 
     def train_dataloader(self):
-        # We use a random, infinite sampler WITH replacement for convenience
-        return DataLoader(
+        return get_dataloader(
             self.train_data,
-            batch_sampler=InfiniteDistributedUniformSampler(
-                n=len(self.train_data), batch_size=self.cfg.batch_size
-            ),
-            collate_fn=self.get_collate_fn(),
+            batch_size=self.cfg.batch_size,
+            prefix_length=self.cfg.prefix_length,
+            suffix_length=self.cfg.suffix_length,
+            enc_tokenizer=self.encoder.tokenizer,
+            dec_tokenizer=self.decoder.tokenizer,
+            num_workers=int(os.environ["TORCH_NUM_WORKERS"]),
+            encoder_mode="suffix",
+            encoder_noise=self.cfg.denoising,
         )
 
     def val_dataloader(self):
-        if torch.distributed.is_available() and torch.distributed.is_initialized():
-            sampler = torch.utils.data.DistributedSampler(self.val_data, shuffle=False)
-        else:
-            sampler = torch.utils.data.SequentialSampler(self.val_data)
-
-        return DataLoader(
+        return get_dataloader(
             self.val_data,
             batch_size=self.cfg.batch_size,
-            sampler=sampler,
-            collate_fn=self.get_collate_fn(),
+            prefix_length=self.cfg.prefix_length,
+            suffix_length=self.cfg.suffix_length,
+            enc_tokenizer=self.encoder.tokenizer,
+            dec_tokenizer=self.decoder.tokenizer,
+            num_workers=int(os.environ["TORCH_NUM_WORKERS"]),
+            encoder_mode="suffix",
+            encoder_noise=self.cfg.denoising,
         )
 
     def configure_optimizers(self):
@@ -181,56 +159,6 @@ class AETask(L.LightningModule):
         else:
             return optimizer
 
-    def get_collate_fn(self):
-        dec_tokenizer = self.decoder.tokenizer
-        max_length = self.dataset.max_length
-
-        def fn(batch):
-
-            input_str = batch["input_str"]
-
-            # Compute input_ids of the decoder if not already there
-            # If is there we still need to add BOS
-            if "input_ids" not in batch:
-                input_ids_dec = dec_tokenizer.batch_encode_plus(
-                    batch["input_str"],
-                    truncation=True,
-                    padding=True,
-                    max_length=max_length,
-                    return_tensors="pt",
-                    add_special_tokens=True,
-                    return_attention_mask=False,
-                )["input_ids"]
-            else:
-                input_ids_dec = [
-                    [dec_tokenizer.bos_token_id] + seq for seq in batch["input_ids"]
-                ]
-                input_ids_dec = dec_tokenizer.pad(
-                    {"input_ids": input_ids_dec},
-                    padding=True,
-                    return_tensors="pt",
-                    max_length=max_length,
-                    return_attention_mask=False,
-                )["input_ids"]
-
-            # Compute input_ids of encoder
-            batch_enc = self.encoder.tokenizer.batch_encode_plus(
-                input_str,
-                truncation=True,
-                padding="max_length",
-                max_length=max_length,
-                return_tensors="pt",
-            )
-
-            return {
-                "input_str": batch["input_str"],
-                "input_ids_dec": input_ids_dec,
-                "input_ids_enc": batch_enc["input_ids"],
-                "attention_mask_enc": batch_enc["attention_mask"].bool(),
-            }
-
-        return fn
-
     def training_step(self, batch, batch_idx):
 
         z, sem_out = self.encoder(
@@ -248,15 +176,18 @@ class AETask(L.LightningModule):
         # Compute decoder likelihood of input_ids (no need for attention mask cuz causal)
         logits = self.decoder(input_ids=batch["input_ids_dec"], z=z)
 
-        # Compute loss
-        logits = logits[:, :-1].contiguous()
+        info_mask_dec = batch["info_mask_dec"][:, 1:]
         targets = batch["input_ids_dec"][:, 1:].contiguous()
+        logits = logits[:, :-1].contiguous()
         loss = torch.nn.functional.cross_entropy(
             logits.view(-1, logits.size(-1)),
             targets.view(-1),
             ignore_index=self.decoder.tokenizer.pad_token_id,
+            reduction="none",
         )
+        loss = loss.view_as(targets)
 
+        loss = loss[info_mask_dec == InfoLabel.SUFFIX.value].mean()
         self.log(
             "train/loss",
             loss,
@@ -288,7 +219,7 @@ class AETask(L.LightningModule):
     @torch.no_grad()
     def validation_step(self, batch, batch_idx):
 
-        z, sem_out = self.encoder(
+        soft_z, sem_out = self.encoder(
             batch["input_ids_enc"],
             batch["attention_mask_enc"],
             return_count=True,
@@ -318,7 +249,7 @@ class AETask(L.LightningModule):
 
         self.log(
             "val/latent_norm",
-            z.norm(p=2, dim=-1).mean().detach().item(),
+            soft_z.norm(p=2, dim=-1).mean().detach().item(),
             on_epoch=True,
             sync_dist=True,
         )
@@ -331,59 +262,37 @@ class AETask(L.LightningModule):
             temp=1e-4,
         )
 
-        # Compute clean reconstruction loss
-        logits = self.decoder(input_ids=batch["input_ids_dec"], z=hard_z)
+        for latent, latent_type in zip([hard_z, soft_z], ["hard", "soft"]):
+            logits = self.decoder(input_ids=batch["input_ids_dec"], z=latent)
 
-        logits = logits[:, :-1].contiguous()
-        targets = batch["input_ids_dec"][:, 1:].contiguous()
-        recon_loss = torch.nn.functional.cross_entropy(
-            logits.view(-1, logits.size(-1)),
-            targets.view(-1),
-            ignore_index=self.decoder.tokenizer.pad_token_id,
-        )
-        self.log("val/loss", recon_loss, on_epoch=True, sync_dist=True)
+            info_mask_dec = batch["info_mask_dec"][:, 1:]
+            targets = batch["input_ids_dec"][:, 1:].contiguous()
+            logits = logits[:, :-1].contiguous()
+            loss = torch.nn.functional.cross_entropy(
+                logits.view(-1, logits.size(-1)),
+                targets.view(-1),
+                ignore_index=self.decoder.tokenizer.pad_token_id,
+                reduction="none",
+            )
+            loss = loss.view_as(targets)
+
+            suffix_loss = loss[info_mask_dec == InfoLabel.SUFFIX.value].mean()
+            self.log(
+                f"val/loss_{latent_type}", suffix_loss, on_epoch=True, sync_dist=True
+            )
 
         # Maybe log some generations
-        if (batch_idx == 0) and (rank_zero_only.rank == 0) and (z != None):
+        if (batch_idx == 0) and (rank_zero_only.rank == 0) and (hard_z != None):
             # Log generation from clean samples
             table_clean = wandb.Table(columns=["Original", "Reconstructed"])
             for original, reconstructed in zip(
                 batch["input_str"][:5],
                 self.decoder.tokenizer.batch_decode(
-                    self.decoder.generate(z=z[:5], max_length=self.dataset.max_length),
+                    self.decoder.generate(
+                        z=hard_z[:5], max_length=self.cfg.suffix_length
+                    ),
                     skip_special_tokens=True,
                 ),
             ):
                 table_clean.add_data(original, reconstructed)
             wandb.log({"val/samples": table_clean})
-
-    def on_before_zero_grad(self, optimizer):
-        if (
-            self.cfg.sem_reset
-            and (self.global_step >= self.cfg.sem_reset_schedule[0])
-            and (self.global_step <= self.cfg.sem_reset_schedule[1])
-            and (self.global_step % self.cfg.sem_reset_schedule[-1] == 0)
-        ):
-            self.trainer.strategy.barrier()
-
-            with torch.no_grad():
-                if rank_zero_only.rank == 0:
-
-                    # Compute new weights (with dead vertices reset)
-                    bound = 1 / (self.encoder.sem.cfg.input_dim**0.5)
-                    dead_mask = self.sem_usage_ema.usage < self.cfg.sem_reset_threshold
-
-                    self.encoder.sem.proj_in.weight[dead_mask] = (
-                        self.encoder.sem.proj_in.weight[dead_mask].uniform_(
-                            -bound, bound
-                        )
-                    )
-
-                    self.encoder.sem.proj_out.weight[:, dead_mask] = (
-                        self.encoder.sem.proj_out.weight[:, dead_mask].uniform_(
-                            -bound, bound
-                        )
-                    )
-
-                for param in self.encoder.sem.parameters():
-                    self.trainer.strategy.broadcast(param.data, src=0)

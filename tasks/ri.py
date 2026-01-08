@@ -19,7 +19,7 @@ import os
 import wandb
 import hydra
 from lightning.pytorch.utilities.rank_zero import rank_zero_info, rank_zero_only
-from tasks.autoencoder import AETask, InfiniteDistributedUniformSampler
+from tasks.autoencoder import AETask
 from data.datasets import WikipediaDataset, FineWebDataset
 from tqdm import tqdm
 from mauve import compute_mauve, get_features_from_input
@@ -227,13 +227,7 @@ class RITask(L.LightningModule):
             return optimizer
 
     def train_dataloader(self):
-        return DataLoader(
-            self.train_data,
-            batch_sampler=InfiniteDistributedUniformSampler(
-                n=len(self.train_data), batch_size=self.cfg.batch_size
-            ),
-            collate_fn=self.get_collate_fn(),
-        )
+        pass
 
     def val_dataloader(self):
         if torch.distributed.is_available() and torch.distributed.is_initialized():

@@ -1,6 +1,0 @@
-_target_: model.encoder.SEMHead
-L: 16
-V: 1024
-temp: 1.0
-per_simpex_ln: True
-ln: True

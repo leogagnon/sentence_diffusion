@@ -37,10 +37,11 @@ class SEMHeadConfig:
     L: int
     V: int
     temp: float
+    output_dim: Optional[int] = None
     input_dim: Optional[int] = None
     ln: bool = True
     per_simpex_ln: bool = False
-    dropout_p: float = 0.0
+    hard_renorm: bool = False
 
 
 class SEMHead(nn.Module):
@@ -59,7 +60,11 @@ class SEMHead(nn.Module):
                 self.norm = nn.LayerNorm((cfg.L, cfg.V))
         else:
             self.norm = nn.Identity()
-        self.proj_out = nn.Linear(cfg.L * cfg.V, cfg.input_dim, bias=False)
+
+        self.proj_out = nn.Parameter(torch.empty(cfg.L, cfg.V, cfg.output_dim))
+        torch.nn.init.kaiming_uniform_(self.proj_out, a=math.sqrt(5))
+        self.latent_len = cfg.L
+
         self.cfg = cfg
 
     @property
@@ -82,22 +87,16 @@ class SEMHead(nn.Module):
 
         # Compute Softmax
         probs = torch.softmax(x / temp, dim=-1)
-
-        # Compute output
+        
+        # Compute output (add noise, renorm, project out)
+        out = probs
         if noise > 0.0:
-            out = probs + noise * torch.randn_like(probs)
-        else:
-            out = probs
+            out = out + noise * torch.randn_like(out)
+        if self.cfg.hard_renorm:
+            out = torch.softmax(out * 10.0, dim=-1)
+        out = torch.einsum("blv,lvo->blo", out, self.proj_out).contiguous()
 
-        if self.training and (self.cfg.dropout_p > 0.0):
-            dropout_mask = torch.rand_like(out[:, :, 0]) < self.cfg.dropout_p
-            dropout_mask = einx.rearrange(
-                "b l -> b l v", dropout_mask, v=out.shape[-1]
-            )
-            out = out.masked_fill(dropout_mask, 0.0)
-        out = einx.rearrange("b l v -> b (l v)", out)
-        out = self.proj_out(out)
-
+        # Figure out what to return
         out_dict = {"c_out": out, "probs": probs}
 
         if return_dlc:
@@ -130,7 +129,6 @@ class HSEMHeadConfig:
     per_simpex_ln: bool = False
     ln: bool = True
     out_normalization: str = "none"
-    dropout_p: float = 0.0
 
 
 class HSEMHead(nn.Module):
@@ -152,14 +150,18 @@ class HSEMHead(nn.Module):
                 self.norm = nn.LayerNorm((cfg.L, self.N, cfg.V))
         else:
             self.norm = nn.Identity()
-        self.proj_out = nn.Linear(cfg.L * cfg.V * self.N, cfg.input_dim, bias=False)
-        if cfg.out_normalization == "spectral":
-            self.proj_out = nn.utils.parametrizations.spectral_norm(
-                self.proj_out, eps=1e-6
-            )
-        elif cfg.out_normalization == "norm":
-            self.proj_out = nn.utils.parametrizations.weight_norm(self.proj_out)
-            self.proj_out.weight_g.data.fill_(1)
+
+        self.latent_len = cfg.D
+        self.proj_out = nn.ModuleList(
+            [
+                nn.ModuleList(
+                    [
+                        nn.Linear(cfg.L * (cfg.V**l) * cfg.V, cfg.input_dim, bias=False)
+                        for l in range(cfg.D)
+                    ]
+                )
+            ]
+        )
         self.cfg = cfg
 
     @property
@@ -201,23 +203,19 @@ class HSEMHead(nn.Module):
                 # Compute probs at level d by multiplying with parent probs
                 end = start + self.cfg.V**d
                 level = x[:, :, start:end] * parent_probs[..., None]
-                probs.append(level)
+                probs.append(einx.rearrange("b L n V -> b (L n V)", level))
                 # Update parent and go down a level
                 parent_probs = einx.rearrange("b L n V -> b L (n V)", level)
                 start = end
 
         # Compute output
-        if noise > 0.0:
-            out = torch.cat([p + noise * torch.randn_like(p) for p in probs], dim=2)
-        else:
-            out = torch.cat(probs, dim=2)
-
-        if self.training and (self.cfg.dropout_p > 0.0):
-            dropout_mask = torch.rand_like(out[:, :, 0, 0]) < self.cfg.dropout_p
-            dropout_mask = einx.rearrange(
-                "b l -> b l n v", dropout_mask, n=out.shape[-2], v=out.shape[-1]
-            )
-            out = out.masked_fill(dropout_mask, 0.0)
+        out = torch.cat(
+            [
+                self.proj_out[i](probs[i] + noise * torch.randn_like(probs[i]))
+                for i in range(len(probs))
+            ],
+            dim=2,
+        )
 
         out = einx.rearrange("b L N V -> b (L N V)", out)
         out = self.proj_out(out)
@@ -355,6 +353,7 @@ class SONARTransformer(nn.Module):
 @dataclass
 class EncoderConfig:
     model_name: str
+    latent_dim: Optional[int] = None
     sem: Optional[dict] = None
     dino_head: Optional[DINOHeadConfig] = None
     prompt: Optional[str] = None
@@ -377,7 +376,7 @@ class EncoderModel(nn.Module):
                 "cointegrated/SONAR_200_text_encoder"
             )
             self.tokenizer.src_lang = "eng_Latn"
-            self._latent_dim = self.transformer.get_sentence_embedding_dimension()
+            backbone_dim = self.transformer.get_sentence_embedding_dimension()
         else:
             model_kwargs = {}
 
@@ -413,17 +412,18 @@ class EncoderModel(nn.Module):
             ), "Expected Pooling as second module"
 
             self.tokenizer = backbone.tokenizer
-            self._latent_dim = (
+            backbone_dim = (
                 self.transformer.auto_model.get_input_embeddings().weight.shape[1]
             )
 
         if cfg.sem is not None:
-            cfg.sem["input_dim"] = self.latent_dim
+            cfg.sem["input_dim"] = backbone_dim
+            cfg.sem["output_dim"] = cfg.latent_dim
             self.sem = hydra.utils.instantiate(cfg.sem)
             self.sem: SEMHead | HSEMHead
 
         if cfg.dino_head is not None:
-            cfg.dino_head.dim = self.latent_dim
+            cfg.dino_head.dim = backbone_dim
             self.dino_head = DINOHead(cfg.dino_head).requires_grad_(True)
 
         self.cfg = cfg
@@ -435,11 +435,11 @@ class EncoderModel(nn.Module):
 
     @property
     def latent_dim(self):
-        return self._latent_dim
+        return self.cfg.latent_dim
 
     @property
     def latent_len(self):
-        return 1
+        return self.sem.latent_len
 
     def forward(
         self,

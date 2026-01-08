@@ -21,7 +21,9 @@ teacher:
 encoder:
   model_name: microsoft/deberta-v3-large
 
+dataset:
+  _target_: data.datasets.FineWebDataset
+
 defaults:
   - encoder/sem: flat
   - encoder/dino_head: null
-  - dataset: fineweb
