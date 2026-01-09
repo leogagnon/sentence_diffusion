@@ -162,7 +162,7 @@ class AETask(L.LightningModule):
     def training_step(self, batch, batch_idx):
 
         z, sem_out = self.encoder(
-            self.random_substitution(batch["input_ids_enc"]),
+            batch["input_ids_enc"],
             batch["attention_mask_enc"],
             return_count=hasattr(self, "sem_usage_ema"),
             noise=cosine_warmup_get_value(
