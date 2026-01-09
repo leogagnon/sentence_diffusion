@@ -15,10 +15,15 @@ from tasks.dcse import DCSETask, DCSETaskConfig
 from tasks.ri import RITask, RITaskConfig
 from lightning.pytorch.callbacks import EarlyStopping
 from lightning.pytorch.utilities.rank_zero import rank_zero_info, rank_zero_only
+import warnings
+from transformers.utils import logging
 
+logging.set_verbosity_error()
 torch.set_float32_matmul_precision("high")
 torch._dynamo.config.capture_scalar_outputs = True
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
+
+
 
 @dataclass
 class TaskConfig:
@@ -90,9 +95,12 @@ def main(cfg: Optional[TrainConfig] = None, run_id: Optional[str] = None):
     os.environ["LATENT_CONTROL_CKPT_DIR"] = os.path.join(cfg.log_dir, "checkpoints") 
 
     if cfg.workers is None:
-        cfg.workers = os.environ["SLURM_CPUS_PER_TASK"]
+        assert "SLURM_CPUS_PER_TASK" in os.environ, "cfg.workers is None but SLURM_CPUS_PER_TASK not in env!"
+        cfg.workers = int(os.environ["SLURM_CPUS_PER_TASK"])
+        
     os.environ["TORCH_NUM_WORKERS"] = str(cfg.workers)
 
+    rank_zero_info(f"Using {cfg.workers} dataloader workers per process.")
     L.seed_everything(cfg.seed, workers=True)
 
     # Setup checkpoint (with wandb ID as <dirpath>)

@@ -6,8 +6,8 @@ gres: gpu:h100:4
 array_parallelism: 32
 nodes: 1 
 tasks_per_node: 4
-cpus_per_task: 4
-timeout_min: 719 # 360
+cpus_per_task: 6
+timeout_min: 179
 account: rrg-bengioy-ad
 additional_parameters:
   no-requeue: true

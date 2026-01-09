@@ -22,10 +22,12 @@ from lightning.pytorch.utilities.rank_zero import rank_zero_info
 from transformers import GenerationConfig, GPT2LMHeadModel, GPT2Config
 from copy import deepcopy
 
+
 @dataclass
 class DecoderConfig:
     name: str
     cross_attention: bool = False
+
 
 class DecoderModel(nn.Module):
 
@@ -43,7 +45,7 @@ class DecoderModel(nn.Module):
             )
         else:
             self.backbone = AutoModelForCausalLM.from_pretrained(cfg.name)
-        
+
         # Use better attention implementation
         try:
             self.backbone.set_attn_implementation("sdpa")
@@ -58,28 +60,26 @@ class DecoderModel(nn.Module):
                 module.p = 0.0
 
         # Init tokenizer, make it put BOS and EOS tokens around inputs, and add PAD and THINK tokens.
-        self.tokenizer = AutoTokenizer.from_pretrained(cfg.name)
-        self.tokenizer: GPT2TokenizerFast
-        self.tokenizer._tokenizer.post_processor = TemplateProcessing(
-            single=self.tokenizer.bos_token + " $A " + self.tokenizer.eos_token,
-            special_tokens=[
-                (self.tokenizer.eos_token, self.tokenizer.eos_token_id),
-                (self.tokenizer.bos_token, self.tokenizer.bos_token_id),
-            ],
+        self.tokenizer = GPT2TokenizerFast.from_pretrained(cfg.name)
+        
+        # Add PAD and THINK tokens, resize embeddings
+        self.tokenizer.add_special_tokens(
+            {"pad_token": "<|pad|>", "additional_special_tokens": ["<|think|>"]}
         )
-        if self.tokenizer.pad_token_id is None:
-            self.tokenizer.add_special_tokens({"pad_token": "[PAD]"})
-            self.backbone.resize_token_embeddings(
-                len(self.tokenizer), mean_resizing=True
-            )
+        self.tokenizer.think_token_id = self.tokenizer.convert_tokens_to_ids(
+            "<|think|>"
+        )
+        self.backbone.resize_token_embeddings(
+            len(self.tokenizer), mean_resizing=True
+        )
 
         # Whether the model is in DLC mode or not
         self.is_dlc = False
 
     @property
     def dim(self):
-        return self.backbone.get_input_embeddings().weight.shape[1] 
-    
+        return self.backbone.get_input_embeddings().weight.shape[1]
+
     def compile(self):
         # Only compile GPT2 backbone
         self.backbone.compile()
@@ -119,35 +119,46 @@ class DecoderModel(nn.Module):
         Format of the generation is : prefix <|think|> DLC <|bos|> suffix
         """
         device = next(self.parameters()).device
+        if prefix is not None:
+            assert isinstance(prefix, list), "Prefix should be a list of input_ids"
+            prefix = self.tokenizer.pad(
+                {"input_ids": prefix},
+                padding=True,
+                padding_side="left",
+                return_tensors="pt",
+            ).to(device=device)
+            prefix_ids, prefix_attention_mask = (
+                prefix["input_ids"],
+                prefix["attention_mask"],
+            )
+            if batch_size is None:
+                batch_size = prefix_ids.shape[0]
 
-        # If in DLC mode
         if self.is_dlc:
             assert z is None
-            batch_size = batch_size if prefix is None else len(prefix)
 
-            # if no prompt, set it to <|think|>
-            if prefix is None:
-                prefix = (
-                    torch.full(
-                        size=(batch_size, 1),
-                        fill_value=self.tokenizer.think_token_id,
-                        dtype=torch.long,
-                        device=device,
-                    )
-                    if prefix is None
-                    else prefix
+            think_token = torch.full(
+                size=(batch_size, 1),
+                fill_value=self.tokenizer.think_token_id,
+                dtype=torch.long,
+                device=device,
+            )
+
+            # Append <|think|> token to the prefix
+            if prefix is not None:
+                input_ids = torch.cat([prefix_ids, think_token], dim=1)
+                attention_mask = torch.cat(
+                    [
+                        prefix_attention_mask,
+                        torch.ones_like(think_token, dtype=torch.bool),
+                    ],
+                    dim=1,
                 )
-                prompt_mask = None
             else:
-                prefix = self.tokenizer.pad(
-                    {"input_ids": prefix},
-                    padding=True,
-                    padding_side="left",
-                    return_tensors="pt",
-                ).to(device=device)
-                prefix, prompt_mask = prefix["input_ids"], prefix["attention_mask"]
+                input_ids = think_token
+                attention_mask = torch.ones_like(think_token, dtype=torch.bool)
 
-            # if no DLC, generate it
+            # Generate DLC if not provided
             if dlc is None:
                 assert gen_dlc_len is not None
                 gen_cfg_dlc = {
@@ -164,64 +175,37 @@ class DecoderModel(nn.Module):
                 if gen_kwargs_dlc is not None:
                     gen_cfg_dlc.update(gen_kwargs_dlc)
 
-                dlc = self.backbone.generate(
-                    input_ids=prefix,
-                    attention_mask=prompt_mask,
+                input_ids = self.backbone.generate(
+                    input_ids=input_ids,
+                    attention_mask=attention_mask,
                     generation_config=GenerationConfig(**gen_cfg_dlc),
-                )[:, prefix.shape[1] :]
-
-            # Append DLC after prompt => ... <|think|> DLC
-            prefix = torch.cat([prefix, dlc], dim=1)
-            prompt_mask = (
-                torch.ones_like(prefix, dtype=torch.bool)
-                if prompt_mask is None
-                else torch.cat(
-                    [prompt_mask, torch.ones_like(dlc, dtype=torch.bool)], dim=1
                 )
-            )
 
+            # Add BOS token after DLC and update attention mask to account for DLC and the BOS
             bos = torch.full(
                 (batch_size, 1),
                 self.tokenizer.bos_token_id,
                 device=device,
                 dtype=torch.long,
             )
-            input_ids = torch.cat([prefix, bos])
+            input_ids = torch.cat([input_ids, bos], dim=1)
             attention_mask = torch.cat(
-                [prompt_mask, torch.ones_like(prompt_mask[:, [0]])], dim=1
+                [
+                    attention_mask,
+                    torch.ones(
+                        (batch_size, dlc.shape[1] + 1), dtype=torch.bool, device=device
+                    ),
+                ],
+                dim=1,
             )
-
-        # If generating from continuous latent (for auto-encoder)
-        elif z != None:
-            batch_size = z.shape[0]
-            attention_mask = None
-            input_ids = torch.full(
-                (batch_size, 1),
-                self.tokenizer.bos_token_id,
-                device=device,
-                dtype=torch.long,
-            )
-        # If generating unconditionally (for baseline)
+            # NOTE: Final input_ids are : prefix <|think|> DLC <|bos|>
         else:
-            if prefix is not None:
-                prefix = self.tokenizer.pad(
-                    {"input_ids": prefix},
-                    padding=True,
-                    padding_side="left",
-                    return_tensors="pt",
-                ).to(device=device)
-                input_ids, attention_mask = (
-                    prefix["input_ids"],
-                    prefix["attention_mask"],
-                )
-            else:
-                input_ids = torch.full(
-                    (batch_size, 1),
-                    self.tokenizer.bos_token_id,
-                    device=device,
-                    dtype=torch.long,
-                )
-                attention_mask = None
+            # This means we are in normal generation mode, maybe with z conditioning
+            assert (
+                prefix is not None
+            ), "Right now, generation without DLC must be conditionned on a prefix"
+            input_ids = prefix_ids
+            attention_mask = prefix_attention_mask
 
         gen_cfg = {
             "max_new_tokens": max_length,

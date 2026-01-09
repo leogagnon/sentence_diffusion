@@ -256,7 +256,7 @@ class PrefixSuffixIterable(IterableDataset):
         self.enc_tok = enc_tok
         self.dec_tok = dec_tok
         self.encoder_mode = encoder_mode
-        assert self.encoder_mode in ["prefix", "context"]
+        assert self.encoder_mode in ["suffix", "context"]
         if self.encoder_mode == "context":
             assert (
                 self.context_length > 0
@@ -314,20 +314,18 @@ class PrefixSuffixIterable(IterableDataset):
                     [InfoLabel.SUFFIX.value] * self.suffix_length
                 )
 
-                input_str = self.dec_tok.decode(
-                    input_ids_dec, skip_special_tokens=True
+                prefix_str = self.dec_tok.decode(
+                    input_ids_dec[: self.prefix_length], skip_special_tokens=True
+                )
+                suffix_str = self.dec_tok.decode(
+                    input_ids_dec[-self.suffix_length :], skip_special_tokens=True
                 )
 
                 if self.encoder_mode == "suffix":
-                    suffix_str = self.dec_tok.decode(
-                        input_ids_dec[-self.suffix_length :],
-                        skip_special_tokens=True,
-                    )
+                    # Unicode characters can mess with SentencePiece tokenization, so fix them
                     suffix_str = ftfy.fix_text(suffix_str)
 
-                    input_ids_enc = torch.LongTensor(
-                        self.enc_tok.encode(suffix_str)
-                    )
+                    input_ids_enc = torch.LongTensor(self.enc_tok.encode(suffix_str))
                 elif self.encoder_mode == "context":
                     context_str = self.dec_tok.decode(
                         context_ids_dec,
@@ -336,30 +334,29 @@ class PrefixSuffixIterable(IterableDataset):
                     context_str = ftfy.fix_text(context_str)
                     input_ids_enc = self.enc_tok.encode(context_str)
 
-                out = {
+                if self.encoder_noise:
+                    input_ids_enc = self.span_masker(input_ids_enc, generator)
+
+                yield {
                     "input_ids_enc": torch.LongTensor(input_ids_enc),
                     "input_ids_dec": torch.LongTensor(input_ids_dec),
                     "info_mask_dec": torch.LongTensor(info_mask_dec),
-                    "input_str": input_str,
+                    "suffix_str": suffix_str,
+                    "prefix_str": prefix_str,
                 }
-
-                if self.encoder_noise:
-                    corrupted_ids_enc = self.span_masker(input_ids_enc, generator)
-                    out.update({"corrupted_ids_enc": torch.LongTensor(corrupted_ids_enc)})
-
-                yield out
 
 
 def get_dataloader(
     dataset,
-    batch_size,
-    prefix_length,
-    suffix_length,
+    batch_size: int,
+    prefix_length: int,
+    suffix_length: int,
     enc_tokenizer,
     dec_tokenizer,
     num_workers,
     encoder_mode,
-    encoder_noise
+    encoder_noise,
+    persistent_workers,
 ):
 
     def collate_fn(batch):
@@ -389,7 +386,8 @@ def get_dataloader(
             "info_mask_dec": info_mask_dec,
             "input_ids_enc": batch_enc["input_ids"],
             "attention_mask_enc": batch_enc["attention_mask"],
-            "input_str": batch["input_str"],
+            "prefix_str": batch["prefix_str"],
+            "suffix_str": batch["suffix_str"],
         }
 
     iterable = PrefixSuffixIterable(
@@ -408,7 +406,7 @@ def get_dataloader(
         batch_size=batch_size,
         collate_fn=collate_fn,
         num_workers=num_workers,
-        persistent_workers=True,
+        persistent_workers=persistent_workers,
         prefetch_factor=4,
         pin_memory=True,
     )

@@ -19,3 +19,4 @@ datasets
 entmax
 flash-attn
 triton
+ftfy

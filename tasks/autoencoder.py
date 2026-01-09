@@ -32,7 +32,6 @@ from typing import Iterator, Optional
 from tasks.utils import *
 from data.datasets import WikipediaDataset, FineWebDataset, get_dataloader, InfoLabel
 import torch.nn as nn
-import numpy as np
 
 
 @dataclass
@@ -47,8 +46,6 @@ class AETaskConfig:
     denoising: bool = True
     delta_ent: float = 0.0
     reg_warmup_steps: int = 0
-    delta_margin: float = 0.0
-    reg_type: str = "none"
     sem_noise: float = 0.0
     sem_noise_warmup_steps: int = 0
     prefix_length: int = 0
@@ -113,6 +110,7 @@ class AETask(L.LightningModule):
             num_workers=int(os.environ["TORCH_NUM_WORKERS"]),
             encoder_mode="suffix",
             encoder_noise=self.cfg.denoising,
+            persistent_workers=True,
         )
 
     def val_dataloader(self):
@@ -125,7 +123,8 @@ class AETask(L.LightningModule):
             dec_tokenizer=self.decoder.tokenizer,
             num_workers=int(os.environ["TORCH_NUM_WORKERS"]),
             encoder_mode="suffix",
-            encoder_noise=self.cfg.denoising,
+            encoder_noise=False,  # No noise at validation
+            persistent_workers=False
         )
 
     def configure_optimizers(self):
@@ -164,7 +163,7 @@ class AETask(L.LightningModule):
         z, sem_out = self.encoder(
             batch["input_ids_enc"],
             batch["attention_mask_enc"],
-            return_count=hasattr(self, "sem_usage_ema"),
+            return_count=False,
             noise=cosine_warmup_get_value(
                 step=self.global_step,
                 max_value=self.cfg.sem_noise,
@@ -196,23 +195,16 @@ class AETask(L.LightningModule):
             sync_dist=True,
         )
 
-        reg = None
-        if (self.cfg.delta_ent > 0.0) and (self.cfg.reg_type == "ent"):
+        # Maybe entropy regularization
+        if self.cfg.delta_ent > 0.0:
             ent, m_ent = sem_entropy(sem_out["probs"])
             reg = self.cfg.delta_ent * (ent - m_ent)
-        elif (self.cfg.delta_margin > 0.0) and (self.cfg.reg_type == "margin"):
-            reg = sem_margin(sem_out["probs"], delta=self.cfg.delta_margin)
-
-        if reg is not None:
             delta = cosine_warmup_get_value(
                 self.global_step,
                 max_value=1.0,
                 warmup_steps=self.cfg.reg_warmup_steps,
             )
             loss = loss + delta * reg
-
-        if hasattr(self, "sem_usage_ema"):
-            self.sem_usage_ema.update(sem_out["usage_count"], batch_size=z.shape[0])
 
         return loss
 
@@ -226,6 +218,7 @@ class AETask(L.LightningModule):
             noise=0.0,
         )
 
+        # Log entropy, marginal entropy and dead words fraction
         ent, m_ent = sem_entropy(sem_out["probs"])
         self.log(
             "val/sem_entropy",
@@ -247,14 +240,8 @@ class AETask(L.LightningModule):
             sync_dist=True,
         )
 
-        self.log(
-            "val/latent_norm",
-            soft_z.norm(p=2, dim=-1).mean().detach().item(),
-            on_epoch=True,
-            sync_dist=True,
-        )
-
-        hard_z, sem_out = self.encoder(
+        # Decode with hard latents
+        hard_z, _ = self.encoder(
             batch["input_ids_enc"],
             batch["attention_mask_enc"],
             return_count=True,
@@ -281,18 +268,24 @@ class AETask(L.LightningModule):
                 f"val/loss_{latent_type}", suffix_loss, on_epoch=True, sync_dist=True
             )
 
-        # Maybe log some generations
-        if (batch_idx == 0) and (rank_zero_only.rank == 0) and (hard_z != None):
-            # Log generation from clean samples
-            table_clean = wandb.Table(columns=["Original", "Reconstructed"])
-            for original, reconstructed in zip(
-                batch["input_str"][:5],
-                self.decoder.tokenizer.batch_decode(
-                    self.decoder.generate(
-                        z=hard_z[:5], max_length=self.cfg.suffix_length
-                    ),
-                    skip_special_tokens=True,
+        
+        if (batch_idx == 0) and (rank_zero_only.rank == 0):
+            
+            # Reconstruct a few (5) samples from hard SEMs
+            prefix_str = batch["prefix_str"][:5]
+            prefix_ids = self.decoder.tokenizer.batch_encode_plus(prefix_str)[
+                "input_ids"
+            ]
+            true_suffix_str = batch["suffix_str"][:5]
+            generated_suffix_str = self.decoder.tokenizer.batch_decode(
+                self.decoder.generate(
+                    z=hard_z[:5], max_length=self.cfg.suffix_length, prefix=prefix_ids
                 ),
-            ):
-                table_clean.add_data(original, reconstructed)
-            wandb.log({"val/samples": table_clean})
+                skip_special_tokens=True,
+            )
+            
+            # Log to wandb
+            table = wandb.Table(columns=["Prefix", "True Suffix", "Generated Suffix"])
+            for i in range(5):
+                table.add_data(prefix_str[i], true_suffix_str[i], generated_suffix_str[i])
+            wandb.log({"val/samples": table})
