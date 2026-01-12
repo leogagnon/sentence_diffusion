@@ -16,7 +16,9 @@
                 "task/ae=base",
                 "num_devices=1",
                 "val_check_interval=1",
-                "workers=4"
+                "workers=4",
+                "task.ae.encoder_mode=context",
+                "task.ae.context_length=224"
             ],
         }
     ]

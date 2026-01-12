@@ -3,5 +3,6 @@ L: 64
 V: 128
 temp: 1.0
 per_simpex_ln: False
-ln: False
-hard_renorm: True
+ln: true
+hard_renorm: true
+proj_out_test: False

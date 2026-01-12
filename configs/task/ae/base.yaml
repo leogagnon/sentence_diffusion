@@ -4,11 +4,13 @@ lr_warmup_steps: 1000
 val_size: 16384
 delta_ent: 0.0
 reg_warmup_steps: 10000
-sem_noise: 0.3
-sem_noise_warmup_steps: 10000
+sem_noise: 0.2
+sem_noise_warmup_steps: 0 #10000
 prefix_length: 32
 suffix_length: 128
+context_length: 0
 denoising: true
+encoder_mode: suffix
 
 encoder:
   model_name: SONAR

@@ -42,6 +42,7 @@ class SEMHeadConfig:
     ln: bool = True
     per_simpex_ln: bool = False
     hard_renorm: bool = False
+    proj_out_test: bool = False
 
 
 class SEMHead(nn.Module):
@@ -61,8 +62,11 @@ class SEMHead(nn.Module):
         else:
             self.norm = nn.Identity()
 
-        self.proj_out = nn.Parameter(torch.empty(cfg.L, cfg.V, cfg.output_dim))
-        torch.nn.init.kaiming_uniform_(self.proj_out, a=math.sqrt(5))
+        if cfg.proj_out_test:
+            self.proj_out = nn.Linear(cfg.L * cfg.V, cfg.output_dim * cfg.L, bias=False)
+        else:
+            self.proj_out = nn.Parameter(torch.empty(cfg.L, cfg.V, cfg.output_dim))
+            torch.nn.init.kaiming_uniform_(self.proj_out, a=math.sqrt(5))
         self.latent_len = cfg.L
 
         self.cfg = cfg
@@ -94,7 +98,13 @@ class SEMHead(nn.Module):
             out = out + noise * torch.randn_like(out)
         if self.cfg.hard_renorm:
             out = torch.softmax(out * 10.0, dim=-1)
-        out = torch.einsum("blv,lvo->blo", out, self.proj_out).contiguous()
+        
+        if self.cfg.proj_out_test:
+            out = einx.rearrange("b l v -> b (l v)", out)
+            out = self.proj_out(out)
+            out = einx.rearrange("b (l o) -> b l o", out, o=self.cfg.output_dim, l=self.cfg.L)
+        else:
+            out = torch.einsum("blv,lvo->blo", out, self.proj_out).contiguous()
 
         # Figure out what to return
         out_dict = {"c_out": out, "probs": probs}

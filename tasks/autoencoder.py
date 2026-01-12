@@ -50,6 +50,8 @@ class AETaskConfig:
     sem_noise_warmup_steps: int = 0
     prefix_length: int = 0
     suffix_length: int = 128
+    context_length: int = 0
+    encoder_mode: str = "suffix"
 
     name: Optional[str] = None
 
@@ -105,10 +107,11 @@ class AETask(L.LightningModule):
             batch_size=self.cfg.batch_size,
             prefix_length=self.cfg.prefix_length,
             suffix_length=self.cfg.suffix_length,
+            context_length=self.cfg.context_length,
             enc_tokenizer=self.encoder.tokenizer,
             dec_tokenizer=self.decoder.tokenizer,
             num_workers=int(os.environ["TORCH_NUM_WORKERS"]),
-            encoder_mode="suffix",
+            encoder_mode=self.cfg.encoder_mode,
             encoder_noise=self.cfg.denoising,
             persistent_workers=True,
         )
@@ -120,9 +123,10 @@ class AETask(L.LightningModule):
             prefix_length=self.cfg.prefix_length,
             suffix_length=self.cfg.suffix_length,
             enc_tokenizer=self.encoder.tokenizer,
+            context_length=self.cfg.context_length,
             dec_tokenizer=self.decoder.tokenizer,
             num_workers=int(os.environ["TORCH_NUM_WORKERS"]),
-            encoder_mode="suffix",
+            encoder_mode=self.cfg.encoder_mode,
             encoder_noise=False,  # No noise at validation
             persistent_workers=False
         )
