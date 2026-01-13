@@ -325,7 +325,7 @@ class PrefixSuffixIterable(IterableDataset):
                     # Unicode characters can mess with SentencePiece tokenization, so fix them
                     suffix_str = ftfy.fix_text(suffix_str)
 
-                    input_ids_enc = torch.LongTensor(self.enc_tok.encode(suffix_str))
+                    input_ids_enc = self.enc_tok.encode(suffix_str)
                 elif self.encoder_mode == "context":
                     context_str = self.dec_tok.decode(
                         context_ids_dec,
@@ -408,7 +408,7 @@ def get_dataloader(
         batch_size=batch_size,
         collate_fn=collate_fn,
         num_workers=num_workers,
-        persistent_workers=persistent_workers,
-        prefetch_factor=4,
-        pin_memory=True,
+        persistent_workers=False,
+        prefetch_factor=2,
+        pin_memory=False,
     )

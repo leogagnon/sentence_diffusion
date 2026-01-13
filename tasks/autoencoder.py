@@ -223,26 +223,27 @@ class AETask(L.LightningModule):
         )
 
         # Log entropy, marginal entropy and dead words fraction
-        ent, m_ent = sem_entropy(sem_out["probs"])
-        self.log(
-            "val/sem_entropy",
-            ent.item(),
-            on_epoch=True,
-            sync_dist=True,
-        )
-        self.log(
-            "val/sem_marginal_entropy",
-            m_ent.item(),
-            on_epoch=True,
-            sync_dist=True,
-        )
-
-        self.log(
-            "val/dead_words",
-            torch.sum(sem_out["usage_count"] == 0).item() / len(sem_out["usage_count"]),
-            on_epoch=True,
-            sync_dist=True,
-        )
+        if "probs" in sem_out.keys():
+            ent, m_ent = sem_entropy(sem_out["probs"])
+            self.log(
+                "val/sem_entropy",
+                ent.item(),
+                on_epoch=True,
+                sync_dist=True,
+            )
+            self.log(
+                "val/sem_marginal_entropy",
+                m_ent.item(),
+                on_epoch=True,
+                sync_dist=True,
+            )
+        if "usage_count" in sem_out.keys():
+            self.log(
+                "val/dead_words",
+                torch.sum(sem_out["usage_count"] == 0).item() / len(sem_out["usage_count"]),
+                on_epoch=True,
+                sync_dist=True,
+            )
 
         # Decode with hard latents
         hard_z, _ = self.encoder(

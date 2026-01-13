@@ -30,6 +30,7 @@ from torch.distributions import Gamma
 from torch.nn.init import trunc_normal_
 from torch.nn.utils import weight_norm
 import torch.nn as nn
+from torch.utils.checkpoint import checkpoint
 
 
 @dataclass
@@ -43,7 +44,8 @@ class SEMHeadConfig:
     per_simpex_ln: bool = False
     hard_renorm: bool = False
     proj_out_test: bool = False
-
+    baseline: bool = False
+    dlc_len: Optional[int] = None
 
 class SEMHead(nn.Module):
     def __init__(self, cfg: Optional[SEMHeadConfig] = None, **kwargs):
@@ -53,21 +55,24 @@ class SEMHead(nn.Module):
             cfg = SEMHeadConfig(**kwargs)
 
         assert cfg.input_dim is not None, "input_dim has to be set"
-        self.proj_in = nn.Linear(cfg.input_dim, cfg.L * cfg.V, bias=False)
-        if cfg.ln:
-            if cfg.per_simpex_ln:
-                self.norm = nn.LayerNorm((cfg.V,))
+        if cfg.baseline:
+            self.proj_out = nn.Linear(cfg.input_dim, cfg.L * cfg.output_dim)
+        else:
+            self.proj_in = nn.Linear(cfg.input_dim, cfg.L * cfg.V, bias=False)
+            if cfg.ln:
+                if cfg.per_simpex_ln:
+                    self.norm = nn.LayerNorm((cfg.V,))
+                else:
+                    self.norm = nn.LayerNorm((cfg.L, cfg.V))
             else:
-                self.norm = nn.LayerNorm((cfg.L, cfg.V))
-        else:
-            self.norm = nn.Identity()
+                self.norm = nn.Identity()
 
-        if cfg.proj_out_test:
-            self.proj_out = nn.Linear(cfg.L * cfg.V, cfg.output_dim * cfg.L, bias=False)
-        else:
-            self.proj_out = nn.Parameter(torch.empty(cfg.L, cfg.V, cfg.output_dim))
-            torch.nn.init.kaiming_uniform_(self.proj_out, a=math.sqrt(5))
-        self.latent_len = cfg.L
+            if cfg.proj_out_test:
+                self.proj_out = nn.Linear(cfg.L * cfg.V, cfg.output_dim * cfg.L, bias=False)
+            else:
+                self.proj_out = nn.Parameter(torch.empty(cfg.L, cfg.V, cfg.output_dim))
+                torch.nn.init.kaiming_uniform_(self.proj_out, a=math.sqrt(5))
+        self.latent_len = cfg.L if cfg.dlc_len is None else cfg.dlc_len
 
         self.cfg = cfg
 
@@ -82,7 +87,12 @@ class SEMHead(nn.Module):
         return_count=False,
         noise: float = 0.0,
         temp: Optional[float] = 0.0,
-    ):
+    ):  
+        if self.cfg.baseline:
+            out = self.proj_out(x)
+            out = einx.rearrange("b (l o) -> b l o", out, l=self.cfg.L, o=self.cfg.output_dim)
+            return {"c_out": out}
+        
         temp = self.cfg.temp if temp is None else temp
         # Proj in DLC space
         x = self.proj_in(x)
@@ -91,20 +101,26 @@ class SEMHead(nn.Module):
 
         # Compute Softmax
         probs = torch.softmax(x / temp, dim=-1)
-        
+
         # Compute output (add noise, renorm, project out)
         out = probs
         if noise > 0.0:
             out = out + noise * torch.randn_like(out)
         if self.cfg.hard_renorm:
             out = torch.softmax(out * 10.0, dim=-1)
-        
+
         if self.cfg.proj_out_test:
             out = einx.rearrange("b l v -> b (l v)", out)
             out = self.proj_out(out)
-            out = einx.rearrange("b (l o) -> b l o", out, o=self.cfg.output_dim, l=self.cfg.L)
+            out = einx.rearrange(
+                "b (l o) -> b l o", out, o=self.cfg.output_dim, l=self.cfg.L
+            )
         else:
             out = torch.einsum("blv,lvo->blo", out, self.proj_out).contiguous()
+
+        if self.latent_len != self.cfg.L:
+            out = einx.rearrange("b (m l) o -> b m l o", out, m=self.cfg.L//self.latent_len, l=self.latent_len)
+            out = out.sum(dim=1)
 
         # Figure out what to return
         out_dict = {"c_out": out, "probs": probs}
@@ -348,7 +364,7 @@ class SONARTransformer(nn.Module):
     def __init__(self):
         super().__init__()
         self.auto_model = M2M100Encoder.from_pretrained(
-            "cointegrated/SONAR_200_text_encoder",
+            "cointegrated/SONAR_200_text_encoder"
         )
 
     def get_sentence_embedding_dimension(self):

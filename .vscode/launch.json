@@ -12,13 +12,13 @@
             "console": "integratedTerminal",
             "justMyCode": false,
             "args": [
-                //"--wandb_id=9fz6p3h6"
-                "task/ae=base",
-                "num_devices=1",
-                "val_check_interval=1",
-                "workers=4",
-                "task.ae.encoder_mode=context",
-                "task.ae.context_length=224"
+                "--wandb_id=vjf7103x"
+                //"task/ae=base",
+                //"num_devices=1",
+                //"val_check_interval=1",
+                //"workers=4",
+                //"task.ae.encoder_mode=context",
+                //"task.ae.context_length=224"
             ],
         }
     ]

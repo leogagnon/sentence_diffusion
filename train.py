@@ -69,7 +69,7 @@ def main(cfg: Optional[TrainConfig] = None, run_id: Optional[str] = None):
         wandb_id = run_id
         api = wandb.Api()
         entity = "guillaume-lajoie"
-        project = "dlc_lm_0"
+        project = "dlc_lm_1"
         run = api.run(f"{entity}/{project}/{run_id}")
         cfg = OmegaConf.merge(OmegaConf.structured(TrainConfig), run.config)
 
@@ -95,8 +95,7 @@ def main(cfg: Optional[TrainConfig] = None, run_id: Optional[str] = None):
     os.environ["LATENT_CONTROL_CKPT_DIR"] = os.path.join(cfg.log_dir, "checkpoints") 
 
     if cfg.workers is None:
-        assert "SLURM_CPUS_PER_TASK" in os.environ, "cfg.workers is None but SLURM_CPUS_PER_TASK not in env!"
-        cfg.workers = int(os.environ["SLURM_CPUS_PER_TASK"])
+        cfg.workers = int(os.environ.get("SLURM_CPUS_PER_TASK", 1))
         
     os.environ["TORCH_NUM_WORKERS"] = str(cfg.workers)
 
@@ -131,14 +130,14 @@ def main(cfg: Optional[TrainConfig] = None, run_id: Optional[str] = None):
         # Add the autoencoder config to cfg
         if cfg.task.dlclm.pretrained_ae_id is not None:
             run = wandb.Api().run(
-                f"guillaume-lajoie/dlc_lm_0/{cfg.task.dlclm.pretrained_ae_id}"
+                f"guillaume-lajoie/dlc_lm_1/{cfg.task.dlclm.pretrained_ae_id}"
             )
             cfg.task.ae = OmegaConf.merge(
                 OmegaConf.structured(AETaskConfig), run.config["task"]["ae"]
             )
         elif cfg.task.dlclm.pretrained_dcse_id is not None:
             run = wandb.Api().run(
-                f"guillaume-lajoie/dlc_lm_0/{cfg.task.dlclm.pretrained_dcse_id}"
+                f"guillaume-lajoie/dlc_lm_1/{cfg.task.dlclm.pretrained_dcse_id}"
             )
             cfg.task.dcse = OmegaConf.merge(
                 OmegaConf.structured(DCSETaskConfig),
@@ -196,7 +195,7 @@ def main(cfg: Optional[TrainConfig] = None, run_id: Optional[str] = None):
         val_check_interval=cfg.val_check_interval * accumulate_grad_batches,  # to account for accumulation
         gradient_clip_val=cfg.gradient_clip_val,
         num_sanity_val_steps=0,
-        max_steps=cfg.max_steps+100,
+        max_steps=cfg.max_steps,
         log_every_n_steps=50,
         accumulate_grad_batches=accumulate_grad_batches,
         precision=cfg.precision,
