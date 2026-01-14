@@ -38,14 +38,9 @@ class SEMHeadConfig:
     L: int
     V: int
     temp: float
-    output_dim: Optional[int] = None
     input_dim: Optional[int] = None
-    ln: bool = True
-    per_simpex_ln: bool = False
     hard_renorm: bool = False
-    proj_out_test: bool = False
-    baseline: bool = False
-    dlc_len: Optional[int] = None
+
 
 class SEMHead(nn.Module):
     def __init__(self, cfg: Optional[SEMHeadConfig] = None, **kwargs):
@@ -55,30 +50,14 @@ class SEMHead(nn.Module):
             cfg = SEMHeadConfig(**kwargs)
 
         assert cfg.input_dim is not None, "input_dim has to be set"
-        if cfg.baseline:
-            self.proj_out = nn.Linear(cfg.input_dim, cfg.L * cfg.output_dim)
-        else:
-            self.proj_in = nn.Linear(cfg.input_dim, cfg.L * cfg.V, bias=False)
-            if cfg.ln:
-                if cfg.per_simpex_ln:
-                    self.norm = nn.LayerNorm((cfg.V,))
-                else:
-                    self.norm = nn.LayerNorm((cfg.L, cfg.V))
-            else:
-                self.norm = nn.Identity()
-
-            if cfg.proj_out_test:
-                self.proj_out = nn.Linear(cfg.L * cfg.V, cfg.output_dim * cfg.L, bias=False)
-            else:
-                self.proj_out = nn.Parameter(torch.empty(cfg.L, cfg.V, cfg.output_dim))
-                torch.nn.init.kaiming_uniform_(self.proj_out, a=math.sqrt(5))
-        self.latent_len = cfg.L if cfg.dlc_len is None else cfg.dlc_len
+        self.proj_in = nn.Linear(cfg.input_dim, cfg.L * cfg.V, bias=False)
+        self.norm = nn.LayerNorm((cfg.L, cfg.V))
 
         self.cfg = cfg
 
     @property
-    def dlc_len(self):
-        return self.cfg.L
+    def out_dim(self):
+        return self.cfg.L * self.cfg.V
 
     def forward(
         self,
@@ -87,43 +66,24 @@ class SEMHead(nn.Module):
         return_count=False,
         noise: float = 0.0,
         temp: Optional[float] = 0.0,
-    ):  
-        if self.cfg.baseline:
-            out = self.proj_out(x)
-            out = einx.rearrange("b (l o) -> b l o", out, l=self.cfg.L, o=self.cfg.output_dim)
-            return {"c_out": out}
-        
+    ):
+
         temp = self.cfg.temp if temp is None else temp
-        # Proj in DLC space
+        # Proj in DLC space and normalize
         x = self.proj_in(x)
         x = einx.rearrange("b (l v) -> b l v", x, l=self.cfg.L, v=self.cfg.V)
         x = self.norm(x)
 
-        # Compute Softmax
+        # Compute Softmax (with temperature)
         probs = torch.softmax(x / temp, dim=-1)
 
         # Compute output (add noise, renorm, project out)
         out = probs
         if noise > 0.0:
             out = out + noise * torch.randn_like(out)
-        if self.cfg.hard_renorm:
-            out = torch.softmax(out * 10.0, dim=-1)
-
-        if self.cfg.proj_out_test:
-            out = einx.rearrange("b l v -> b (l v)", out)
-            out = self.proj_out(out)
-            out = einx.rearrange(
-                "b (l o) -> b l o", out, o=self.cfg.output_dim, l=self.cfg.L
-            )
-        else:
-            out = torch.einsum("blv,lvo->blo", out, self.proj_out).contiguous()
-
-        if self.latent_len != self.cfg.L:
-            out = einx.rearrange("b (m l) o -> b m l o", out, m=self.cfg.L//self.latent_len, l=self.latent_len)
-            out = out.sum(dim=1)
 
         # Figure out what to return
-        out_dict = {"c_out": out, "probs": probs}
+        out_dict = {"probs": probs}
 
         if return_dlc:
             out_dict.update({"dlc": self._encode(probs)})
@@ -292,74 +252,6 @@ class HSEMHead(nn.Module):
         return counts
 
 
-@dataclass
-class DINOHeadConfig:
-    nlayers: int
-    hidden_dim: int
-    mlp_bias: bool
-    dim: Optional[int] = None
-    bottleneck_dim: Optional[int] = None
-    normalize: bool = False
-
-
-class DINOHead(nn.Module):
-    def __init__(self, cfg: Optional[DINOHeadConfig] = None, **kwargs):
-        super().__init__()
-        if cfg == None:
-            cfg = DINOHeadConfig(**kwargs)
-        assert cfg.dim is not None
-        self.mlp = _build_mlp(
-            cfg.nlayers,
-            cfg.dim,
-            cfg.dim if cfg.bottleneck_dim is None else cfg.bottleneck_dim,
-            hidden_dim=cfg.hidden_dim,
-            use_bn=False,
-            bias=cfg.mlp_bias,
-        )
-        self.apply(self._init_weights)
-        if cfg.bottleneck_dim is not None:
-            self.last_layer = weight_norm(
-                nn.Linear(cfg.bottleneck_dim, cfg.dim, bias=False)
-            )
-            self.last_layer.weight_g.data.fill_(1)
-        else:
-            self.last_layer = nn.Identity()
-
-        self.cfg = cfg
-
-    def _init_weights(self, m):
-        if isinstance(m, nn.Linear):
-            trunc_normal_(m.weight, std=0.02)
-            if isinstance(m, nn.Linear) and m.bias is not None:
-                nn.init.constant_(m.bias, 0)
-
-    def forward(self, x):
-        x = self.mlp(x)
-        if self.cfg.normalize:
-            x = nn.functional.normalize(x, dim=-1, p=2, eps=1e-5)
-        x = self.last_layer(x)
-        return x
-
-
-def _build_mlp(
-    nlayers, in_dim, bottleneck_dim, hidden_dim=None, use_bn=False, bias=True
-):
-    if nlayers == 1:
-        return nn.Linear(in_dim, bottleneck_dim, bias=bias)
-    else:
-        layers = [nn.Linear(in_dim, hidden_dim, bias=bias)]
-        if use_bn:
-            layers.append(nn.BatchNorm1d(hidden_dim))
-        layers.append(nn.GELU())
-        for _ in range(nlayers - 2):
-            layers.append(nn.Linear(hidden_dim, hidden_dim, bias=bias))
-            if use_bn:
-                layers.append(nn.BatchNorm1d(hidden_dim))
-            layers.append(nn.GELU())
-        layers.append(nn.Linear(hidden_dim, bottleneck_dim, bias=bias))
-        return nn.Sequential(*layers)
-
-
 class SONARTransformer(nn.Module):
     def __init__(self):
         super().__init__()
@@ -379,15 +271,17 @@ class SONARTransformer(nn.Module):
 @dataclass
 class EncoderConfig:
     model_name: str
+    latent_length: int
     latent_dim: Optional[int] = None
     sem: Optional[dict] = None
-    dino_head: Optional[DINOHeadConfig] = None
-    prompt: Optional[str] = None
     train: bool = True
+
 
 class EncoderModel(nn.Module):
     def __init__(self, cfg: Optional[EncoderConfig] = None, **kwargs):
         super().__init__()
+
+        assert cfg.latent_dim is not None, "latent_dim has to be set"
 
         if cfg == None:
             cfg = EncoderConfig(**kwargs)
@@ -442,42 +336,31 @@ class EncoderModel(nn.Module):
                 self.transformer.auto_model.get_input_embeddings().weight.shape[1]
             )
 
-        if cfg.sem is not None:
+        # Maybe freeze backbone
+        self.transformer = self.transformer.train(cfg.train).requires_grad_(cfg.train)
+
+        # Initialize SEM/output projection
+        if cfg.sem is None:
+            self.out_proj = nn.Linear(backbone_dim, cfg.latent_length * cfg.latent_dim)
+        else:
             cfg.sem["input_dim"] = backbone_dim
-            cfg.sem["output_dim"] = cfg.latent_dim
             self.sem = hydra.utils.instantiate(cfg.sem)
             self.sem: SEMHead | HSEMHead
-
-        if cfg.dino_head is not None:
-            cfg.dino_head.dim = backbone_dim
-            self.dino_head = DINOHead(cfg.dino_head).requires_grad_(True)
-
-        if cfg.train:
-            super().train(True)
-            self.requires_grad_(True)
-        else:
-            super().train(False)
-            self.requires_grad_(False)
-            self.sem.proj_out = self.sem.proj_out.requires_grad_(True)
+            self.out_proj = nn.Linear(
+                self.sem.out_dim, cfg.latent_length * cfg.latent_dim
+            )
 
         self.cfg = cfg
 
-    def train(self, mode = True):
-        if self.cfg.train:
-            return super().train(mode)
+    def train(self, mode=True):
+        super().train(mode)
+        if not self.cfg.train:
+            self.transformer.train(False)
 
     def compile(self):
         # Only compile the SEM
         if self.cfg.sem is not None:
             self.sem.compile()
-
-    @property
-    def latent_dim(self):
-        return self.cfg.latent_dim
-
-    @property
-    def latent_len(self):
-        return self.sem.latent_len
 
     def forward(
         self,
@@ -497,8 +380,10 @@ class EncoderModel(nn.Module):
         batch = self.pooling(batch)
         z = batch["sentence_embedding"]
 
+        # Run through SEM / output projection
         if self.cfg.sem is None:
-            return z
+            z = self.out_proj(z)
+            sem_out = {}
         else:
             sem_out = self.sem(
                 z,
@@ -507,9 +392,9 @@ class EncoderModel(nn.Module):
                 noise=noise,
                 temp=temp,
             )
-            z = sem_out.pop("c_out")
-
-        if self.cfg.dino_head is not None:
-            z = self.dino_head(z)
+            z = self.out_proj(sem_out["probs"].view(sem_out["probs"].shape[0], -1))
+        
+        # Reshape latent
+        z = einx.rearrange("b (l d) -> b l d", z, l=self.cfg.latent_length, d=self.cfg.latent_dim)
 
         return z, sem_out

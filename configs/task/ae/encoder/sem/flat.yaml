@@ -2,9 +2,4 @@ _target_: model.encoder.SEMHead
 L: 64
 V: 128
 temp: 1.0
-per_simpex_ln: False
-ln: true
 hard_renorm: false
-proj_out_test: False
-baseline: false
-dlc_len: null

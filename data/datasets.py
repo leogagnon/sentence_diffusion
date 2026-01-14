@@ -326,6 +326,8 @@ class PrefixSuffixIterable(IterableDataset):
                     suffix_str = ftfy.fix_text(suffix_str)
 
                     input_ids_enc = self.enc_tok.encode(suffix_str)
+                    if len(input_ids_enc) > self.suffix_length * 1.3:
+                        continue
                 elif self.encoder_mode == "context":
                     context_str = self.dec_tok.decode(
                         context_ids_dec,
@@ -333,6 +335,10 @@ class PrefixSuffixIterable(IterableDataset):
                     )
                     context_str = ftfy.fix_text(context_str)
                     input_ids_enc = self.enc_tok.encode(context_str)
+                    if len(input_ids_enc) > (
+                        self.context_length + self.prefix_length
+                    ) * 1.3:
+                        continue
 
                 if self.encoder_noise:
                     input_ids_enc = self.span_masker(input_ids_enc, generator)
@@ -348,18 +354,19 @@ class PrefixSuffixIterable(IterableDataset):
 
 def get_dataloader(
     dataset,
-    batch_size: int,
-    prefix_length: int,
-    suffix_length: int,
-    context_length: int,
+    batch_size,
+    prefix_length,
+    suffix_length,
+    context_length,
     enc_tokenizer,
     dec_tokenizer,
     num_workers,
     encoder_mode,
     encoder_noise,
-    seed=42
+    seed
 ):
 
+    # Make the collation function
     def collate_fn(batch):
         # Merge dicts by key
         batch = {key: [item[key] for item in batch] for key in batch[0].keys()}

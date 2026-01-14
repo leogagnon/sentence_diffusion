@@ -1,4 +1,4 @@
-batch_size: 64
+batch_size: 2
 lr: 1e-4
 lr_warmup_steps: 1000
 val_size: 16384
@@ -14,6 +14,7 @@ encoder_mode: suffix
 
 encoder:
   model_name: SONAR
+  latent_length: 16
 
 decoder:
   name: gpt2-large # 1.5B params

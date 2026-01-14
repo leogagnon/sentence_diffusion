@@ -77,7 +77,7 @@ class DecoderModel(nn.Module):
         self.is_dlc = False
 
     @property
-    def dim(self):
+    def latent_dim(self):
         return self.backbone.get_input_embeddings().weight.shape[1]
 
     def compile(self):
@@ -90,17 +90,11 @@ class DecoderModel(nn.Module):
         attention_mask: Optional[torch.Tensor] = None,
         z: Optional[torch.Tensor] = None,
     ):
-        if z == None:
-            assert hasattr(self, "prompt_generator") == False
-            return self.backbone(
-                input_ids=input_ids, attention_mask=attention_mask
-            ).logits
-        else:
-            # Compute input embeddings
-            return self.backbone(
-                input_ids=input_ids,
-                encoder_hidden_states=z,
-            ).logits
+        return self.backbone(
+            input_ids=input_ids,
+            attention_mask=attention_mask,
+            encoder_hidden_states=z,
+        ).logits
 
     @torch.inference_mode()
     def generate(

@@ -52,7 +52,6 @@ class AETaskConfig:
     suffix_length: int = 128
     context_length: int = 0
     encoder_mode: str = "suffix"
-    freeze_encoder: bool = False
 
     name: Optional[str] = None
 
@@ -75,9 +74,9 @@ class AETask(L.LightningModule):
 
         # Load encoder and decoder and make sure they are trainable
         self.decoder = DecoderModel(cfg.decoder).train().requires_grad_(True)
-        cfg.encoder.latent_dim = self.decoder.dim
+        cfg.encoder.latent_dim = self.decoder.latent_dim
         self.encoder = EncoderModel(cfg.encoder)
-    
+
         # Setup dataset
         self.dataset = hydra.utils.instantiate(cfg.dataset)
         self.dataset: WikipediaDataset | FineWebDataset
@@ -114,7 +113,7 @@ class AETask(L.LightningModule):
             num_workers=int(os.environ["TORCH_NUM_WORKERS"]),
             encoder_mode=self.cfg.encoder_mode,
             encoder_noise=self.cfg.denoising,
-            seed=42
+            seed=random.randint(0, 100000),  # Dataset should be different if restarted
         )
 
     def val_dataloader(self):
@@ -129,7 +128,7 @@ class AETask(L.LightningModule):
             num_workers=int(os.environ["TORCH_NUM_WORKERS"]),
             encoder_mode=self.cfg.encoder_mode,
             encoder_noise=False,  # No noise at validation
-            seed=random.randint(0,100000)
+            seed=42,  # Always the same validation set for consistency
         )
 
     def configure_optimizers(self):
@@ -165,10 +164,10 @@ class AETask(L.LightningModule):
 
     def training_step(self, batch, batch_idx):
 
+        # Encode input_ids to get z
         z, sem_out = self.encoder(
             batch["input_ids_enc"],
             batch["attention_mask_enc"],
-            return_count=False,
             noise=cosine_warmup_get_value(
                 step=self.global_step,
                 max_value=self.cfg.sem_noise,
@@ -177,9 +176,10 @@ class AETask(L.LightningModule):
             ),
         )
 
-        # Compute decoder likelihood of input_ids (no need for attention mask cuz causal)
+        # Compute decoder likelihood of input_ids given z
         logits = self.decoder(input_ids=batch["input_ids_dec"], z=z)
 
+        # Compute loss on suffix only
         info_mask_dec = batch["info_mask_dec"][:, 1:]
         targets = batch["input_ids_dec"][:, 1:].contiguous()
         logits = logits[:, :-1].contiguous()
@@ -190,7 +190,6 @@ class AETask(L.LightningModule):
             reduction="none",
         )
         loss = loss.view_as(targets)
-
         loss = loss[info_mask_dec == InfoLabel.SUFFIX.value].mean()
         self.log(
             "train/loss",
@@ -241,7 +240,8 @@ class AETask(L.LightningModule):
         if "usage_count" in sem_out.keys():
             self.log(
                 "val/dead_words",
-                torch.sum(sem_out["usage_count"] == 0).item() / len(sem_out["usage_count"]),
+                torch.sum(sem_out["usage_count"] == 0).item()
+                / len(sem_out["usage_count"]),
                 on_epoch=True,
                 sync_dist=True,
             )
@@ -271,12 +271,14 @@ class AETask(L.LightningModule):
 
             suffix_loss = loss[info_mask_dec == InfoLabel.SUFFIX.value].mean()
             self.log(
-                f"val/loss_{latent_type}", suffix_loss.item(), on_epoch=True, sync_dist=True
+                f"val/loss_{latent_type}",
+                suffix_loss.item(),
+                on_epoch=True,
+                sync_dist=True,
             )
 
-        
         if (batch_idx == 0) and (rank_zero_only.rank == 0):
-            
+
             # Reconstruct a few (5) samples from hard SEMs
             prefix_str = batch["prefix_str"][:5]
             prefix_ids = self.decoder.tokenizer.batch_encode_plus(prefix_str)[
@@ -289,9 +291,11 @@ class AETask(L.LightningModule):
                 ),
                 skip_special_tokens=True,
             )
-            
+
             # Log to wandb
             table = wandb.Table(columns=["Prefix", "True Suffix", "Generated Suffix"])
             for i in range(5):
-                table.add_data(prefix_str[i], true_suffix_str[i], generated_suffix_str[i])
+                table.add_data(
+                    prefix_str[i], true_suffix_str[i], generated_suffix_str[i]
+                )
             wandb.log({"val/samples": table})
