@@ -1,0 +1,25 @@
+task/ae: base
+model_checkpoint: base
+effective_batch_size: 1024
+task.ae.batch_size: 64
+task.ae.lr_warmup_steps: 1000
+task.ae.lr: 1e-4
+
+task/ae/encoder/sem: flat
+task.ae.prefix_length: 16
+task.ae.suffix_length: 64
+task.ae.context_length: 96
+task.ae.encoder_mode: context
+task.ae.encoder.sem.V: 64
+task.ae.sem_noise_warmup_steps: 10000
+task.ae.sem_noise: 0.3
+task.ae.encoder.sem.hard_renorm: false, true
+task.ae.denoising: false
+
+max_steps: 20000
+
+limit_val_batches: 4
+val_check_interval: 256
+
+sweep_id: ae/sweep_1
+
