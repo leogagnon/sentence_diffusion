@@ -383,7 +383,7 @@ class EncoderConfig:
     sem: Optional[dict] = None
     dino_head: Optional[DINOHeadConfig] = None
     prompt: Optional[str] = None
-
+    train: bool = True
 
 class EncoderModel(nn.Module):
     def __init__(self, cfg: Optional[EncoderConfig] = None, **kwargs):
@@ -452,7 +452,19 @@ class EncoderModel(nn.Module):
             cfg.dino_head.dim = backbone_dim
             self.dino_head = DINOHead(cfg.dino_head).requires_grad_(True)
 
+        if cfg.train:
+            super().train(True)
+            self.requires_grad_(True)
+        else:
+            super().train(False)
+            self.requires_grad_(False)
+            self.sem.proj_out = self.sem.proj_out.requires_grad_(True)
+
         self.cfg = cfg
+
+    def train(self, mode = True):
+        if self.cfg.train:
+            return super().train(mode)
 
     def compile(self):
         # Only compile the SEM

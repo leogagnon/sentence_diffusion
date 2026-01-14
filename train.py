@@ -22,7 +22,8 @@ logging.set_verbosity_error()
 torch.set_float32_matmul_precision("high")
 torch._dynamo.config.capture_scalar_outputs = True
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
-
+os.environ["PYTORCH_ALLOC_CONF"]="expandable_segments:True"
+os.environ["PYTORCH_CUDA_ALLOC_CONF"]="expandable_segments:True"
 
 
 @dataclass

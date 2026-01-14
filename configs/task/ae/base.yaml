@@ -14,6 +14,7 @@ encoder_mode: suffix
 
 encoder:
   model_name: SONAR
+  train: True
 
 decoder:
   name: gpt2-large # 1.5B params

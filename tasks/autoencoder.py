@@ -52,6 +52,7 @@ class AETaskConfig:
     suffix_length: int = 128
     context_length: int = 0
     encoder_mode: str = "suffix"
+    freeze_encoder: bool = False
 
     name: Optional[str] = None
 
@@ -75,8 +76,8 @@ class AETask(L.LightningModule):
         # Load encoder and decoder and make sure they are trainable
         self.decoder = DecoderModel(cfg.decoder).train().requires_grad_(True)
         cfg.encoder.latent_dim = self.decoder.dim
-        self.encoder = EncoderModel(cfg.encoder).train().requires_grad_(True)
-
+        self.encoder = EncoderModel(cfg.encoder)
+    
         # Setup dataset
         self.dataset = hydra.utils.instantiate(cfg.dataset)
         self.dataset: WikipediaDataset | FineWebDataset
@@ -113,7 +114,7 @@ class AETask(L.LightningModule):
             num_workers=int(os.environ["TORCH_NUM_WORKERS"]),
             encoder_mode=self.cfg.encoder_mode,
             encoder_noise=self.cfg.denoising,
-            persistent_workers=True,
+            seed=42
         )
 
     def val_dataloader(self):
@@ -128,7 +129,7 @@ class AETask(L.LightningModule):
             num_workers=int(os.environ["TORCH_NUM_WORKERS"]),
             encoder_mode=self.cfg.encoder_mode,
             encoder_noise=False,  # No noise at validation
-            persistent_workers=False
+            seed=random.randint(0,100000)
         )
 
     def configure_optimizers(self):
@@ -193,7 +194,7 @@ class AETask(L.LightningModule):
         loss = loss[info_mask_dec == InfoLabel.SUFFIX.value].mean()
         self.log(
             "train/loss",
-            loss,
+            loss.item(),
             on_epoch=False,
             on_step=True,
             sync_dist=True,
@@ -270,7 +271,7 @@ class AETask(L.LightningModule):
 
             suffix_loss = loss[info_mask_dec == InfoLabel.SUFFIX.value].mean()
             self.log(
-                f"val/loss_{latent_type}", suffix_loss, on_epoch=True, sync_dist=True
+                f"val/loss_{latent_type}", suffix_loss.item(), on_epoch=True, sync_dist=True
             )
 
         

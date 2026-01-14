@@ -357,7 +357,7 @@ def get_dataloader(
     num_workers,
     encoder_mode,
     encoder_noise,
-    persistent_workers,
+    seed=42
 ):
 
     def collate_fn(batch):
@@ -400,7 +400,7 @@ def get_dataloader(
         context_length=context_length,
         encoder_mode=encoder_mode,
         encoder_noise=encoder_noise,
-        seed=42,
+        seed=seed,
     )
 
     return DataLoader(
