@@ -73,7 +73,7 @@ def main(cfg: Optional[TrainConfig] = None, run_id: Optional[str] = None):
         wandb_id = run_id
         api = wandb.Api()
         entity = "guillaume-lajoie"
-        project = "dlc_lm_1"
+        project = "dlc_lm_2"
         run = api.run(f"{entity}/{project}/{run_id}")
         cfg = OmegaConf.merge(OmegaConf.structured(TrainConfig), run.config)
 
@@ -134,7 +134,7 @@ def main(cfg: Optional[TrainConfig] = None, run_id: Optional[str] = None):
         # Add the autoencoder config to cfg
         if cfg.task.dlc_ar.pretrained_ae_id is not None:
             run = wandb.Api().run(
-                f"guillaume-lajoie/dlc_lm_1/{cfg.task.dlc_ar.pretrained_ae_id}"
+                f"guillaume-lajoie/dlc_lm_2/{cfg.task.dlc_ar.pretrained_ae_id}"
             )
             cfg.task.ae = OmegaConf.merge(
                 OmegaConf.structured(AETaskConfig), run.config["task"]["ae"]

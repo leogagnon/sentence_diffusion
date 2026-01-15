@@ -1,4 +1,0 @@
-_target_: model.encoder.SEMHead
-L: 32
-V: 32
-temp: 1.0
