@@ -1,7 +1,0 @@
-_target_: model.encoder.HSEMHead
-L: 8
-V: 8
-D: 4
-temp: 1.0
-per_simpex_ln: False
-out_normalization: none

@@ -5,6 +5,8 @@
 #SBATCH --gpus-per-node=4
 #SBATCH --ntasks-per-node=4
 #SBATCH --account=aip-glaj
+#SBATCH --output=/logs/resumed/out/%x_%j.out
+#SBATCH --error=/logs/resumed/err/%x_%j.err
 
 export PYTHONFAULTHANDLER=1
 export TORCH_SHOW_CPP_STACKTRACES=1

@@ -10,9 +10,7 @@ from hydra.core.config_store import ConfigStore
 from lightning.pytorch.loggers import WandbLogger
 from omegaconf import MISSING, DictConfig, OmegaConf, SCMode
 from tasks.autoencoder import AETask, AETaskConfig
-from tasks.dlclm import DLCLMTask, DLCLMTaskConfig
-from tasks.dcse import DCSETask, DCSETaskConfig
-from tasks.ri import RITask, RITaskConfig
+from tasks.dlc_ar import DLCARTask, DLCARTaskConfig
 from lightning.pytorch.callbacks import EarlyStopping
 from lightning.pytorch.utilities.rank_zero import rank_zero_info, rank_zero_only
 import warnings
@@ -22,16 +20,21 @@ logging.set_verbosity_error()
 torch.set_float32_matmul_precision("high")
 torch._dynamo.config.capture_scalar_outputs = True
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
-os.environ["PYTORCH_ALLOC_CONF"]="expandable_segments:True"
-os.environ["PYTORCH_CUDA_ALLOC_CONF"]="expandable_segments:True"
+os.environ["PYTORCH_ALLOC_CONF"] = "expandable_segments:True"
+os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
+os.environ["PYTHONFAULTHANDLER"] = "1"
+os.environ["TORCH_SHOW_CPP_STACKTRACES"] = "1"
+os.environ["HYDRA_FULL_ERROR"] = "1"
+#os.environ["NCCL_DEBUG"] = "INFO"
+#os.environ["TORCH_DISTRIBUTED_DEBUG"] = "DETAIL"
+os.environ["TORCH_NCCL_ASYNC_ERROR_HANDLING"] = "1"
+os.environ["TORCH_DISABLE_ADDR2LINE"] = "1"
 
 
 @dataclass
 class TaskConfig:
     ae: Optional[AETaskConfig] = None
-    dlclm: Optional[DLCLMTaskConfig] = None
-    dcse: Optional[DCSETaskConfig] = None
-    ri: Optional[RITaskConfig] = None
+    dlc_ar: Optional[DLCARTaskConfig] = None
 
 
 @dataclass
@@ -79,7 +82,7 @@ def main(cfg: Optional[TrainConfig] = None, run_id: Optional[str] = None):
         logger = hydra.utils.instantiate(cfg.logger)
     else:
         # Setup tags for wandb
-        tags = [k for k in cfg.task.keys() if cfg.task[k] != None]
+        tags = [k for k in cfg.task.keys() if cfg.task[k] is not None]
         # Add user to logger
         if "USER" in os.environ:
             tags += [os.environ["USER"]]
@@ -93,11 +96,11 @@ def main(cfg: Optional[TrainConfig] = None, run_id: Optional[str] = None):
     # Environment variable to save/load checkpoints from everywhere
     if cfg.log_dir is None:
         cfg.log_dir = os.environ["LOG_DIR"]
-    os.environ["LATENT_CONTROL_CKPT_DIR"] = os.path.join(cfg.log_dir, "checkpoints") 
+    os.environ["LATENT_CONTROL_CKPT_DIR"] = os.path.join(cfg.log_dir, "checkpoints")
 
     if cfg.workers is None:
         cfg.workers = int(os.environ.get("SLURM_CPUS_PER_TASK", 1))
-        
+
     os.environ["TORCH_NUM_WORKERS"] = str(cfg.workers)
 
     rank_zero_info(f"Using {cfg.workers} dataloader workers per process.")
@@ -124,35 +127,21 @@ def main(cfg: Optional[TrainConfig] = None, run_id: Optional[str] = None):
         rank_zero_info("Using early stopping!")
         callbacks.append(hydra.utils.instantiate(cfg.early_stopping))
 
-    if cfg.task.dlclm != None:
-        task = DLCLMTask(cfg.task.dlclm)
-        cfg.task.dlclm = task.cfg
+    if cfg.task.dlc_ar != None:
+        task = DLCARTask(cfg.task.dlc_ar)
+        cfg.task.dlc_ar = task.cfg
 
         # Add the autoencoder config to cfg
-        if cfg.task.dlclm.pretrained_ae_id is not None:
+        if cfg.task.dlc_ar.pretrained_ae_id is not None:
             run = wandb.Api().run(
-                f"guillaume-lajoie/dlc_lm_1/{cfg.task.dlclm.pretrained_ae_id}"
+                f"guillaume-lajoie/dlc_lm_1/{cfg.task.dlc_ar.pretrained_ae_id}"
             )
             cfg.task.ae = OmegaConf.merge(
                 OmegaConf.structured(AETaskConfig), run.config["task"]["ae"]
             )
-        elif cfg.task.dlclm.pretrained_dcse_id is not None:
-            run = wandb.Api().run(
-                f"guillaume-lajoie/dlc_lm_1/{cfg.task.dlclm.pretrained_dcse_id}"
-            )
-            cfg.task.dcse = OmegaConf.merge(
-                OmegaConf.structured(DCSETaskConfig),
-                run.config["task"]["dcse"],
-            )
     elif cfg.task.ae != None:
         task = AETask(cfg.task.ae)
         cfg.task.ae = task.cfg
-    elif cfg.task.dcse != None:
-        task = DCSETask(cfg.task.dcse)
-        cfg.task.dcse = task.cfg
-    elif cfg.task.ri != None:
-        task = RITask(cfg.task.ri)
-        cfg.task.ri = task.cfg
     else:
         raise ValueError("No task specified in config!")
 
@@ -193,7 +182,8 @@ def main(cfg: Optional[TrainConfig] = None, run_id: Optional[str] = None):
         accelerator="gpu",
         enable_checkpointing=True if cfg.model_checkpoint else False,
         callbacks=callbacks,
-        val_check_interval=cfg.val_check_interval * accumulate_grad_batches,  # to account for accumulation
+        val_check_interval=cfg.val_check_interval
+        * accumulate_grad_batches,  # to account for accumulation
         gradient_clip_val=cfg.gradient_clip_val,
         num_sanity_val_steps=0,
         max_steps=cfg.max_steps,
@@ -201,7 +191,7 @@ def main(cfg: Optional[TrainConfig] = None, run_id: Optional[str] = None):
         accumulate_grad_batches=accumulate_grad_batches,
         precision=cfg.precision,
         limit_val_batches=cfg.limit_val_batches if cfg.limit_val_batches else 1.0,
-        devices= num_devices,
+        devices=num_devices,
         strategy=cfg.strategy,
         num_nodes=1,
         use_distributed_sampler=False,

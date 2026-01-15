@@ -27,13 +27,14 @@ from copy import deepcopy
 class DecoderConfig:
     name: str
     cross_attention: bool = False
+    dlc_vocab_size: int = 0
+    dlc_len: Optional[int] = None
 
 
 class DecoderModel(nn.Module):
 
     def __init__(self, cfg: DecoderConfig):
         super().__init__()
-        self.cfg = cfg
 
         # Init causal LM backbone
         if cfg.cross_attention:
@@ -69,12 +70,16 @@ class DecoderModel(nn.Module):
         self.tokenizer.think_token_id = self.tokenizer.convert_tokens_to_ids(
             "<|think|>"
         )
-        self.backbone.resize_token_embeddings(
-            len(self.tokenizer), mean_resizing=True
-        )
 
-        # Whether the model is in DLC mode or not
-        self.is_dlc = False
+        # Resize token embeddings to account for new tokens
+        # If using DLC, we add dlc_vocab_size tokens on top of that
+        self.backbone.resize_token_embeddings(
+            len(self.tokenizer) + cfg.dlc_vocab_size, mean_resizing=True
+        )
+        if cfg.dlc_vocab_size > 0:
+            assert cfg.dlc_len is not None, "If using DLC, dlc_len must be specified"
+
+        self.cfg = cfg
 
     @property
     def latent_dim(self):
@@ -101,9 +106,8 @@ class DecoderModel(nn.Module):
         self,
         max_length: int,
         z: Optional[torch.Tensor] = None,
-        prefix: Optional[List[int]] = None,
-        dlc: Optional[torch.Tensor] = None,
-        gen_dlc_len: Optional[int] = None,
+        prefix: Optional[List[List[int]]] = None,
+        dlc: Optional[List[List[int]]] = None,
         batch_size: Optional[int] = None,
         gen_kwargs: Optional[dict] = None,
         gen_kwargs_dlc: Optional[dict] = None,
@@ -113,8 +117,11 @@ class DecoderModel(nn.Module):
         Format of the generation is : prefix <|think|> DLC <|bos|> suffix
         """
         device = next(self.parameters()).device
+        
+        # Process prefix if provided
         if prefix is not None:
             assert isinstance(prefix, list), "Prefix should be a list of input_ids"
+            # NOTE: We use left padding for generation
             prefix = self.tokenizer.pad(
                 {"input_ids": prefix},
                 padding=True,
@@ -128,17 +135,17 @@ class DecoderModel(nn.Module):
             if batch_size is None:
                 batch_size = prefix_ids.shape[0]
 
-        if self.is_dlc:
+        if self.cfg.dlc_vocab_size > 0:
+            # This means we are in DLC generation mode, no z conditioning
             assert z is None
 
+            # Append <|think|> token to the prefix
             think_token = torch.full(
                 size=(batch_size, 1),
                 fill_value=self.tokenizer.think_token_id,
                 dtype=torch.long,
                 device=device,
             )
-
-            # Append <|think|> token to the prefix
             if prefix is not None:
                 input_ids = torch.cat([prefix_ids, think_token], dim=1)
                 attention_mask = torch.cat(
@@ -154,9 +161,8 @@ class DecoderModel(nn.Module):
 
             # Generate DLC if not provided
             if dlc is None:
-                assert gen_dlc_len is not None
                 gen_cfg_dlc = {
-                    "max_new_tokens": gen_dlc_len,
+                    "max_new_tokens": self.cfg.dlc_len,
                     "do_sample": True,
                     "top_p": 1.0,
                     "top_k": 50,
@@ -169,20 +175,17 @@ class DecoderModel(nn.Module):
                 if gen_kwargs_dlc is not None:
                     gen_cfg_dlc.update(gen_kwargs_dlc)
 
-                input_ids = self.backbone.generate(
+                dlc = self.backbone.generate(
                     input_ids=input_ids,
                     attention_mask=attention_mask,
                     generation_config=GenerationConfig(**gen_cfg_dlc),
-                )
+                )[:, -self.cfg.dlc_len :]
+            else:
+                dlc = torch.LongTensor(dlc).to(device=device)
+                assert dlc.shape[1] == self.cfg.dlc_len
 
-            # Add BOS token after DLC and update attention mask to account for DLC and the BOS
-            bos = torch.full(
-                (batch_size, 1),
-                self.tokenizer.bos_token_id,
-                device=device,
-                dtype=torch.long,
-            )
-            input_ids = torch.cat([input_ids, bos], dim=1)
+            # Append "DLC <|think|>"" to input_ids and update mask
+            input_ids = torch.cat([input_ids, dlc, think_token], dim=1)
             attention_mask = torch.cat(
                 [
                     attention_mask,
@@ -192,7 +195,7 @@ class DecoderModel(nn.Module):
                 ],
                 dim=1,
             )
-            # NOTE: Final input_ids are : prefix <|think|> DLC <|bos|>
+            # NOTE: Final input_ids are : prefix <|think|> DLC <|think|>
         else:
             # This means we are in normal generation mode, maybe with z conditioning
             assert (
@@ -200,6 +203,7 @@ class DecoderModel(nn.Module):
             ), "Right now, generation without DLC must be conditionned on a prefix"
             input_ids = prefix_ids
             attention_mask = prefix_attention_mask
+            # NOTE: Final input_ids are : prefix
 
         gen_cfg = {
             "max_new_tokens": max_length,
@@ -208,7 +212,6 @@ class DecoderModel(nn.Module):
             "top_k": 50,
             "num_beams": 1,
             "temperature": 1.0,
-            "return_dict_in_generate": True,
             "pad_token_id": self.tokenizer.pad_token_id,
             "eos_token_id": self.tokenizer.eos_token_id,
             "use_cache": True,
@@ -221,7 +224,7 @@ class DecoderModel(nn.Module):
             generation_config=GenerationConfig(**gen_cfg),
             encoder_hidden_states=z,
             attention_mask=attention_mask,
-        ).sequences
+        )
 
         # Remove the input_ids prefix
         output = output[:, input_ids.shape[1] :]

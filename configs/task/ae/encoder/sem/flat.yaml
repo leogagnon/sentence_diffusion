@@ -1,5 +1,4 @@
 _target_: model.encoder.SEMHead
-L: 64
-V: 128
+L: 32
+V: 32
 temp: 1.0
-hard_renorm: false

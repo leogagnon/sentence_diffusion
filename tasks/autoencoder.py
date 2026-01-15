@@ -23,14 +23,13 @@ from lightning.pytorch.utilities.rank_zero import rank_zero_info, rank_zero_only
 from tqdm import tqdm
 from mauve import compute_mauve, get_features_from_input
 from transformers import get_constant_schedule_with_warmup
-from data.datasets import DATA_SEED
 import einx
 import os
 import torch
 from torch.utils.data import Sampler
 from typing import Iterator, Optional
 from tasks.utils import *
-from data.datasets import WikipediaDataset, FineWebDataset, get_dataloader, InfoLabel
+from data import WikipediaDataset, FineWebDataset, get_dataloader, InfoLabel
 import torch.nn as nn
 
 
@@ -40,12 +39,9 @@ class AETaskConfig:
     batch_size: int
     encoder: EncoderConfig
     decoder: DecoderConfig
-    dataset: dict
-    val_size: int
+    dataset: str
     lr_warmup_steps: int = 1500
     denoising: bool = True
-    delta_ent: float = 0.0
-    reg_warmup_steps: int = 0
     sem_noise: float = 0.0
     sem_noise_warmup_steps: int = 0
     prefix_length: int = 0
@@ -72,19 +68,11 @@ class AETask(L.LightningModule):
                 )
             )
 
-        # Load encoder and decoder and make sure they are trainable
+        # Load encoder and decoder
+        assert cfg.decoder.cross_attention == True, "AE decoder must use cross-attention"
         self.decoder = DecoderModel(cfg.decoder).train().requires_grad_(True)
         cfg.encoder.latent_dim = self.decoder.latent_dim
-        self.encoder = EncoderModel(cfg.encoder)
-
-        # Setup dataset
-        self.dataset = hydra.utils.instantiate(cfg.dataset)
-        self.dataset: WikipediaDataset | FineWebDataset
-
-        # This is with a fixed seed to make sure validation set never changes
-        self.train_indices, self.val_indices = self.dataset.get_train_val_indices(
-            val_size=cfg.val_size
-        )
+        self.encoder = EncoderModel(cfg.encoder)             
 
         self.cfg = cfg
 
@@ -97,9 +85,16 @@ class AETask(L.LightningModule):
         self.decoder.compile()
 
     def setup(self, **kwargs):
-        """Setup the data"""
-        self.train_data = Subset(self.dataset, indices=self.train_indices)
-        self.val_data = Subset(self.dataset, indices=self.val_indices)
+        
+        if self.cfg.dataset == "wikipedia":
+            self.dataset = WikipediaDataset()
+        elif self.cfg.dataset == "fineweb":
+            self.dataset = FineWebDataset()
+        else:
+            raise ValueError(f"Unknown dataset {self.cfg.dataset}")   
+        
+        self.train_data = Subset(self.dataset, indices=self.dataset.train_indices)
+        self.val_data = Subset(self.dataset, indices=self.dataset.val_indices)
 
     def train_dataloader(self):
         return get_dataloader(
@@ -110,7 +105,6 @@ class AETask(L.LightningModule):
             context_length=self.cfg.context_length,
             enc_tokenizer=self.encoder.tokenizer,
             dec_tokenizer=self.decoder.tokenizer,
-            num_workers=int(os.environ["TORCH_NUM_WORKERS"]),
             encoder_mode=self.cfg.encoder_mode,
             encoder_noise=self.cfg.denoising,
             seed=random.randint(0, 100000),  # Dataset should be different if restarted
@@ -125,7 +119,6 @@ class AETask(L.LightningModule):
             enc_tokenizer=self.encoder.tokenizer,
             context_length=self.cfg.context_length,
             dec_tokenizer=self.decoder.tokenizer,
-            num_workers=int(os.environ["TORCH_NUM_WORKERS"]),
             encoder_mode=self.cfg.encoder_mode,
             encoder_noise=False,  # No noise at validation
             seed=42,  # Always the same validation set for consistency
@@ -198,17 +191,6 @@ class AETask(L.LightningModule):
             on_step=True,
             sync_dist=True,
         )
-
-        # Maybe entropy regularization
-        if self.cfg.delta_ent > 0.0:
-            ent, m_ent = sem_entropy(sem_out["probs"])
-            reg = self.cfg.delta_ent * (ent - m_ent)
-            delta = cosine_warmup_get_value(
-                self.global_step,
-                max_value=1.0,
-                warmup_steps=self.cfg.reg_warmup_steps,
-            )
-            loss = loss + delta * reg
 
         return loss
 
@@ -299,3 +281,4 @@ class AETask(L.LightningModule):
                     prefix_str[i], true_suffix_str[i], generated_suffix_str[i]
                 )
             wandb.log({"val/samples": table})
+            del table

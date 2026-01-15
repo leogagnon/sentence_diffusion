@@ -4,9 +4,7 @@ defaults:
   - logger: base
   - hydra: base
   - task/ae: null
-  - task/dcse: null
   - task/dlclm: null
-  - task/ri: null
   - model_checkpoint: null
   - early_stopping: null
   - hydra/sweeper/params : null
@@ -15,12 +13,12 @@ defaults:
 seed: 1337
 log_dir: null
 max_steps: 15000
-effective_batch_size: 1024
-val_check_interval: 128
+effective_batch_size: 32 #1024
+val_check_interval: 1 #128
 sweep_id: null
 precision: bf16-mixed
 limit_val_batches: 4
-strategy: ddp #auto
+strategy: ddp 
 compile: false
 gradient_clip_val: 1.0
 num_devices: null

@@ -39,8 +39,6 @@ class SEMHeadConfig:
     V: int
     temp: float
     input_dim: Optional[int] = None
-    hard_renorm: bool = False
-
 
 class SEMHead(nn.Module):
     def __init__(self, cfg: Optional[SEMHeadConfig] = None, **kwargs):
@@ -58,6 +56,10 @@ class SEMHead(nn.Module):
     @property
     def out_dim(self):
         return self.cfg.L * self.cfg.V
+    
+    @property
+    def dlc_len(self):
+        return self.cfg.L
 
     def forward(
         self,
@@ -65,39 +67,39 @@ class SEMHead(nn.Module):
         return_dlc=False,
         return_count=False,
         noise: float = 0.0,
-        temp: Optional[float] = 0.0,
+        temp: Optional[float] = None,
     ):
 
-        temp = self.cfg.temp if temp is None else temp
         # Proj in DLC space and normalize
         x = self.proj_in(x)
         x = einx.rearrange("b (l v) -> b l v", x, l=self.cfg.L, v=self.cfg.V)
         x = self.norm(x)
 
         # Compute Softmax (with temperature)
+        temp = self.cfg.temp if temp is None else temp
         probs = torch.softmax(x / temp, dim=-1)
 
-        # Compute output (add noise, renorm, project out)
+        # Maybe add noise
         out = probs
         if noise > 0.0:
             out = out + noise * torch.randn_like(out)
 
-        # Figure out what to return
+        # Return stuff
         out_dict = {"probs": probs}
-
         if return_dlc:
             out_dict.update({"dlc": self._encode(probs)})
-
         if return_count:
             out_dict.update({"usage_count": self._usage_count(probs)})
 
         return out_dict
 
     def _encode(self, probs):
+        # DLC = argmax of each simplex
         dlc = probs.argmax(-1)
         return dlc
 
     def _usage_count(self, probs):
+        # Count how many times each DLC word was used
         counts = torch.stack(
             [torch.sum(probs.argmax(-1) == i, dim=0) for i in range(self.cfg.V)], dim=-1
         )
@@ -274,7 +276,7 @@ class EncoderConfig:
     latent_length: int
     latent_dim: Optional[int] = None
     sem: Optional[dict] = None
-    train: bool = True
+    train_backbone: bool = True
 
 
 class EncoderModel(nn.Module):
@@ -337,7 +339,7 @@ class EncoderModel(nn.Module):
             )
 
         # Maybe freeze backbone
-        self.transformer = self.transformer.train(cfg.train).requires_grad_(cfg.train)
+        self.transformer = self.transformer.train(cfg.train_backbone).requires_grad_(cfg.train_backbone)
 
         # Initialize SEM/output projection
         if cfg.sem is None:
@@ -354,8 +356,9 @@ class EncoderModel(nn.Module):
 
     def train(self, mode=True):
         super().train(mode)
-        if not self.cfg.train:
+        if not self.cfg.train_backbone:
             self.transformer.train(False)
+        return self
 
     def compile(self):
         # Only compile the SEM

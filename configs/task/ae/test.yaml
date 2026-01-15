@@ -1,27 +1,23 @@
-batch_size: 2
-lr: 1e-4
-lr_warmup_steps: 1000
-val_size: 16384
-delta_ent: 0.0
-reg_warmup_steps: 10000
+batch_size: 1
+lr: 2e-4
+lr_warmup_steps: 500
 sem_noise: 0.3
-sem_noise_warmup_steps: 10000
-prefix_length: 16
-suffix_length: 64
-#context_length: 96
-denoising: false
+sem_noise_warmup_steps: 0
+prefix_length: 32
+suffix_length: 128
+context_length: 0
+dataset: fineweb
+denoising: true
 encoder_mode: suffix
 
 encoder:
   model_name: SONAR
-  latent_length: 16
+  train_backbone: True
+  latent_length: 32
 
 decoder:
-  name: gpt2-large # 1.5B params
+  name: gpt2 # 1.5B params
   cross_attention: True
-
-dataset:
-  _target_: data.datasets.FineWebDataset
 
 name: base_ae
 
