@@ -1,0 +1,18 @@
+lr: 1e-4
+lr_warmup_steps: 500
+batch_size: 1
+decoder:
+  name: gpt2 # 1.5B params
+  cross_attention: false
+
+dataset: fineweb
+eval_gen_ppl: true
+pretrained_ae_id: a2s2u4tm
+DLC_dropout: 0.5
+
+prefix_length: null
+suffix_length: null
+context_length: null
+encoder_mode: null 
+
+name: test_dlc

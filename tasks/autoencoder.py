@@ -34,6 +34,15 @@ import torch.nn as nn
 
 
 @dataclass
+class SEMResetConfig:
+    enabled: bool = False
+    threshold: float = 1e-4
+    start: int = 5000
+    end: int = 15000
+    interval: int = 1000
+
+
+@dataclass
 class AETaskConfig:
     lr: float
     batch_size: int
@@ -48,6 +57,7 @@ class AETaskConfig:
     suffix_length: int = 128
     context_length: int = 0
     encoder_mode: str = "suffix"
+    sem_reset_config: SEMResetConfig = SEMResetConfig()
 
     name: Optional[str] = None
 
@@ -69,10 +79,14 @@ class AETask(L.LightningModule):
             )
 
         # Load encoder and decoder
-        assert cfg.decoder.cross_attention == True, "AE decoder must use cross-attention"
+        assert (
+            cfg.decoder.cross_attention == True
+        ), "AE decoder must use cross-attention"
         self.decoder = DecoderModel(cfg.decoder).train().requires_grad_(True)
         cfg.encoder.latent_dim = self.decoder.latent_dim
-        self.encoder = EncoderModel(cfg.encoder)             
+        self.encoder = EncoderModel(cfg.encoder)
+
+        self.sem_usage_ema = SEMUsageTracker()
 
         self.cfg = cfg
 
@@ -85,14 +99,14 @@ class AETask(L.LightningModule):
         self.decoder.compile()
 
     def setup(self, **kwargs):
-        
+
         if self.cfg.dataset == "wikipedia":
             self.dataset = WikipediaDataset()
         elif self.cfg.dataset == "fineweb":
             self.dataset = FineWebDataset()
         else:
-            raise ValueError(f"Unknown dataset {self.cfg.dataset}")   
-        
+            raise ValueError(f"Unknown dataset {self.cfg.dataset}")
+
         self.train_data = Subset(self.dataset, indices=self.dataset.train_indices)
         self.val_data = Subset(self.dataset, indices=self.dataset.val_indices)
 
@@ -161,6 +175,7 @@ class AETask(L.LightningModule):
         z, sem_out = self.encoder(
             batch["input_ids_enc"],
             batch["attention_mask_enc"],
+            return_count=True,
             noise=cosine_warmup_get_value(
                 step=self.global_step,
                 max_value=self.cfg.sem_noise,
@@ -192,6 +207,8 @@ class AETask(L.LightningModule):
             sync_dist=True,
         )
 
+        self.sem_usage_ema.update(sem_out["usage_count"], batch_size=z.shape[0])
+
         return loss
 
     @torch.no_grad()
@@ -200,7 +217,6 @@ class AETask(L.LightningModule):
         soft_z, sem_out = self.encoder(
             batch["input_ids_enc"],
             batch["attention_mask_enc"],
-            return_count=True,
             noise=0.0,
         )
 
@@ -218,21 +234,12 @@ class AETask(L.LightningModule):
                 m_ent.item(),
                 on_epoch=True,
                 sync_dist=True,
-            )
-        if "usage_count" in sem_out.keys():
-            self.log(
-                "val/dead_words",
-                torch.sum(sem_out["usage_count"] == 0).item()
-                / len(sem_out["usage_count"]),
-                on_epoch=True,
-                sync_dist=True,
-            )
+            )            
 
         # Decode with hard latents
         hard_z, _ = self.encoder(
             batch["input_ids_enc"],
             batch["attention_mask_enc"],
-            return_count=True,
             noise=0.0,
             temp=1e-4,
         )
@@ -260,6 +267,25 @@ class AETask(L.LightningModule):
             )
 
         if (batch_idx == 0) and (rank_zero_only.rank == 0):
+            
+            # Log % of dead words/simplices
+            is_dead = self.sem_usage_ema.usage < self.cfg.sem_reset_config.threshold
+            dead_words_ratio = torch.sum(is_dead).item() / is_dead.numel()
+            dead_simplices = torch.sum((~is_dead).sum(1) == 1).item() 
+
+            self.log(
+                "val/dead_words_ratio",
+                dead_words_ratio,
+                on_epoch=True,
+                sync_dist=True,
+            )
+            self.log(
+                "val/dead_simplices",
+                dead_simplices,
+                on_epoch=True,
+                sync_dist=True,
+            )
+
 
             # Reconstruct a few (5) samples from hard SEMs
             prefix_str = batch["prefix_str"][:5]
@@ -282,3 +308,40 @@ class AETask(L.LightningModule):
                 )
             wandb.log({"val/samples": table})
             del table
+
+    def on_before_zero_grad(self, optimizer):
+        if (
+            self.cfg.sem_reset_config.enabled
+            and (self.global_step >= self.cfg.sem_reset_config.start)
+            and (self.global_step <= self.cfg.sem_reset_config.end)
+            and (self.global_step % self.cfg.sem_reset_config.interval == 0)
+        ):
+            self.trainer.strategy.barrier()
+
+            with torch.no_grad():
+                if rank_zero_only.rank == 0:
+
+                    # Compute new weights (with dead vertices reset)
+                    bound = 1 / (self.encoder.sem.cfg.input_dim**0.5)
+                    is_dead = self.sem_usage_ema.usage < self.cfg.sem_reset_config.threshold
+                    dead_simplices = (~is_dead).sum(1) == 1
+                    reset_mask = einx.rearrange('L -> (L V)', dead_simplices, V=32)
+
+                    self.encoder.sem.proj_in.weight[reset_mask] = (
+                        self.encoder.sem.proj_in.weight[reset_mask].uniform_(
+                            -bound, bound
+                        )
+                    )
+
+                    self.encoder.out_proj.weight[:, reset_mask] = (
+                        self.encoder.out_proj.weight[:, reset_mask].uniform_(
+                            -bound, bound
+                        )
+                    )
+
+                for param in self.encoder.sem.parameters():
+                    self.trainer.strategy.broadcast(param.data, src=0)
+
+            rank_zero_info(
+                f"SEM Reset applied at step {self.global_step} to {torch.sum(dead_simplices).item()} dead simplices!"
+            )

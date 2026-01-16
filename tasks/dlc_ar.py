@@ -24,7 +24,10 @@ from data import WikipediaDataset, FineWebDataset, InfoLabel
 from tqdm import tqdm
 from mauve import compute_mauve, get_features_from_input
 import einx
-from transformers import get_constant_schedule_with_warmup, get_cosine_schedule_with_warmup
+from transformers import (
+    get_constant_schedule_with_warmup,
+    get_cosine_schedule_with_warmup,
+)
 from enum import Enum
 from tasks.utils import *
 from typing import Tuple, List, ClassVar
@@ -40,6 +43,7 @@ class DLCARTaskConfig:
     decoder: DecoderConfig
     dataset: str
     eval_gen_ppl: bool
+    DLC_dropout: float
 
     pretrained_ae_id: Optional[str] = None
 
@@ -109,7 +113,7 @@ class DLCARTask(L.LightningModule):
             # We keep it on CPU until needed to save GPU memory
             self.ppl_model = [
                 AutoModelForCausalLM.from_pretrained(
-                    "meta-llama/Llama-3.2-3B",torch_dtype=torch.bfloat16
+                    "meta-llama/Llama-3.2-3B", torch_dtype=torch.bfloat16
                 ).cpu()
             ]
             self.ppl_tok = AutoTokenizer.from_pretrained("meta-llama/Llama-3.2-3B")
@@ -210,7 +214,7 @@ class DLCARTask(L.LightningModule):
         )
 
     @torch.inference_mode()
-    def fill_DLCs_in_batch(self, batch):
+    def _fill_DLCs_in_batch(self, batch):
         """
         Use the encoder to compute DLCs for the batch and fill them in the input_ids_dec placeholders
         """
@@ -220,16 +224,56 @@ class DLCARTask(L.LightningModule):
             return_dlc=True,
         )[1]
         dlc_ids = sem_out["dlc"] + len(self.decoder.tokenizer)
-        batch["input_ids_dec"][batch["info_mask_dec"] == InfoLabel.DLC.value] = dlc_ids.view(-1)
+        batch["input_ids_dec"][batch["info_mask_dec"] == InfoLabel.DLC.value] = (
+            dlc_ids.view(-1)
+        )
         return batch
+    
+    def _create_dlc_dropout_mask(self, batch) -> torch.Tensor:
+        """
+        Create attention mask with probabilistic blocking of DLC to suffix attention
+        according to DLC_dropout probability."""
+        bs, seq_len = batch["input_ids_dec"].shape
+        device = batch["input_ids_dec"].device
+        # base causal mask (prevent attending to future tokens)
+        causal = torch.triu(
+            torch.ones((1, 1, seq_len, seq_len), device=device, dtype=torch.bool),
+            diagonal=1,
+        )
+        attention_mask = torch.zeros(
+            (bs, 1, seq_len, seq_len), dtype=torch.float32, device=device
+        )
+        attention_mask = attention_mask.masked_fill(causal, float("-inf"))
+
+        # probabilistic block: suffix queries cannot attend DLC keys (per batch) with prob DLC_dropout
+        DLC_mask = (
+            (batch["info_mask_dec"] == InfoLabel.DLC.value)
+            + (batch["info_mask_dec"] == InfoLabel.SPECIAL.value)
+        ).view(
+            bs, 1, 1, seq_len
+        )  # keys
+        suffix_mask = (batch["info_mask_dec"] == InfoLabel.SUFFIX.value).view(
+            bs, 1, seq_len, 1
+        )  # queries
+        drop = (torch.rand(bs, device=device) < self.cfg.DLC_dropout).view(
+            bs, 1, 1, 1
+        )
+        block = drop * suffix_mask * DLC_mask  # (bs, 1, seq_len, seq_len)
+        attention_mask = attention_mask.masked_fill(block, float("-inf"))
+
+        return attention_mask
 
     def training_step(self, batch, batch_idx):
 
         # Fill DLCs in the batch
         if self.encoder is not None:
-            batch = self.fill_DLCs_in_batch(batch)
+            batch = self._fill_DLCs_in_batch(batch)
 
-        logits = self.decoder(input_ids=batch["input_ids_dec"])
+        attention_mask = self._create_dlc_dropout_mask(batch) if self.cfg.DLC_dropout > 0 else None
+
+        logits = self.decoder(
+            input_ids=batch["input_ids_dec"], attention_mask=attention_mask
+        )
 
         # Compute loss
         info_mask_dec = batch["info_mask_dec"][:, 1:]
@@ -280,7 +324,7 @@ class DLCARTask(L.LightningModule):
 
         # Fill DLCs in the batch
         if self.encoder is not None:
-            batch = self.fill_DLCs_in_batch(batch)
+            batch = self._fill_DLCs_in_batch(batch)
 
         logits = self.decoder(input_ids=batch["input_ids_dec"])
 

@@ -103,7 +103,6 @@ class SEMHead(nn.Module):
         counts = torch.stack(
             [torch.sum(probs.argmax(-1) == i, dim=0) for i in range(self.cfg.V)], dim=-1
         )
-        counts = einx.rearrange("L V -> (L V)", counts)
         return counts
 
 
