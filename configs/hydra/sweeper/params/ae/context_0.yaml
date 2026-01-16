@@ -7,9 +7,9 @@ task.ae.prefix_length: 16
 task.ae.suffix_length: 64
 task.ae.context_length: 112
 task.ae.encoder_mode: context
-
+task.ae.encoder.sem.L: 16, 512
 task.ae.denoising: false
-task.ae.encoder.train_backbone: true, false
+task.ae.encoder.train_backbone: true
 
 max_steps: 20000
 
