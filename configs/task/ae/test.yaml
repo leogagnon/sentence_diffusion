@@ -3,23 +3,25 @@ lr: 2e-4
 lr_warmup_steps: 500
 sem_noise: 0.3
 sem_noise_warmup_steps: 0
-prefix_length: 32
-suffix_length: 128
-context_length: 0
+prefix_length: 16
+suffix_length: 64
+context_length: 112
 dataset: fineweb
 denoising: true
-encoder_mode: suffix
+encoder_mode: context
 
 encoder:
   model_name: SONAR
-  train_backbone: True
-  latent_length: 32
+  train_backbone: false
+  latent_length: 16
+  sem: 
+    _target_: model.encoder.SEMHead
+    L: 512
+    V: 32
+    temp: 1.0
 
 decoder:
   name: gpt2 # 1.5B params
   cross_attention: True
 
 name: base_ae
-
-defaults:
-  - encoder/sem: flat

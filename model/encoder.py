@@ -68,7 +68,7 @@ class SEMHead(nn.Module):
         return_count=False,
         noise: float = 0.0,
         temp: Optional[float] = None,
-    ):
+    ) -> dict:
 
         # Proj in DLC space and normalize
         x = self.proj_in(x)
@@ -80,12 +80,12 @@ class SEMHead(nn.Module):
         probs = torch.softmax(x / temp, dim=-1)
 
         # Maybe add noise
-        out = probs
+        z = einx.rearrange("b l v -> b (l v)", probs)
         if noise > 0.0:
-            out = out + noise * torch.randn_like(out)
+            z = z + noise * torch.randn_like(z)
 
         # Return stuff
-        out_dict = {"probs": probs}
+        out_dict = {"z": z, "probs": probs}
         if return_dlc:
             out_dict.update({"dlc": self._encode(probs)})
         if return_count:
@@ -395,7 +395,7 @@ class EncoderModel(nn.Module):
                 noise=noise,
                 temp=temp,
             )
-            z = self.out_proj(sem_out["probs"].view(sem_out["probs"].shape[0], -1))
+            z = self.out_proj(sem_out.pop("z"))
         
         # Reshape latent
         z = einx.rearrange("b (l d) -> b l d", z, l=self.cfg.latent_length, d=self.cfg.latent_dim)
