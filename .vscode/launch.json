@@ -13,10 +13,10 @@
             "justMyCode": false,
             "args": [
                 //"--wandb_id=vjf7103x"
-                "task/ae=test",
-                //"num_devices=1",
-                //"val_check_interval=1",
-                //"workers=1",
+                "task/dlc_ar=base",
+                "num_devices=1",
+                "val_check_interval=1",
+                "workers=4",
                 //"task.ae.encoder_mode=context",
                 //"task.ae.context_length=224"
             ],

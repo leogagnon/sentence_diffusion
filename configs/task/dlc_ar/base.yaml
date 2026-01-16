@@ -1,13 +1,13 @@
-lr: 2e-4
+lr: 1e-4
 lr_warmup_steps: 500
-batch_size: 1
+batch_size: 32
 decoder:
-  name: gpt2 # 1.5B params
+  name: gpt2-medium # 1.5B params
   cross_attention: false
 
 dataset: fineweb
 eval_gen_ppl: true
-pretrained_ae_id: vtu0tyt3
+pretrained_ae_id: zy3prl4p
 
 prefix_length: null
 suffix_length: null

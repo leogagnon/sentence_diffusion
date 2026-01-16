@@ -17,7 +17,7 @@ import warnings
 from transformers.utils import logging
 
 logging.set_verbosity_error()
-torch.set_float32_matmul_precision("high")
+torch.set_float32_matmul_precision("medium")
 torch._dynamo.config.capture_scalar_outputs = True
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
 os.environ["PYTORCH_ALLOC_CONF"] = "expandable_segments:True"
@@ -29,6 +29,7 @@ os.environ["HYDRA_FULL_ERROR"] = "1"
 #os.environ["TORCH_DISTRIBUTED_DEBUG"] = "DETAIL"
 os.environ["TORCH_NCCL_ASYNC_ERROR_HANDLING"] = "1"
 os.environ["TORCH_DISABLE_ADDR2LINE"] = "1"
+os.environ["TORCH_FR_BUFFER_SIZE"] = "1024"
 
 
 @dataclass

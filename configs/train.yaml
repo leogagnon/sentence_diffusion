@@ -4,7 +4,7 @@ defaults:
   - logger: base
   - hydra: base
   - task/ae: null
-  - task/dlclm: null
+  - task/dlc_ar: null
   - model_checkpoint: null
   - early_stopping: null
   - hydra/sweeper/params : null

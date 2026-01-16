@@ -9,7 +9,7 @@ task.ae.encoder_mode: suffix
 
 task.ae.encoder.sem.L: 16, 512
 task.ae.denoising: true, false
-task.ae.encoder.train_backbone: true
+task.ae.encoder.train_backbone: false
 
 max_steps: 20000
 

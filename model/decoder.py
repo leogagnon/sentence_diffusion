@@ -49,10 +49,10 @@ class DecoderModel(nn.Module):
 
         # Use better attention implementation
         try:
-            self.backbone.set_attn_implementation("sdpa")
+            self.backbone.set_attn_implementation("flash_attention_2")
         except:
             rank_zero_info(
-                "Tried to use SDPA attention in decoder, but it is not available."
+                "Tried to use Flash Attention 2 in decoder, but it failed."
             )
 
         # Disable dropout in the backbone
@@ -170,7 +170,7 @@ class DecoderModel(nn.Module):
                     "temperature": 1.0,
                     "pad_token_id": self.tokenizer.pad_token_id,
                     "eos_token_id": self.tokenizer.bos_token_id,
-                    "use_cache": False,
+                    "use_cache": True,
                 }
                 if gen_kwargs_dlc is not None:
                     gen_cfg_dlc.update(gen_kwargs_dlc)

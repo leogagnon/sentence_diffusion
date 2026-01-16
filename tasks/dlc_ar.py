@@ -209,6 +209,7 @@ class DLCARTask(L.LightningModule):
             num_dlc_ph=self.encoder.sem.dlc_len if self.encoder is not None else 0,
         )
 
+    @torch.inference_mode()
     def fill_DLCs_in_batch(self, batch):
         """
         Use the encoder to compute DLCs for the batch and fill them in the input_ids_dec placeholders
@@ -219,7 +220,7 @@ class DLCARTask(L.LightningModule):
             return_dlc=True,
         )[1]
         dlc_ids = sem_out["dlc"] + len(self.decoder.tokenizer)
-        batch["input_ids_dec"][batch["info_mask_dec"] == InfoLabel.DLC.value] = dlc_ids
+        batch["input_ids_dec"][batch["info_mask_dec"] == InfoLabel.DLC.value] = dlc_ids.view(-1)
         return batch
 
     def training_step(self, batch, batch_idx):
@@ -393,7 +394,7 @@ class DLCARTask(L.LightningModule):
                     batch["input_ids_dec"][i][
                         (batch["info_mask_dec"][i] == InfoLabel.DLC.value)
                     ].tolist()
-                    for i in range(len(batch["input_ids_dec"]))
+                    for i in range(5)
                 ]
                 dlc = None if len(dlc[0]) == 0 else dlc
                 gen_suffix_str = self.decoder.tokenizer.batch_decode(
