@@ -273,28 +273,28 @@ class AETask(L.LightningModule):
             is_dead = self.sem_usage_ema.usage < self.cfg.sem_reset_config.threshold
             dead_words_ratio = torch.sum(is_dead).item() / is_dead.numel()
             dead_simplices = torch.sum((~is_dead).sum(1) == 1).item()
-            dead_words_per_simplex = torch.sum(is_dead).sum(1).mean().item()
+            dead_words_per_simplex = torch.sum(is_dead, dim=1).float().mean().item()
 
             self.log(
                 "val/dead_words_ratio",
                 dead_words_ratio,
                 on_epoch=True,
                 sync_dist=False,
-                rank_zero_only=True
+                rank_zero_only=True,
             )
             self.log(
                 "val/dead_simplices",
                 dead_simplices,
                 on_epoch=True,
                 sync_dist=False,
-                rank_zero_only=True
+                rank_zero_only=True,
             )
             self.log(
                 "val/dead_words_per_simplex",
                 dead_words_per_simplex,
                 on_epoch=True,
                 sync_dist=False,
-                rank_zero_only=True
+                rank_zero_only=True,
             )
 
             # Reconstruct a few (5) samples from hard SEMs
@@ -312,7 +312,7 @@ class AETask(L.LightningModule):
 
             # Log to wandb
             table = wandb.Table(columns=["Prefix", "True Suffix", "Generated Suffix"])
-            for i in range(5):
+            for i in range(1):
                 table.add_data(
                     prefix_str[i], true_suffix_str[i], generated_suffix_str[i]
                 )
@@ -330,8 +330,13 @@ class AETask(L.LightningModule):
             self.trainer.strategy.barrier()
 
             with torch.no_grad():
+                reset_mask = torch.empty(
+                    size=(self.encoder.sem.cfg.L * self.encoder.sem.cfg.V,),
+                    dtype=torch.bool,
+                    device=self.device,
+                )
                 if rank_zero_only.rank == 0:
-                    
+
                     # Compute what to reset
                     is_dead = (
                         self.sem_usage_ema.usage < self.cfg.sem_reset_config.threshold
@@ -342,9 +347,7 @@ class AETask(L.LightningModule):
                             "L -> (L V)", dead_simplices, V=self.encoder.sem.cfg.V
                         )
                     else:
-                        reset_mask = einx.rearrange(
-                            "L V -> (L V)", is_dead
-                        )
+                        reset_mask = einx.rearrange("L V -> (L V)", is_dead)
 
                     # Reset input/output proj associated with whatever's dead
                     if reset_mask.sum() > 0:
@@ -369,3 +372,15 @@ class AETask(L.LightningModule):
 
                 for param in self.encoder.out_proj.parameters():
                     self.trainer.strategy.broadcast(param.data, src=0)
+
+                self.trainer.strategy.broadcast(reset_mask, src=0)
+
+                opt = self.optimizers()
+                if isinstance(opt, list):
+                    opt = opt[0]
+                state = opt.state
+                for k in ("exp_avg", "exp_avg_sq"):
+                    if k in state[self.encoder.sem.proj_in.weight]:
+                        state[self.encoder.sem.proj_in.weight][k][reset_mask] = 0
+                    if k in state[self.encoder.out_proj.weight]:
+                        state[self.encoder.out_proj.weight][k][:, reset_mask] = 0

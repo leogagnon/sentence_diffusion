@@ -1,5 +1,5 @@
-batch_size: 1
-lr: 2e-4
+batch_size: 2
+lr: 3e-4
 lr_warmup_steps: 500
 sem_noise: 0.3
 sem_noise_warmup_steps: 0
@@ -9,19 +9,27 @@ context_length: 0
 dataset: fineweb
 denoising: true
 encoder_mode: suffix
+sem_reset_config:
+  enabled: true
+  simplex_mode: false
+  threshold: 1e-3
+  start: 2
+  end: 15000
+  interval: 2
 
 encoder:
   model_name: SONAR
-  train_backbone: false
+  train_backbone: True
   latent_length: 16
   sem: 
     _target_: model.encoder.SEMHead
-    L: 512
+    L: 128
     V: 32
     temp: 1.0
 
 decoder:
   name: gpt2 # 1.5B params
   cross_attention: True
+  attn_implem: sdpa
 
 name: base_ae

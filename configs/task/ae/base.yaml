@@ -10,7 +10,7 @@ dataset: fineweb
 denoising: true
 encoder_mode: suffix
 sem_reset_config:
-  enabled: false
+  enabled: true
   simplex_mode: false
   threshold: 1e-3
   start: 5000
