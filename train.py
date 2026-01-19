@@ -1,10 +1,12 @@
+import torch
+torch._dynamo.config.capture_scalar_outputs = True
+
 import argparse
 import os
 from dataclasses import dataclass, fields
 from typing import Any, List, Optional
 import hydra
 import lightning as L
-import torch
 import wandb
 from hydra.core.config_store import ConfigStore
 from lightning.pytorch.loggers import WandbLogger
@@ -18,7 +20,6 @@ from transformers.utils import logging
 
 logging.set_verbosity_error()
 torch.set_float32_matmul_precision("medium")
-torch._dynamo.config.capture_scalar_outputs = True
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
 os.environ["PYTORCH_ALLOC_CONF"] = "expandable_segments:True"
 os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"

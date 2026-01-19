@@ -8,12 +8,11 @@ decoder:
 
 dataset: fineweb
 eval_gen_ppl: true
-pretrained_ae_id: 4szrb171
 DLC_dropout: 0.0
 
-prefix_length: null
-suffix_length: null
+prefix_length: 16
+suffix_length: 64
 context_length: null
 encoder_mode: null 
 
-name: base_dlc
+name: dlc_baseline

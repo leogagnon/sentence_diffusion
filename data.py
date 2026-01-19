@@ -23,6 +23,7 @@ import ftfy
 import math
 import random
 
+
 class InfoLabel(Enum):
     SUFFIX = 0
     DLC = 1
@@ -39,6 +40,7 @@ class WikipediaDatasetConfig:
 class WikipediaDataset(Dataset):
     VAL_SIZE = 8192
     SEED = 42
+
     def __init__(self, cfg: Optional[WikipediaDatasetConfig] = None, **kwargs):
         if cfg == None:
             cfg = WikipediaDatasetConfig(**kwargs)
@@ -53,8 +55,8 @@ class WikipediaDataset(Dataset):
             len(self.dataset),
             generator=torch.Generator().manual_seed(self.SEED),
         )
-        train_indices = indices[:-self.VAL_SIZE]
-        val_indices = indices[-self.VAL_SIZE:]
+        train_indices = indices[: -self.VAL_SIZE]
+        val_indices = indices[-self.VAL_SIZE :]
 
         return train_indices, val_indices
 
@@ -82,8 +84,8 @@ class FineWebDataset(Dataset):
             len(self.dataset),
             generator=torch.Generator().manual_seed(self.SEED),
         )
-        self.train_indices = indices[:-self.VAL_SIZE]
-        self.val_indices = indices[-self.VAL_SIZE:]
+        self.train_indices = indices[: -self.VAL_SIZE]
+        self.val_indices = indices[-self.VAL_SIZE :]
 
     def __len__(self):
         return len(self.dataset)
@@ -374,6 +376,7 @@ class PrefixSuffixIterable(IterableDataset):
                         continue
                 else:
                     yield out_dict
+                    continue
 
                 # Potentially apply span masking to encoder input
                 if self.encoder_noise:
@@ -389,7 +392,7 @@ def get_dataloader(
     prefix_length: int,
     suffix_length: int,
     context_length: int,
-    enc_tokenizer: PreTrainedTokenizerFast,
+    enc_tokenizer: Optional[PreTrainedTokenizerFast],
     dec_tokenizer: PreTrainedTokenizerFast,
     encoder_mode: str,
     encoder_noise: bool,
@@ -413,21 +416,28 @@ def get_dataloader(
             batch["info_mask_dec"], batch_first=True, padding_value=InfoLabel.PAD.value
         )
 
-        batch_enc = enc_tokenizer.pad(
-            {"input_ids": batch["input_ids_enc"]},
-            padding=True,
-            return_tensors="pt",
-            return_attention_mask=True,
-        )
-
-        return {
+        out = {
             "input_ids_dec": input_ids_dec,
             "info_mask_dec": info_mask_dec,
-            "input_ids_enc": batch_enc["input_ids"],
-            "attention_mask_enc": batch_enc["attention_mask"],
             "prefix_str": batch["prefix_str"],
             "suffix_str": batch["suffix_str"],
         }
+
+        if "input_ids_enc" in batch.keys():
+            batch_enc = enc_tokenizer.pad(
+                {"input_ids": batch["input_ids_enc"]},
+                padding=True,
+                return_tensors="pt",
+                return_attention_mask=True,
+            )
+
+            out.update(
+                {
+                    "input_ids_enc": batch_enc["input_ids"],
+                    "attention_mask_enc": batch_enc["attention_mask"],
+                }
+            )
+        return out
 
     iterable = PrefixSuffixIterable(
         dataset,

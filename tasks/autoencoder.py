@@ -31,11 +31,13 @@ from typing import Iterator, Optional
 from tasks.utils import *
 from data import WikipediaDataset, FineWebDataset, get_dataloader, InfoLabel
 import torch.nn as nn
+from dataclasses import dataclass, field
 
 
 @dataclass
 class SEMResetConfig:
     enabled: bool = False
+    simplex_mode: bool = False
     threshold: float = 1e-4
     start: int = 5000
     end: int = 15000
@@ -57,7 +59,7 @@ class AETaskConfig:
     suffix_length: int = 128
     context_length: int = 0
     encoder_mode: str = "suffix"
-    sem_reset_config: SEMResetConfig = SEMResetConfig()
+    sem_reset_config: SEMResetConfig = field(default_factory=SEMResetConfig)
 
     name: Optional[str] = None
 
@@ -234,7 +236,7 @@ class AETask(L.LightningModule):
                 m_ent.item(),
                 on_epoch=True,
                 sync_dist=True,
-            )            
+            )
 
         # Decode with hard latents
         hard_z, _ = self.encoder(
@@ -265,27 +267,32 @@ class AETask(L.LightningModule):
                 on_epoch=True,
                 sync_dist=True,
             )
-
         if (batch_idx == 0) and (rank_zero_only.rank == 0):
-            
+
             # Log % of dead words/simplices
             is_dead = self.sem_usage_ema.usage < self.cfg.sem_reset_config.threshold
             dead_words_ratio = torch.sum(is_dead).item() / is_dead.numel()
-            dead_simplices = torch.sum((~is_dead).sum(1) == 1).item() 
+            dead_simplices = torch.sum((~is_dead).sum(1) == 1).item()
+            dead_words_per_simplex = torch.sum(is_dead).sum(1).mean().item()
 
             self.log(
                 "val/dead_words_ratio",
                 dead_words_ratio,
                 on_epoch=True,
-                sync_dist=True,
+                sync_dist=False,
             )
             self.log(
                 "val/dead_simplices",
                 dead_simplices,
                 on_epoch=True,
-                sync_dist=True,
+                sync_dist=False,
             )
-
+            self.log(
+                "val/dead_words_per_simplex",
+                dead_words_per_simplex,
+                on_epoch=True,
+                sync_dist=False,
+            )
 
             # Reconstruct a few (5) samples from hard SEMs
             prefix_str = batch["prefix_str"][:5]
@@ -316,32 +323,46 @@ class AETask(L.LightningModule):
             and (self.global_step <= self.cfg.sem_reset_config.end)
             and (self.global_step % self.cfg.sem_reset_config.interval == 0)
         ):
+            rank_zero_info("Entered reset")
             self.trainer.strategy.barrier()
 
             with torch.no_grad():
                 if rank_zero_only.rank == 0:
-
-                    # Compute new weights (with dead vertices reset)
-                    bound = 1 / (self.encoder.sem.cfg.input_dim**0.5)
-                    is_dead = self.sem_usage_ema.usage < self.cfg.sem_reset_config.threshold
-                    dead_simplices = (~is_dead).sum(1) == 1
-                    reset_mask = einx.rearrange('L -> (L V)', dead_simplices, V=32)
-
-                    self.encoder.sem.proj_in.weight[reset_mask] = (
-                        self.encoder.sem.proj_in.weight[reset_mask].uniform_(
-                            -bound, bound
-                        )
+                    
+                    # Compute what to reset
+                    is_dead = (
+                        self.sem_usage_ema.usage < self.cfg.sem_reset_config.threshold
                     )
-
-                    self.encoder.out_proj.weight[:, reset_mask] = (
-                        self.encoder.out_proj.weight[:, reset_mask].uniform_(
-                            -bound, bound
+                    if self.cfg.sem_reset_config.simplex_mode:
+                        dead_simplices = (~is_dead).sum(1) == 1
+                        reset_mask = einx.rearrange(
+                            "L -> (L V)", dead_simplices, V=self.encoder.sem.cfg.V
                         )
-                    )
+                    else:
+                        reset_mask = einx.rearrange(
+                            "L V -> (L V)", is_dead
+                        )
 
-                for param in self.encoder.sem.parameters():
+                    # Reset input/output proj associated with whatever's dead
+                    if reset_mask.sum() > 0:
+                        bound = 1 / (self.encoder.sem.cfg.input_dim**0.5)
+                        self.encoder.sem.proj_in.weight[reset_mask] = (
+                            self.encoder.sem.proj_in.weight[reset_mask].uniform_(
+                                -bound, bound
+                            )
+                        )
+
+                        self.encoder.out_proj.weight[:, reset_mask] = (
+                            self.encoder.out_proj.weight[:, reset_mask].uniform_(
+                                -bound, bound
+                            )
+                        )
+                        rank_zero_info(
+                            f"SEM Reset applied at step {self.global_step} to {torch.sum(reset_mask).item()} dead SEM words!"
+                        )
+
+                for param in self.encoder.sem.proj_in.parameters():
                     self.trainer.strategy.broadcast(param.data, src=0)
 
-            rank_zero_info(
-                f"SEM Reset applied at step {self.global_step} to {torch.sum(dead_simplices).item()} dead simplices!"
-            )
+                for param in self.encoder.out_proj.parameters():
+                    self.trainer.strategy.broadcast(param.data, src=0)

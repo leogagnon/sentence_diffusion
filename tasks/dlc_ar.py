@@ -190,7 +190,7 @@ class DLCARTask(L.LightningModule):
             prefix_length=self.cfg.prefix_length,
             suffix_length=self.cfg.suffix_length,
             context_length=self.cfg.context_length,
-            enc_tokenizer=self.encoder.tokenizer,
+            enc_tokenizer=self.encoder.tokenizer if self.encoder is not None else None,
             dec_tokenizer=self.decoder.tokenizer,
             encoder_mode=self.cfg.encoder_mode,
             encoder_noise=False,  # No noise during DLC-LM finetuning
@@ -204,7 +204,7 @@ class DLCARTask(L.LightningModule):
             batch_size=self.cfg.batch_size,
             prefix_length=self.cfg.prefix_length,
             suffix_length=self.cfg.suffix_length,
-            enc_tokenizer=self.encoder.tokenizer,
+            enc_tokenizer=self.encoder.tokenizer if self.encoder is not None else None,
             context_length=self.cfg.context_length,
             dec_tokenizer=self.decoder.tokenizer,
             encoder_mode=self.cfg.encoder_mode,

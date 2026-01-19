@@ -29,6 +29,7 @@ class DecoderConfig:
     cross_attention: bool = False
     dlc_vocab_size: int = 0
     dlc_len: Optional[int] = None
+    attn_implem: str = 'sdpa'
 
 
 class DecoderModel(nn.Module):
@@ -49,10 +50,10 @@ class DecoderModel(nn.Module):
 
         # Use better attention implementation
         try:
-            self.backbone.set_attn_implementation("flash_attention_2")
+            self.backbone.set_attn_implementation(cfg.attn_implem)
         except:
             rank_zero_info(
-                "Tried to use Flash Attention 2 in decoder, but it failed."
+                f"Tried to use {cfg.attn_implem} in decoder, but it failed."
             )
 
         # Disable dropout in the backbone

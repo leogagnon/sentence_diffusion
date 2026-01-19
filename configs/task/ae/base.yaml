@@ -9,6 +9,13 @@ context_length: 0
 dataset: fineweb
 denoising: true
 encoder_mode: suffix
+sem_reset_config:
+  enabled: false
+  simplex_mode: false
+  threshold: 1e-3
+  start: 5000
+  end: 15000
+  interval: 100
 
 encoder:
   model_name: SONAR
@@ -23,5 +30,6 @@ encoder:
 decoder:
   name: gpt2-large # 1.5B params
   cross_attention: True
+  attn_implem: sdpa
 
 name: base_ae
