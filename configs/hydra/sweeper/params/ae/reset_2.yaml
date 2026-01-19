@@ -7,13 +7,13 @@ task.ae.prefix_length: 16
 task.ae.suffix_length: 64
 task.ae.encoder_mode: suffix
 
-task.ae.encoder.sem.L: 256
+task.ae.encoder.sem.L: 512
+task.ae.encoder.sem.V: 8
 task.ae.denoising: true
 task.ae.encoder.train_backbone: true
 task.ae.sem_reset_config.enabled: true
-task.ae.sem_reset_config.start: 1000 #, 5000
-
-task.val_check_interval: 10
+task.ae.sem_reset_config.start: 3000
+task.ae.sem_reset_config.simplex_mode: true, false
 
 max_steps: 20000
 

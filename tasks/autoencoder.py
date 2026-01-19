@@ -280,18 +280,21 @@ class AETask(L.LightningModule):
                 dead_words_ratio,
                 on_epoch=True,
                 sync_dist=False,
+                rank_zero_only=True
             )
             self.log(
                 "val/dead_simplices",
                 dead_simplices,
                 on_epoch=True,
                 sync_dist=False,
+                rank_zero_only=True
             )
             self.log(
                 "val/dead_words_per_simplex",
                 dead_words_per_simplex,
                 on_epoch=True,
                 sync_dist=False,
+                rank_zero_only=True
             )
 
             # Reconstruct a few (5) samples from hard SEMs
