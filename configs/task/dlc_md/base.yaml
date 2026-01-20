@@ -1,0 +1,20 @@
+lr: 3e-4
+lr_warmup_steps: 500
+batch_size: 8
+dit:
+  name: kuleshov-group/mdlm-owt
+  sampling_steps: 256
+  sampling_mode: mdlm  # mdlm, remdm-cap, remdm-loop  
+  nucleus_p: 0.9  
+  sampling_eps: 1e-3 
+
+dataset: fineweb
+eval_gen_ppl: true
+pretrained_ae_id: t6iwcr8a
+
+prefix_length: 16
+suffix_length: 64
+context_length: null
+encoder_mode: null 
+
+name: dlc_md

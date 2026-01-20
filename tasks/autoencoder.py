@@ -327,16 +327,10 @@ class AETask(L.LightningModule):
             and (self.global_step % self.cfg.sem_reset_config.interval == 0)
         ):
             rank_zero_info("Entered reset")
-            self.trainer.strategy.barrier()
 
             with torch.no_grad():
-                reset_mask = torch.empty(
-                    size=(self.encoder.sem.cfg.L * self.encoder.sem.cfg.V,),
-                    dtype=torch.bool,
-                    device=self.device,
-                )
-                if rank_zero_only.rank == 0:
 
+                if rank_zero_only.rank == 0:
                     # Compute what to reset
                     is_dead = (
                         self.sem_usage_ema.usage < self.cfg.sem_reset_config.threshold
@@ -349,38 +343,52 @@ class AETask(L.LightningModule):
                     else:
                         reset_mask = einx.rearrange("L V -> (L V)", is_dead)
 
-                    # Reset input/output proj associated with whatever's dead
-                    if reset_mask.sum() > 0:
-                        bound = 1 / (self.encoder.sem.cfg.input_dim**0.5)
-                        self.encoder.sem.proj_in.weight[reset_mask] = (
-                            self.encoder.sem.proj_in.weight[reset_mask].uniform_(
-                                -bound, bound
-                            )
-                        )
-
-                        self.encoder.out_proj.weight[:, reset_mask] = (
-                            self.encoder.out_proj.weight[:, reset_mask].uniform_(
-                                -bound, bound
-                            )
-                        )
-                        rank_zero_info(
-                            f"SEM Reset applied at step {self.global_step} to {torch.sum(reset_mask).item()} dead SEM words!"
-                        )
-
-                for param in self.encoder.sem.proj_in.parameters():
-                    self.trainer.strategy.broadcast(param.data, src=0)
-
-                for param in self.encoder.out_proj.parameters():
-                    self.trainer.strategy.broadcast(param.data, src=0)
+                    reset_mask = reset_mask.to('cpu')
+                    seed = torch.randint(0, 100000000, size=(1,), device='cpu')
+                else:
+                    # Empty placeholder for DDP broadcasting
+                    reset_mask = torch.empty(
+                        size=(self.encoder.sem.cfg.L * self.encoder.sem.cfg.V,),
+                        dtype=torch.bool,
+                        device='cpu',
+                    )
+                    seed = torch.empty(size=(1,), dtype=torch.long, device='cpu')
 
                 self.trainer.strategy.broadcast(reset_mask, src=0)
+                self.trainer.strategy.broadcast(seed, src=0)
 
-                opt = self.optimizers()
-                if isinstance(opt, list):
-                    opt = opt[0]
-                state = opt.state
-                for k in ("exp_avg", "exp_avg_sq"):
-                    if k in state[self.encoder.sem.proj_in.weight]:
-                        state[self.encoder.sem.proj_in.weight][k][reset_mask] = 0
-                    if k in state[self.encoder.out_proj.weight]:
-                        state[self.encoder.out_proj.weight][k][:, reset_mask] = 0
+                # If there are things to reset
+                if reset_mask.sum() > 0:
+
+                    # Reset appropriate rows of SEM input/output proj
+                    # using the broadcasted seed
+                    bound = 1 / (self.encoder.sem.cfg.input_dim**0.5)
+                    g = torch.Generator(device=self.device)
+                    g.manual_seed(seed.item())
+                    self.encoder.sem.proj_in.weight[reset_mask] = (
+                        self.encoder.sem.proj_in.weight[reset_mask].uniform_(
+                            -bound, bound, generator=g
+                        )
+                    )
+                    self.encoder.out_proj.weight[:, reset_mask] = (
+                        self.encoder.out_proj.weight[:, reset_mask].uniform_(
+                            -bound, bound, generator=g
+                        )
+                    )
+
+                    # Update the optimizer state
+                    state = optimizer.state
+                    proj_in_w = self.encoder.sem.proj_in.weight
+                    out_proj_w = self.encoder.out_proj.weight
+                    if proj_in_w in state:
+                        for k in ("exp_avg", "exp_avg_sq"):
+                            if k in state[proj_in_w]:
+                                state[proj_in_w][k][reset_mask] = 0
+                    if out_proj_w in state:
+                        for k in ("exp_avg", "exp_avg_sq"):
+                            if k in state[out_proj_w]:
+                                state[out_proj_w][k][:, reset_mask] = 0
+
+                rank_zero_info(
+                    f"SEM Reset applied at step {self.global_step} to {torch.sum(reset_mask).item()} dead SEM words!"
+                )

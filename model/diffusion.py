@@ -28,6 +28,7 @@ from transformers import (
 from copy import deepcopy
 import abc
 import numpy as np
+from tqdm import tqdm
 
 # Flags required to enable jit fusion kernels
 torch._C._jit_set_profiling_mode(False)
@@ -89,7 +90,7 @@ class LogLinearNoise(Noise):
         return t
 
 
-def _sample_categorical(categorical_probs):
+def sample_categorical(categorical_probs):
     gumbel_norm = 1e-10 - (torch.rand_like(categorical_probs) + 1e-10).log()
     return (categorical_probs / gumbel_norm).argmax(dim=-1)
 
@@ -101,16 +102,20 @@ class DiTConfig:
     dlc_len: Optional[int] = None
     sigma_min: float = 1e-4
     sigma_max: float = 20.0
-    sampling_steps: int = 128
+    sampling_steps: int = 1024
     noise_removal: bool = True
-    num_sample_batches: int = 2
-    num_sample_log: int = 2
     max_seq_len: int = 1024
-    time_conditioning: bool = True
+    time_conditioning: bool = False
     change_of_variables: bool = False
     importance_sampling: bool = False
-    antithetic_sampling: bool = False
+    antithetic_sampling: bool = True
+    sampling_mode: str = "mdlm"  # "mdlm", "remdm-cap", "remdm-loop"
+    eta: Optional[float] = None  # Will be set depending on sampling_mode if None
+    alpha_on: float = 0.9  
+    t_on: float = 0.55 
+    t_off: float = 0.05  
     T: int = 0  # Number of discrete timesteps. If 0, continuous time is used.
+    nucleus_p: float = 0.9  # Nucleus sampling probability
     sampling_eps: float = 0.001  # Minimum time for
 
 
@@ -124,30 +129,60 @@ class DiTModel(nn.Module):
         )
 
         # Init tokenizer, make it put BOS and EOS tokens around inputs, and add PAD and THINK tokens.
-        self.tokenizer = GPT2TokenizerFast.from_pretrained(cfg.name)
+        self.tokenizer = GPT2TokenizerFast.from_pretrained("gpt2")
 
         # Add PAD and THINK tokens, resize embeddings
         self.tokenizer.add_special_tokens(
-            {"pad_token": "<|pad|>", "additional_special_tokens": ["<|think|>"]}
+            {
+                "additional_special_tokens": ["<|mask|>", "<|think|>"],
+                "pad_token": "<|pad|>",
+            }
         )
         self.tokenizer.think_token_id = self.tokenizer.convert_tokens_to_ids(
             "<|think|>"
         )
-        self.mask_index = self.tokenizer.mask_token_id
-
-        self.noise = LogLinearNoise()
+        self.tokenizer.mask_token_id = self.tokenizer.convert_tokens_to_ids("<|mask|>")
+        assert self.tokenizer.mask_token_id == 50257
 
         # Resize token embeddings to account for new tokens
         # If using DLC, we add dlc_vocab_size tokens on top of that
-        self.backbone.resize_token_embeddings(
-            len(self.tokenizer) + cfg.dlc_vocab_size, mean_resizing=True
+        new_embeddings = torch.empty(
+            (cfg.dlc_vocab_size + 3, self.backbone.config.hidden_dim),
+            dtype=torch.float32,
         )
+        new_embeddings = torch.nn.init.kaiming_uniform_(new_embeddings, a=math.sqrt(5))
+
+        self.backbone.backbone.vocab_embed.embedding.data = torch.cat(
+            [
+                self.backbone.backbone.vocab_embed.embedding.data,
+                new_embeddings,
+            ],
+            dim=0,
+        )
+        old_out_layer: nn.Linear = self.backbone.backbone.output_layer.linear
+        new_out_layer = nn.Linear(
+            in_features=old_out_layer.in_features,
+            out_features=old_out_layer.out_features + 2 + cfg.dlc_vocab_size,
+            bias=True,
+        )
+        new_out_layer.weight.data.zero_()
+        new_out_layer.bias.data.zero_()
+        with torch.no_grad():
+            new_out_layer.weight[:old_out_layer.out_features].copy_(old_out_layer.weight)
+            new_out_layer.bias[:old_out_layer.out_features].copy_(old_out_layer.bias)
+        self.backbone.backbone.output_layer.linear = new_out_layer
+
         if cfg.dlc_vocab_size > 0:
             assert cfg.dlc_len is not None, "If using DLC, dlc_len must be specified"
 
+        self.noise = LogLinearNoise()
+
+        if cfg.eta is None and cfg.sampling_mode.startswith("remdm"):
+            cfg.eta = 0.008 if cfg.sampling_mode == "remdm-cap" else 0.05
+
         self.cfg = cfg
 
-    def q_xt(self, x, move_chance):
+    def q_xt(self, x, move_chance, cond_mask=None):
         """Computes the noisy sample xt.
 
         Args:
@@ -156,10 +191,15 @@ class DiTModel(nn.Module):
         move_chance: float torch.Tensor with shape (batch_size, 1).
         """
         move_indices = torch.rand(*x.shape, device=x.device) < move_chance
-        xt = torch.where(move_indices, self.mask_index, x)
+
+        if cond_mask is not None:
+            # Do not move the conditioned tokens
+            move_indices = move_indices & (~cond_mask)
+
+        xt = torch.where(move_indices, self.tokenizer.mask_token_id, x)
         return xt
 
-    def _ddpm_caching_update(self, x, t, dt, p_x0=None):
+    def ddpm_caching_update(self, x, t, dt, p_x0=None):
         sigma_t, _ = self.noise(t)
         if t.ndim > 1:
             t = t.squeeze(-1)
@@ -170,83 +210,74 @@ class DiTModel(nn.Module):
         assert move_chance_t.ndim == 3, move_chance_t.shape
         if p_x0 is None:
             p_x0 = self.forward(x, sigma_t).exp()
+            if self.cfg.nucleus_p < 1:
+                sorted_probs, sorted_indices = torch.sort(p_x0, descending=True, dim=-1)
+                cumulative_probs = torch.cumsum(sorted_probs, dim=-1)
+                top_p_mask = cumulative_probs <= self.cfg.nucleus_p
+                top_p_mask[..., 0] = True
+                nucleus_probs = sorted_probs * top_p_mask
+                nucleus_probs /= nucleus_probs.sum(dim=-1, keepdim=True)
+                p_x0 = torch.zeros_like(p_x0).scatter_(-1, sorted_indices, nucleus_probs)
 
         assert move_chance_t.ndim == p_x0.ndim
-        q_xs = p_x0 * (move_chance_t - move_chance_s)
-        q_xs[:, :, self.mask_index] = move_chance_s[:, :, 0]
-        _x = _sample_categorical(q_xs)
 
-        copy_flag = (x != self.mask_index).to(x.dtype)
-        return p_x0, copy_flag * x + (1 - copy_flag) * _x
+        if self.cfg.sampling_mode == "mdlm":
+            q_xs = p_x0 * (move_chance_t - move_chance_s)
+            q_xs[:, :, self.tokenizer.mask_token_id] = move_chance_s[:, :, 0]
+            _x = sample_categorical(q_xs)
+            copy_flag = (x != self.tokenizer.mask_token_id).to(x.dtype)
+            xs = copy_flag * x + (1 - copy_flag) * _x
+        elif self.cfg.sampling_mode == "remdm-cap":
+            alpha_t = (1 - move_chance_t)[0].item()
+            alpha_s = (1 - move_chance_s)[0].item()
+            if alpha_t > 0:
+                sigma = min(self.cfg.eta, (1 - alpha_s) / alpha_t)
+            else:
+                sigma = self.cfg.eta
+            q_xs = p_x0 * (1 - sigma)
+            q_xs[..., self.tokenizer.mask_token_id] = sigma
+            q_xs_2 = p_x0 * ((alpha_s - (1 - sigma) * alpha_t) / (1 - alpha_t))
+            q_xs_2[..., self.tokenizer.mask_token_id] = (1 - alpha_s - sigma * alpha_t) / (1 - alpha_t)
+            copy_flag = (x != self.tokenizer.mask_token_id).to(torch.bool)
+            q_xs = torch.where(copy_flag.unsqueeze(-1), q_xs, q_xs_2)
+            xs = sample_categorical(q_xs)
+        elif self.cfg.sampling_mode == "remdm-loop":
+            time = t[0].item()
+            # compute alpha_t and alpha_s
+            if time > self.cfg.t_on:
+                move_chance_t = (1 - (1 - t) * self.cfg.alpha_on / (1 - self.cfg.t_on))[:, None, None]
+                move_chance_s = (1 - (1 - t + dt) * self.cfg.alpha_on / (1 - self.cfg.t_on))[:, None, None]
+            elif time <= self.cfg.t_off:
+                move_chance_t = (t * (1 - self.cfg.alpha_on) / self.cfg.t_off)[:, None, None]
+                move_chance_s = ((t - dt) * (1 - self.cfg.alpha_on) / self.cfg.t_off)[:, None, None]
+            else:
+                move_chance_t, move_chance_s = None, None
+            # use MDLM
+            if time > self.cfg.t_on or time <= self.cfg.t_off:
+                q_xs = p_x0 * (move_chance_t - move_chance_s)
+                q_xs[:, :, self.tokenizer.mask_token_id] = move_chance_s[:, :, 0]
+                _x = sample_categorical(q_xs)
+                copy_flag = (x != self.tokenizer.mask_token_id).to(x.dtype)
+                xs = copy_flag * x + (1 - copy_flag) * _x
+            else: # use ReMDM
+                sigma = self.cfg.eta
+                q_xs = p_x0 * (1 - sigma)
+                q_xs[..., self.tokenizer.mask_token_id] = sigma
+                q_xs_2 = p_x0 * ((self.cfg.alpha_on - (1 - sigma) * self.cfg.alpha_on) / (1 - self.cfg.alpha_on))
+                q_xs_2[..., self.tokenizer.mask_token_id] = (1 - self.cfg.alpha_on - self.cfg.alpha_on * sigma) / (1 - self.cfg.alpha_on)
+                copy_flag = (x != self.tokenizer.mask_token_id).to(torch.bool)
+                q_xs = torch.where(copy_flag.unsqueeze(-1), q_xs, q_xs_2)
+                xs = sample_categorical(q_xs)
 
-    def _sample_prior(self, *batch_dims):
-        return self.mask_index * torch.ones(*batch_dims, dtype=torch.int64)
-
-    @torch.no_grad()
-    def _sample(self, num_steps=None, eps=1e-5, batch_size=1):
-        """Generate samples from the model."""
-
-        # Lightning auto-casting is not working in this method for some reason
-        if num_steps is None:
-            num_steps = self.cfg.sampling_steps
-        x = self._sample_prior(batch_size, self.cfg.max_seq_len).to(self.device)
-
-        timesteps = torch.linspace(1, eps, num_steps + 1, device=self.device)
-        dt = (1 - eps) / num_steps
-        p_x0_cache = None
-
-        for i in range(num_steps):
-            t = timesteps[i] * torch.ones(x.shape[0], 1, device=self.device)
-            p_x0_cache, x_next = self._ddpm_caching_update(x, t, dt, p_x0=p_x0_cache)
-            if not torch.allclose(x_next, x) or self.cfg.time_conditioning:
-                # Disable caching
-                p_x0_cache = None
-                x = x_next
-
-        if self.cfg.noise_removal:
-            t = timesteps[-1] * torch.ones(x.shape[0], 1, device=self.device)
-            unet_conditioning = self.noise(t)[0]
-            x = self.forward(x, unet_conditioning).argmax(dim=-1)
-        return x
-
-    def _maybe_sub_sample(self, x0, attention_mask):
-        seqlen = x0.shape[1]
-        if seqlen > self.cfg.max_seq_len:
-            assert seqlen == 2 * self.cfg.max_seq_len
-            # cropping is needed for text8-crop dataset
-            # try the same starting point for now
-            start = np.random.choice(self.cfg.max_seq_len)
-            end = start + self.cfg.max_seq_len
-            input_tokens = x0[:, start:end]
-            output_tokens = x0[:, start + 1 : end + 1]
-            new_attention_mask = attention_mask[:, start:end]
-
-            # Helps with validation PPL, since the val
-            # examples will all start and end with BOS/EOS
-            input_tokens[:, 0] = self.tokenizer.bos_token_id
-            output_tokens[:, -1] = self.tokenizer.eos_token_id
+        if torch.allclose(xs, x):
+            p_x0_cache = p_x0
         else:
-            input_tokens = x0
-            output_tokens = None
-            new_attention_mask = attention_mask
-        return input_tokens, output_tokens, new_attention_mask
+            p_x0_cache = None
 
-    def compute_loss(self, x0, attention_mask):
-        (input_tokens, output_tokens, attention_mask) = self._maybe_sub_sample(
-            x0, attention_mask
-        )
+        return p_x0_cache, xs
 
-        loss = self._forward_pass_diffusion(input_tokens)
 
-        nlls = loss * attention_mask
-        count = attention_mask.sum()
-
-        batch_nll = nlls.sum()
-        token_nll = batch_nll / count
-
-        return token_nll, nlls, attention_mask
-
-    def _sample_t(self, n, device):
+    def sample_t(self, n, device):
         _eps_t = torch.rand(n, device=device)
         if self.cfg.antithetic_sampling:
             offset = torch.arange(n, device=device) / n
@@ -257,8 +288,8 @@ class DiTModel(nn.Module):
             return self.noise.importance_sampling_transformation(t)
         return t
 
-    def _forward_pass_diffusion(self, x0):
-        t = self._sample_t(x0.shape[0], x0.device)
+    def forward_pass_diffusion(self, x0, cond_mask=None):
+        t = self.sample_t(x0.shape[0], x0.device)
         if self.cfg.T > 0:
             t = (t * self.cfg.T).to(torch.int)
             t = t / self.cfg.T
@@ -276,8 +307,10 @@ class DiTModel(nn.Module):
             unet_conditioning = sigma[:, None]
             move_chance = 1 - torch.exp(-sigma[:, None])
 
-        xt = self.q_xt(x0, move_chance)
+        xt = self.q_xt(x0, move_chance, cond_mask=cond_mask)
         model_output = self.forward(xt, unet_conditioning)
+        if torch.isnan(model_output).any():
+            print("model_output contains NaNs", model_output)
 
         if self.cfg.T > 0:
             return self._d3pm_loss(model_output=model_output, xt=xt, x0=x0, t=t)
@@ -303,7 +336,7 @@ class DiTModel(nn.Module):
         alpha_s = 1 - (t - dt) + torch.zeros_like(xt)
 
         log_x_theta_at_x0 = torch.gather(model_output, -1, x0[:, :, None]).squeeze(-1)
-        log_x_theta_at_m = model_output[:, :, self.mask_index]
+        log_x_theta_at_m = model_output[:, :, self.tokenizer.mask_token_id]
         x_theta_at_m = log_x_theta_at_m.exp()
 
         term_1_coef = dt / t
@@ -318,7 +351,7 @@ class DiTModel(nn.Module):
             term_2_log_nr - term_2_log_dr
         )
 
-        L_vb = L_vb_masked * (xt == self.mask_index)
+        L_vb = L_vb_masked * (xt == self.tokenizer.mask_token_id)
 
         return self.cfg.T * L_vb
 
@@ -326,9 +359,9 @@ class DiTModel(nn.Module):
     def latent_dim(self):
         return self.backbone.get_input_embeddings().weight.shape[1]
 
-    def _subs_parameterization(self, logits, xt):
+    def subs_parameterization(self, logits, xt):
         # log prob at the mask index = - infinity
-        logits[:, :, self.mask_index] += self.neg_infinity
+        logits[:, :, self.tokenizer.mask_token_id] += -1000000.0
 
         # Normalize the logits such that x.exp() is
         # a probability distribution over vocab_size.
@@ -338,27 +371,68 @@ class DiTModel(nn.Module):
         # For the logits of the unmasked tokens, set all values
         # to -infinity except for the indices corresponding to
         # the unmasked tokens.
-        unmasked_indices = xt != self.mask_index
-        logits[unmasked_indices] = self.neg_infinity
+        unmasked_indices = xt != self.tokenizer.mask_token_id
+        logits[unmasked_indices] = -1000000.0
         logits[unmasked_indices, xt[unmasked_indices]] = 0
         return logits
 
-    def _process_sigma(self, sigma):
-        assert sigma is not None, "Sigma must be provided"
-        if sigma.ndim > 1:
-            sigma = sigma.squeeze(-1)
-        if not self.time_conditioning:
-            sigma = torch.zeros_like(sigma)
-            assert sigma.ndim == 1, sigma.shape
-            return sigma
-
     def compile(self):
-        # Only compile GPT2 backbone
         self.backbone.compile()
 
     def forward(self, x, sigma):
-        sigma = self._process_sigma(sigma)
-        with torch.amp.autocast(dtype=torch.float32):
+        if sigma.ndim > 1:
+            sigma = sigma.squeeze(-1)
+        if not self.cfg.time_conditioning:
+            sigma = torch.zeros_like(sigma)
+
+        with torch.amp.autocast(device_type="cuda", dtype=torch.float32):
             logits = self.backbone(x, sigma)
 
-        return self._subs_parameterization(logits=logits, xt=x)
+        return self.subs_parameterization(logits=logits, xt=x)
+
+    @torch.no_grad()
+    def sample(self, batch_size=None, num_steps=None, eps=1e-5, prior=None):
+        """Generate samples from the model."""
+        device = next(self.parameters()).device
+
+        # Lightning auto-casting is not working in this method for some reason
+        if num_steps is None:
+            num_steps = self.cfg.sampling_steps
+
+        if prior is None:
+            assert batch_size is not None
+            x = self.tokenizer.mask_token_id * torch.ones(
+                size=(batch_size, self.cfg.max_seq_len),
+                dtype=torch.int64,
+                device=device,
+            )
+        else:
+            assert batch_size is None
+            x = prior
+
+        timesteps = torch.linspace(1, eps, num_steps + 1, device=device)
+        dt = (1 - eps) / num_steps
+        p_x0_cache = None
+
+        for i in tqdm(range(num_steps)):
+            t = timesteps[i] * torch.ones(x.shape[0], 1, device=device)
+            p_x0_cache, x_next = self.ddpm_caching_update(x, t, dt, p_x0=p_x0_cache)
+            x = x_next
+
+        if self.cfg.noise_removal:
+            t = timesteps[-1] * torch.ones(x.shape[0], 1, device=device)
+            unet_conditioning = self.noise(t)[0]
+            x = self.forward(x, unet_conditioning).argmax(dim=-1)
+        return x
+
+    def compute_loss(self, x0, attention_mask, cond_mask=None):
+
+        loss = self.forward_pass_diffusion(x0, cond_mask=cond_mask)
+
+        nlls = loss * attention_mask
+        count = attention_mask.sum()
+
+        batch_nll = nlls.sum()
+        token_nll = batch_nll / count
+
+        return token_nll, nlls, attention_mask

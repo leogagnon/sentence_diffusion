@@ -13,6 +13,7 @@ from lightning.pytorch.loggers import WandbLogger
 from omegaconf import MISSING, DictConfig, OmegaConf, SCMode
 from tasks.autoencoder import AETask, AETaskConfig
 from tasks.dlc_ar import DLCARTask, DLCARTaskConfig
+from tasks.dlc_md import DLCMDTask, DLCMDTaskConfig
 from lightning.pytorch.callbacks import EarlyStopping
 from lightning.pytorch.utilities.rank_zero import rank_zero_info, rank_zero_only
 import warnings
@@ -37,6 +38,7 @@ os.environ["TORCH_FR_BUFFER_SIZE"] = "1024"
 class TaskConfig:
     ae: Optional[AETaskConfig] = None
     dlc_ar: Optional[DLCARTaskConfig] = None
+    dlc_md: Optional[DLCMDTaskConfig] = None
 
 
 @dataclass
@@ -137,6 +139,18 @@ def main(cfg: Optional[TrainConfig] = None, run_id: Optional[str] = None):
         if cfg.task.dlc_ar.pretrained_ae_id is not None:
             run = wandb.Api().run(
                 f"guillaume-lajoie/dlc_lm_2/{cfg.task.dlc_ar.pretrained_ae_id}"
+            )
+            cfg.task.ae = OmegaConf.merge(
+                OmegaConf.structured(AETaskConfig), run.config["task"]["ae"]
+            )
+    elif cfg.task.dlc_md != None:
+        task = DLCMDTask(cfg.task.dlc_md)
+        cfg.task.dlc_md = task.cfg
+
+        # Add the autoencoder config to cfg
+        if cfg.task.dlc_md.pretrained_ae_id is not None:
+            run = wandb.Api().run(
+                f"guillaume-lajoie/dlc_lm_2/{cfg.task.dlc_md.pretrained_ae_id}"
             )
             cfg.task.ae = OmegaConf.merge(
                 OmegaConf.structured(AETaskConfig), run.config["task"]["ae"]
