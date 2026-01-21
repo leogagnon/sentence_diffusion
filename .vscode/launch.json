@@ -13,10 +13,10 @@
             "justMyCode": false,
             "args": [
                 //"--wandb_id=vjf7103x"
-                "task/ae=base",
+                "task/dlc_md=base",
                 "num_devices=1",
                 //"model_checkpoint=test",
-                "val_check_interval=10",
+                "val_check_interval=20",
                 //"workers=4",
                 "effective_batch_size=6",
                 //"compile=true"

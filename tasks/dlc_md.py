@@ -44,7 +44,7 @@ class DLCMDTaskConfig:
     dit: DiTConfig
     dataset: str
     eval_gen_ppl: bool
-    gen_batch_size: Optional[int] = None
+    val_batch_size: Optional[int] = None
 
     pretrained_ae_id: Optional[str] = None
 
@@ -201,7 +201,11 @@ class DLCMDTask(L.LightningModule):
     def val_dataloader(self):
         return get_dataloader(
             self.val_data,
-            batch_size=self.cfg.batch_size,
+            batch_size=(
+                self.cfg.val_batch_size
+                if self.cfg.val_batch_size is not None
+                else self.cfg.batch_size
+            ),
             prefix_length=self.cfg.prefix_length,
             suffix_length=self.cfg.suffix_length,
             enc_tokenizer=self.encoder.tokenizer if self.encoder is not None else None,
@@ -264,6 +268,38 @@ class DLCMDTask(L.LightningModule):
         self.log("train/loss", loss, on_step=True, on_epoch=False, sync_dist=True)
         return loss
 
+    def eval_ppl(self, prefix_str, suffix_str, device):
+        ppl_batch = self.ppl_tok.batch_encode_plus(
+            [p + c for p, c in zip(prefix_str, suffix_str)],
+            padding=True,
+            return_tensors="pt",
+            return_offsets_mapping=True,
+            add_special_tokens=False,
+            return_attention_mask=False,
+        ).to(device)
+
+        # Compute token index where continuation starts in the new indices
+        split_idx = split_index_from_offsets(
+            ppl_batch["offset_mapping"],
+            [len(p) for p in prefix_str],
+        )
+
+        # Compute conditional perplexity of suffix given prefix
+        # I.e. ignore prompt and padding tokens in loss (set to -100)
+        # Move generative PPL eval model to GPU
+        ppl_model = self.ppl_model[0].to(device)
+
+        labels = ppl_batch["input_ids"].clone()
+        labels[labels == self.ppl_tok.pad_token_id] = -100
+        for i in range(len(labels)):
+            labels[i, : split_idx[i]] = -100
+        ppl = torch.exp(ppl_model(input_ids=ppl_batch["input_ids"], labels=labels).loss)
+
+        del ppl_model
+        torch.cuda.empty_cache()
+
+        return ppl.item()
+
     def validation_step(self, batch, batch_idx):
 
         # Fill DLCs in the batch
@@ -273,79 +309,83 @@ class DLCMDTask(L.LightningModule):
         if batch_idx == 0:
             # Evaluate generative perplexity
             if self.cfg.eval_gen_ppl:
-                gen_batch_size = self.cfg.gen_batch_size if self.cfg.gen_batch_size is not None else self.cfg.batch_size
 
-
-                # Generate conditional on only the prefix
-                prior = batch["input_ids_dec"][:gen_batch_size].clone()
+                # p(DLC, suffix | prefix)
+                prior = batch["input_ids_dec"].clone()
                 prior[
-                    (batch["info_mask_dec"][:gen_batch_size]== InfoLabel.SUFFIX.value)
-                    + (batch["info_mask_dec"][:gen_batch_size] == InfoLabel.DLC.value)
+                    (batch["info_mask_dec"] == InfoLabel.SUFFIX.value)
+                    + (batch["info_mask_dec"] == InfoLabel.DLC.value)
                 ] = self.dit.tokenizer.mask_token_id
-                gen_suffix_str = self.dit.tokenizer.batch_decode(
-                    self.dit.sample(prior=prior)[:, -self.cfg.suffix_length :]
+                gen_suffix_str_joint = self.dit.tokenizer.batch_decode(
+                    self.dit.sample(
+                        prior=prior,
+                    )[:, -self.cfg.suffix_length :]
                 )
-
-                # Tokenize the full sequences with perplexity model
-                ppl_batch = self.ppl_tok.batch_encode_plus(
-                    [p + c for p, c in zip(batch["prefix_str"][:gen_batch_size], gen_suffix_str)],
-                    padding=True,
-                    return_tensors="pt",
-                    return_offsets_mapping=True,
-                    add_special_tokens=False,
-                    return_attention_mask=False,
-                ).to(device=batch["input_ids_dec"].device)
-
-                # Compute token index where continuation starts in the new indices
-                split_idx = split_index_from_offsets(
-                    ppl_batch["offset_mapping"],
-                    [len(p) for p in batch["prefix_str"][:gen_batch_size]],
-                )
-
-                # Compute conditional perplexity of suffix given prefix
-                # I.e. ignore prompt and padding tokens in loss (set to -100)
-                # Move generative PPL eval model to GPU
-                ppl_model = self.ppl_model[0]
-                ppl_model.to(batch["input_ids_dec"].device)
-
-                labels = ppl_batch["input_ids"][:gen_batch_size].clone()
-                labels[labels == self.ppl_tok.pad_token_id] = -100
-                for i in range(len(labels)):
-                    labels[i, : split_idx[i]] = -100
-                ppl = torch.exp(
-                    ppl_model(input_ids=ppl_batch["input_ids"][:gen_batch_size], labels=labels).loss
+                ppl_joint = self.eval_ppl(
+                    batch["prefix_str"],
+                    gen_suffix_str_joint,
+                    device=batch["input_ids_dec"].device,
                 )
                 self.log(
                     "val/gen_ppl",
-                    ppl.item(),
+                    ppl_joint,
                     on_epoch=True,
                     on_step=False,
                     sync_dist=True,
                 )
 
-                # Move ppl model back to CPU
-                ppl_model.cpu()
-                torch.cuda.empty_cache()
+                if self.encoder is not None:
 
-            if (rank_zero_only.rank == 0) and (self.encoder is not None):
+                    # p(DLC | prefix) * p(suffix | prefix, DLC)
+                    prior = batch["input_ids_dec"].clone()
+                    prior[
+                        (batch["info_mask_dec"] == InfoLabel.SUFFIX.value)
+                        + (batch["info_mask_dec"] == InfoLabel.DLC.value)
+                    ] = self.dit.tokenizer.mask_token_id
+                    frozen_mask = batch["info_mask_dec"] != InfoLabel.DLC.value
+                    prior = self.dit.sample(
+                        prior=prior,
+                        frozen_mask=frozen_mask,
+                    )
+                    gen_suffix_str_ancestral = self.dit.tokenizer.batch_decode(
+                        self.dit.sample(prior=prior, num_steps=128)[
+                            :, -self.cfg.suffix_length :
+                        ]
+                    )
+                    ppl_ancestral = self.eval_ppl(
+                        batch["prefix_str"],
+                        gen_suffix_str_ancestral,
+                        device=batch["input_ids_dec"].device,
+                    )
+                    self.log(
+                        "val/gen_ppl_ancestral",
+                        ppl_ancestral,
+                        on_epoch=True,
+                        on_step=False,
+                        sync_dist=True,
+                    )
 
-                prefix_str = batch["prefix_str"][:5]
+                    if rank_zero_only.rank == 0:
 
-                true_suffix_str = batch["suffix_str"][:5]
+                        prefix_str = batch["prefix_str"][:5]
 
-                # Generate conditional on the prefix AND the DLCs
-                prior = batch["input_ids_dec"][:5].clone()
-                prior[(batch["info_mask_dec"][:5] == InfoLabel.SUFFIX.value)] = (
-                    self.dit.tokenizer.mask_token_id
-                )
-                gen_suffix_str = self.dit.tokenizer.batch_decode(
-                    self.dit.sample(prior=prior)[:, -self.cfg.suffix_length :]
-                )
+                        true_suffix_str = batch["suffix_str"][:5]
 
-                table = wandb.Table(
-                    columns=["Prefix", "True Suffix", "Generated Suffix"]
-                )
-                for i in range(5):
-                    table.add_data(prefix_str[i], true_suffix_str[i], gen_suffix_str[i])
-                wandb.log({"val/samples": table})
-                del table
+                        # Generate conditional on the prefix AND the DLCs
+                        prior = batch["input_ids_dec"][:5].clone()
+                        prior[
+                            (batch["info_mask_dec"][:5] == InfoLabel.SUFFIX.value)
+                        ] = self.dit.tokenizer.mask_token_id
+                        gen_suffix_str = self.dit.tokenizer.batch_decode(
+                            self.dit.sample(prior=prior)[:, -self.cfg.suffix_length :]
+                        )
+
+                        table = wandb.Table(
+                            columns=["Prefix", "True Suffix", "Generated Suffix"]
+                        )
+                        for i in range(min(5, len(prefix_str))):
+                            table.add_data(
+                                prefix_str[i], true_suffix_str[i], gen_suffix_str[i]
+                            )
+                        wandb.log({"val/samples": table})
+                        del table

@@ -1,6 +1,8 @@
 lr: 3e-4
 lr_warmup_steps: 500
-batch_size: 64
+batch_size: 2
+val_batch_size: 2
+
 dit:
   name: kuleshov-group/mdlm-owt
   sampling_steps: 256
@@ -10,12 +12,6 @@ dit:
 
 dataset: fineweb
 eval_gen_ppl: true
-gen_batch_size: 16
-pretrained_ae_id: 2ixcxztl
-
-prefix_length: 16
-suffix_length: 64
-context_length: null
-encoder_mode: null 
+pretrained_ae_id: t6iwcr8a #2ixcxztl 
 
 name: dlc_md
