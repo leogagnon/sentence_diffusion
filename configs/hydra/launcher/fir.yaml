@@ -7,7 +7,7 @@ array_parallelism: 32
 nodes: 1 
 tasks_per_node: 4
 cpus_per_task: 6
-timeout_min: 179
+timeout_min: 720
 account: rrg-bengioy-ad
 additional_parameters:
   no-requeue: true

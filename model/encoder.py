@@ -342,13 +342,13 @@ class EncoderModel(nn.Module):
 
         # Initialize SEM/output projection
         if cfg.sem is None:
-            self.out_proj = nn.Linear(backbone_dim, cfg.latent_length * cfg.latent_dim)
+            self.out_proj = nn.Linear(backbone_dim, cfg.latent_length * cfg.latent_dim, bias=False)
         else:
             cfg.sem["input_dim"] = backbone_dim
             self.sem = hydra.utils.instantiate(cfg.sem)
             self.sem: SEMHead | HSEMHead
             self.out_proj = nn.Linear(
-                self.sem.out_dim, cfg.latent_length * cfg.latent_dim
+                self.sem.out_dim, cfg.latent_length * cfg.latent_dim, bias=False
             )
 
         self.cfg = cfg

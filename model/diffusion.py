@@ -27,7 +27,6 @@ from transformers import (
 )
 from copy import deepcopy
 import abc
-import numpy as np
 from tqdm import tqdm
 
 # Flags required to enable jit fusion kernels
@@ -199,7 +198,7 @@ class DiTModel(nn.Module):
         xt = torch.where(move_indices, self.tokenizer.mask_token_id, x)
         return xt
 
-    def ddpm_caching_update(self, x, t, dt, p_x0=None):
+    def ddpm_caching_update(self, x, t, dt, p_x0=None, frozen_mask=None):
         sigma_t, _ = self.noise(t)
         if t.ndim > 1:
             t = t.squeeze(-1)
@@ -269,6 +268,10 @@ class DiTModel(nn.Module):
                 q_xs = torch.where(copy_flag.unsqueeze(-1), q_xs, q_xs_2)
                 xs = sample_categorical(q_xs)
 
+        # Makes sure that frozen tokens remain unchanged (e.g. by remasking)
+        if frozen_mask is not None:
+            xs = torch.where(frozen_mask, x, xs)
+
         if torch.allclose(xs, x):
             p_x0_cache = p_x0
         else:
@@ -313,7 +316,7 @@ class DiTModel(nn.Module):
             print("model_output contains NaNs", model_output)
 
         if self.cfg.T > 0:
-            return self._d3pm_loss(model_output=model_output, xt=xt, x0=x0, t=t)
+            return self.d3pm_loss(model_output=model_output, xt=xt, x0=x0, t=t)
 
         # SUBS parameterization, continuous time.
         log_p_theta = torch.gather(
@@ -325,7 +328,7 @@ class DiTModel(nn.Module):
 
         return -log_p_theta * (dsigma / torch.expm1(sigma))[:, None]
 
-    def _d3pm_loss(self, model_output, xt, x0, t):
+    def d3pm_loss(self, model_output, xt, x0, t):
         dt = 1 / self.cfg.T
 
         if torch.is_tensor(t):
@@ -391,7 +394,7 @@ class DiTModel(nn.Module):
         return self.subs_parameterization(logits=logits, xt=x)
 
     @torch.no_grad()
-    def sample(self, batch_size=None, num_steps=None, eps=1e-5, prior=None):
+    def sample(self, batch_size=None, num_steps=None, eps=1e-5, prior=None, frozen_mask=None):
         """Generate samples from the model."""
         device = next(self.parameters()).device
 
@@ -410,13 +413,16 @@ class DiTModel(nn.Module):
             assert batch_size is None
             x = prior
 
+        if frozen_mask is None:
+            frozen_mask = prior != self.tokenizer.mask_token_id
+
         timesteps = torch.linspace(1, eps, num_steps + 1, device=device)
         dt = (1 - eps) / num_steps
         p_x0_cache = None
 
         for i in tqdm(range(num_steps)):
             t = timesteps[i] * torch.ones(x.shape[0], 1, device=device)
-            p_x0_cache, x_next = self.ddpm_caching_update(x, t, dt, p_x0=p_x0_cache)
+            p_x0_cache, x_next = self.ddpm_caching_update(x, t, dt, p_x0=p_x0_cache, frozen_mask=frozen_mask)
             x = x_next
 
         if self.cfg.noise_removal:

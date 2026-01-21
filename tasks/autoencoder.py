@@ -343,16 +343,16 @@ class AETask(L.LightningModule):
                     else:
                         reset_mask = einx.rearrange("L V -> (L V)", is_dead)
 
-                    reset_mask = reset_mask.to('cpu')
-                    seed = torch.randint(0, 100000000, size=(1,), device='cpu')
+                    reset_mask = reset_mask.to("cpu")
+                    seed = torch.randint(0, 100000000, size=(1,), device="cpu")
                 else:
                     # Empty placeholder for DDP broadcasting
                     reset_mask = torch.empty(
                         size=(self.encoder.sem.cfg.L * self.encoder.sem.cfg.V,),
                         dtype=torch.bool,
-                        device='cpu',
+                        device="cpu",
                     )
-                    seed = torch.empty(size=(1,), dtype=torch.long, device='cpu')
+                    seed = torch.empty(size=(1,), dtype=torch.long, device="cpu")
 
                 self.trainer.strategy.broadcast(reset_mask, src=0)
                 self.trainer.strategy.broadcast(seed, src=0)
@@ -360,8 +360,7 @@ class AETask(L.LightningModule):
                 # If there are things to reset
                 if reset_mask.sum() > 0:
 
-                    # Reset appropriate rows of SEM input/output proj
-                    # using the broadcasted seed
+                    # Reset appropriate rows of SEM input_proj/output_proj/layernorm using the broadcasted seed
                     bound = 1 / (self.encoder.sem.cfg.input_dim**0.5)
                     g = torch.Generator(device=self.device)
                     g.manual_seed(seed.item())
@@ -375,20 +374,60 @@ class AETask(L.LightningModule):
                             -bound, bound, generator=g
                         )
                     )
+                    self.encoder.sem.norm.weight[
+                        einx.rearrange(
+                            "(L V) -> L V",
+                            reset_mask,
+                            L=self.encoder.sem.cfg.L,
+                            V=self.encoder.sem.cfg.V,
+                        )
+                    ].fill_(1.0)
+                    self.encoder.sem.norm.bias[
+                        einx.rearrange(
+                            "(L V) -> L V",
+                            reset_mask,
+                            L=self.encoder.sem.cfg.L,
+                            V=self.encoder.sem.cfg.V,
+                        )
+                    ].fill_(0.0)
 
                     # Update the optimizer state
                     state = optimizer.state
                     proj_in_w = self.encoder.sem.proj_in.weight
                     out_proj_w = self.encoder.out_proj.weight
+                    ln_w = self.encoder.sem.norm.weight
+                    ln_bias = self.encoder.sem.norm.bias
+
+                    if ln_w in state:
+                        for k in ("exp_avg", "exp_avg_sq"):
+                            if k in state[ln_w]:
+                                state[ln_w][k][
+                                    einx.rearrange(
+                                        "(L V) -> L V",
+                                        reset_mask,
+                                        L=self.encoder.sem.cfg.L,
+                                        V=self.encoder.sem.cfg.V,
+                                    )
+                                ] = 0.0
+                    if ln_bias in state:
+                        for k in ("exp_avg", "exp_avg_sq"):
+                            if k in state[ln_bias]:
+                                state[ln_bias][k][
+                                    einx.rearrange(
+                                        "(L V) -> L V",
+                                        reset_mask,
+                                        L=self.encoder.sem.cfg.L,
+                                        V=self.encoder.sem.cfg.V,
+                                    )
+                                ] = 0.0
                     if proj_in_w in state:
                         for k in ("exp_avg", "exp_avg_sq"):
                             if k in state[proj_in_w]:
-                                state[proj_in_w][k][reset_mask] = 0
+                                state[proj_in_w][k][reset_mask] = 0.0
                     if out_proj_w in state:
                         for k in ("exp_avg", "exp_avg_sq"):
                             if k in state[out_proj_w]:
-                                state[out_proj_w][k][:, reset_mask] = 0
-
+                                state[out_proj_w][k][:, reset_mask] = 0.0
                 rank_zero_info(
                     f"SEM Reset applied at step {self.global_step} to {torch.sum(reset_mask).item()} dead SEM words!"
                 )

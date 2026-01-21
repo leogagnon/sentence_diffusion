@@ -1,16 +1,17 @@
 lr: 3e-4
 lr_warmup_steps: 500
-batch_size: 8
+batch_size: 64
 dit:
   name: kuleshov-group/mdlm-owt
   sampling_steps: 256
-  sampling_mode: mdlm  # mdlm, remdm-cap, remdm-loop  
+  sampling_mode: remdm-cap  # mdlm, remdm-cap, remdm-loop  
   nucleus_p: 0.9  
   sampling_eps: 1e-3 
 
 dataset: fineweb
 eval_gen_ppl: true
-pretrained_ae_id: t6iwcr8a
+gen_batch_size: 16
+pretrained_ae_id: 2ixcxztl
 
 prefix_length: 16
 suffix_length: 64
