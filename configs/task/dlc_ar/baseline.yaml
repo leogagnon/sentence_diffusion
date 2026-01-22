@@ -1,4 +1,4 @@
-lr: 1e-4
+lr: 2e-4
 lr_warmup_steps: 500
 batch_size: 32
 decoder:
@@ -8,11 +8,8 @@ decoder:
 
 dataset: fineweb
 eval_gen_ppl: true
-DLC_dropout: 0.0
 
 prefix_length: 16
-suffix_length: 64
-context_length: null
-encoder_mode: null 
+suffix_length: 64 
 
-name: dlc_baseline
+name: ar_baseline

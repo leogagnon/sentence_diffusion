@@ -1,13 +1,13 @@
-task/dlc_md: base
+task/dlc_ar: base
 model_checkpoint: base
 effective_batch_size: 1024
 
-task.dlc_md.pretrained_ae_id: 2ixcxztl
+task.dlc_ar.pretrained_ae_id: 7x22772a, tog6ubg3, s0imsfe4, dvtmr5r9
+
 max_steps: 20000
 
 limit_val_batches: 4
 val_check_interval: 256
 
-compile: false
-sweep_id: dlc_md/sweep_0
+sweep_id: dlc_ar/sweep_1
 

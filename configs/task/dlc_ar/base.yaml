@@ -1,5 +1,5 @@
-lr: 1e-4
-lr_warmup_steps: 500
+lr: 2e-4
+lr_warmup_steps: 1000
 batch_size: 32
 decoder:
   name: gpt2-medium # 1.5B params
@@ -8,12 +8,7 @@ decoder:
 
 dataset: fineweb
 eval_gen_ppl: true
-pretrained_ae_id: 4szrb171
+pretrained_ae_id: 7x22772a
 DLC_dropout: 0.0
 
-prefix_length: null
-suffix_length: null
-context_length: null
-encoder_mode: null 
-
-name: dlc_ar
+name: ae_base

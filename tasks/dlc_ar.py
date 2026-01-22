@@ -43,7 +43,7 @@ class DLCARTaskConfig:
     decoder: DecoderConfig
     dataset: str
     eval_gen_ppl: bool
-    DLC_dropout: float
+    DLC_dropout: float = 0.0
 
     pretrained_ae_id: Optional[str] = None
 
@@ -95,16 +95,17 @@ class DLCARTask(L.LightningModule):
             cfg.encoder_mode = ae_task.cfg.encoder_mode
 
             self.encoder = ae_task.encoder.eval().requires_grad_(False)
+
+            # Set DLC params in decoder config
+            cfg.decoder.dlc_vocab_size = self.encoder.sem.cfg.V
+            cfg.decoder.dlc_len = self.encoder.sem.dlc_len
         else:
             assert cfg.prefix_length is not None
             assert cfg.suffix_length is not None
             cfg.encoder_mode = "none"
             cfg.context_length = 0
 
-        # Create decoder
-        if self.encoder is not None:
-            cfg.decoder.dlc_vocab_size = self.encoder.sem.cfg.V
-            cfg.decoder.dlc_len = self.encoder.sem.dlc_len
+        # Create decoder  
         self.decoder = DecoderModel(cfg.decoder).train().requires_grad_(True)
 
         # Initialize Generative PPL eval model
@@ -228,7 +229,7 @@ class DLCARTask(L.LightningModule):
             dlc_ids.view(-1)
         )
         return batch
-    
+
     def _create_dlc_dropout_mask(self, batch) -> torch.Tensor:
         """
         Create attention mask with probabilistic blocking of DLC to suffix attention
@@ -246,18 +247,19 @@ class DLCARTask(L.LightningModule):
         attention_mask = attention_mask.masked_fill(causal, float("-inf"))
 
         # probabilistic block: suffix queries cannot attend DLC keys (per batch) with prob DLC_dropout
+        # also cannot attend to the SECOND think token (SPECIAL token)
+        think_tokens = batch["info_mask_dec"] == InfoLabel.SPECIAL.value
+        # Second occurrence is where cumsum == 2 and special_mask is True
+        second_think_token = (
+            torch.cumsum(think_tokens.int(), dim=1) == 2
+        ) & think_tokens
         DLC_mask = (
-            (batch["info_mask_dec"] == InfoLabel.DLC.value)
-            + (batch["info_mask_dec"] == InfoLabel.SPECIAL.value)
-        ).view(
-            bs, 1, 1, seq_len
-        )  # keys
+            (batch["info_mask_dec"] == InfoLabel.DLC.value) + second_think_token
+        ).view(bs, 1, 1, seq_len)
         suffix_mask = (batch["info_mask_dec"] == InfoLabel.SUFFIX.value).view(
             bs, 1, seq_len, 1
-        )  # queries
-        drop = (torch.rand(bs, device=device) < self.cfg.DLC_dropout).view(
-            bs, 1, 1, 1
         )
+        drop = (torch.rand(bs, device=device) < self.cfg.DLC_dropout).view(bs, 1, 1, 1)
         block = drop * suffix_mask * DLC_mask  # (bs, 1, seq_len, seq_len)
         attention_mask = attention_mask.masked_fill(block, float("-inf"))
 
@@ -269,7 +271,9 @@ class DLCARTask(L.LightningModule):
         if self.encoder is not None:
             batch = self._fill_DLCs_in_batch(batch)
 
-        attention_mask = self._create_dlc_dropout_mask(batch) if self.cfg.DLC_dropout > 0 else None
+        attention_mask = (
+            self._create_dlc_dropout_mask(batch) if self.cfg.DLC_dropout > 0 else None
+        )
 
         logits = self.decoder(
             input_ids=batch["input_ids_dec"], attention_mask=attention_mask

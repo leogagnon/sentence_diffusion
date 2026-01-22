@@ -96,15 +96,17 @@ class DLCMDTask(L.LightningModule):
             cfg.encoder_mode = ae_task.cfg.encoder_mode
 
             self.encoder = ae_task.encoder.eval().requires_grad_(False)
+
+            # Set DLC params in decoder config
+            cfg.dit.dlc_vocab_size = self.encoder.sem.cfg.V
+            cfg.dit.dlc_len = self.encoder.sem.dlc_len
         else:
             assert cfg.prefix_length is not None
             assert cfg.suffix_length is not None
             cfg.encoder_mode = "none"
             cfg.context_length = 0
 
-        # Create decoder
-        cfg.dit.dlc_vocab_size = self.encoder.sem.cfg.V
-        cfg.dit.dlc_len = self.encoder.sem.dlc_len
+        # Create decoder            
         self.dit = DiTModel(cfg.dit).train().requires_grad_(True)
 
         # Initialize Generative PPL eval model
@@ -348,7 +350,7 @@ class DLCMDTask(L.LightningModule):
                         frozen_mask=frozen_mask,
                     )
                     gen_suffix_str_ancestral = self.dit.tokenizer.batch_decode(
-                        self.dit.sample(prior=prior, num_steps=128)[
+                        self.dit.sample(prior=prior, num_steps=self.dit.cfg.sampling_steps // 2)[
                             :, -self.cfg.suffix_length :
                         ]
                     )
