@@ -39,6 +39,8 @@ class SEMHeadConfig:
     V: int
     temp: float
     input_dim: Optional[int] = None
+    logit_noise: bool = False
+
 
 class SEMHead(nn.Module):
     def __init__(self, cfg: Optional[SEMHeadConfig] = None, **kwargs):
@@ -49,14 +51,17 @@ class SEMHead(nn.Module):
 
         assert cfg.input_dim is not None, "input_dim has to be set"
         self.proj_in = nn.Linear(cfg.input_dim, cfg.L * cfg.V, bias=False)
-        self.norm = nn.LayerNorm((cfg.L, cfg.V))
+        if cfg.logit_noise:
+            self.norm = nn.LayerNorm((cfg.V,), elementwise_affine=False)
+        else:
+            self.norm = nn.LayerNorm((cfg.L, cfg.V))
 
         self.cfg = cfg
 
     @property
     def out_dim(self):
         return self.cfg.L * self.cfg.V
-    
+
     @property
     def dlc_len(self):
         return self.cfg.L
@@ -338,11 +343,15 @@ class EncoderModel(nn.Module):
             )
 
         # Maybe freeze backbone
-        self.transformer = self.transformer.train(cfg.train_backbone).requires_grad_(cfg.train_backbone)
+        self.transformer = self.transformer.train(cfg.train_backbone).requires_grad_(
+            cfg.train_backbone
+        )
 
         # Initialize SEM/output projection
         if cfg.sem is None:
-            self.out_proj = nn.Linear(backbone_dim, cfg.latent_length * cfg.latent_dim, bias=False)
+            self.out_proj = nn.Linear(
+                backbone_dim, cfg.latent_length * cfg.latent_dim, bias=False
+            )
         else:
             cfg.sem["input_dim"] = backbone_dim
             self.sem = hydra.utils.instantiate(cfg.sem)
@@ -395,8 +404,10 @@ class EncoderModel(nn.Module):
                 temp=temp,
             )
             z = self.out_proj(sem_out.pop("z"))
-        
+
         # Reshape latent
-        z = einx.rearrange("b (l d) -> b l d", z, l=self.cfg.latent_length, d=self.cfg.latent_dim)
+        z = einx.rearrange(
+            "b (l d) -> b l d", z, l=self.cfg.latent_length, d=self.cfg.latent_dim
+        )
 
         return z, sem_out
