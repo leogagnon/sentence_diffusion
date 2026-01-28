@@ -143,8 +143,9 @@ class NTXentLoss(torch.nn.Module):
         v = self._cosine_similarity(x.unsqueeze(1), y.unsqueeze(0))
         return v
 
-    def forward(self, zis, zjs):
-        representations = torch.cat([zjs, zis], dim=0)
+    @torch.amp.autocast(device_type="cuda", enabled=False)
+    def forward(self, zis: torch.Tensor, zjs: torch.Tensor):
+        representations = torch.cat([zjs.float(), zis.float()], dim=0)
 
         similarity_matrix = self.similarity_function(representations, representations)
 
