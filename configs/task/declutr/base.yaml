@@ -1,4 +1,4 @@
-batch_size: 16
+batch_size: 32
 lr: 2e-4
 lr_warmup_steps: 500
 

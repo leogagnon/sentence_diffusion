@@ -10,9 +10,10 @@ from torch.utils.data.dataset import Subset
 from transformers import get_constant_schedule_with_warmup
 from omegaconf import OmegaConf
 
-from data import (DeCLUTRIterable, LanguageDataset, LanguageDatasetConfig)
+from data import DeCLUTRIterable, LanguageDataset, LanguageDatasetConfig
 from model.encoder import EncoderConfig, EncoderModel
 from tasks.utils import *
+import torch.distributed as dist
 
 
 @dataclass
@@ -64,11 +65,8 @@ class DeCLUTRTask(L.LightningModule):
         # To not eval MAUVE every validation step
         self.val_epoch_counter = 0
 
-        self.loss = NTXentLoss(
-            batch_size=cfg.batch_size * cfg.num_anchors,
-            temperature=0.1,
-            use_cosine_similarity=True,
-        )
+        # NTXent loss
+        self.loss = NTXentLoss(temperature=0.05)
 
         self.cfg = cfg
 
@@ -150,20 +148,29 @@ class DeCLUTRTask(L.LightningModule):
             input_ids=batch["anchor_ids"],
             attention_mask=(
                 batch["anchor_ids"] != self.encoder.tokenizer.pad_token_id
-            ).to(torch.int32),
+            ).float(),
             return_count=True,
         )
         z_positives, _ = self.encoder(
             input_ids=batch["positive_ids"],
             attention_mask=(
                 batch["positive_ids"] != self.encoder.tokenizer.pad_token_id
-            ).to(torch.int32),
+            ).float(),
         )
         z_positives = einx.rearrange(
             "(b p) d -> b p d", z_positives, p=self.cfg.num_positives
         ).mean(dim=1)
 
-        # NTXent loss
+        # If distributed, gather all representations
+        if self.trainer.num_devices > 1:
+            z_anchors = einx.rearrange(
+                "w b d -> (w b) d", self.all_gather(z_anchors, sync_grads=True)
+            )
+            z_positives = einx.rearrange(
+                "w b d -> (w b) d", self.all_gather(z_positives, sync_grads=True)
+            )
+            print(z_anchors.shape, z_positives.shape)
+
         loss = self.loss(z_anchors, z_positives)
         self.log("train/loss", loss, on_step=True, on_epoch=False, sync_dist=True)
 
@@ -179,19 +186,28 @@ class DeCLUTRTask(L.LightningModule):
                 input_ids=batch["anchor_ids"],
                 attention_mask=(
                     batch["anchor_mask"] != self.encoder.tokenizer.pad_token_id
-                ).to(torch.int32),
+                ).float(),
                 temp=sem_temp,
             )
             z_positives, _ = self.encoder(
                 input_ids=batch["positive_ids"],
                 attention_mask=(
                     batch["positive_mask"] != self.encoder.tokenizer.pad_token_id
-                ).to(torch.int32),
+                ).float(),
                 temp=sem_temp,
             )
             z_positives = einx.rearrange(
                 "(b p) d -> b p d", z_positives, p=self.cfg.num_positives
             ).mean(dim=1)
+
+            if self.trainer.num_devices > 1:
+                z_anchors = einx.rearrange(
+                    "w b d -> (w b) d", self.all_gather(z_anchors, sync_grads=False)
+                )
+                z_positives = einx.rearrange(
+                    "w b d -> (w b) d", self.all_gather(z_positives, sync_grads=False)
+                )
+                print(z_anchors.shape, z_positives.shape)
 
             # NTXent loss
             loss = self.loss(z_anchors, z_positives)
