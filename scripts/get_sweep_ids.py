@@ -1,5 +1,6 @@
-import wandb
 import argparse
+
+import wandb
 
 api = wandb.Api()
 

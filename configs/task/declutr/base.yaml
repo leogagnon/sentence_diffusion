@@ -1,0 +1,26 @@
+batch_size: 16
+lr: 2e-4
+lr_warmup_steps: 500
+
+encoder:
+  model_name: FacebookAI/roberta-large
+  train_backbone: false
+  latent_length: 1
+  latent_dim: 1024
+  sem: 
+    _target_: model.encoder.SEMHead
+    L: 512
+    V: 16
+    temp: 1.0
+    
+dataset:
+  name: fineweb
+  val_size: 16384
+  seed: 42
+
+min_span_length: 32
+max_span_length: 512
+num_anchors: 2
+num_positives: 2
+
+name: base_declutr

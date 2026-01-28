@@ -1,33 +1,12 @@
-from abc import ABC, abstractmethod
-from functools import partial
+import abc
 import math
-import os
-import einx
-from peft.mapping_func import get_peft_model
-import torch.nn as nn
 from dataclasses import dataclass
 from typing import Optional
-from sentence_transformers import SentenceTransformer
-from transformers.models.auto.modeling_auto import AutoModelForCausalLM
-from transformers.models.auto.tokenization_auto import AutoTokenizer
-from transformers import GPT2TokenizerFast
-from x_transformers import Encoder
-from x_transformers.x_transformers import AttentionLayers, ScaledSinusoidalEmbedding
+
 import torch
-from typing import Optional, Union, List
-from einops import rearrange
-from torch.nn import ModuleDict
-from tokenizers.processors import TemplateProcessing
-from lightning.pytorch.utilities.rank_zero import rank_zero_info
-from transformers import (
-    GenerationConfig,
-    GPT2LMHeadModel,
-    GPT2Config,
-    AutoModelForMaskedLM,
-)
-from copy import deepcopy
-import abc
+import torch.nn as nn
 from tqdm import tqdm
+from transformers import (AutoModelForMaskedLM, GPT2TokenizerFast)
 
 # Flags required to enable jit fusion kernels
 torch._C._jit_set_profiling_mode(False)
@@ -50,14 +29,12 @@ class Noise(abc.ABC, nn.Module):
         """
         Rate of change of noise ie g(t)
         """
-        pass
 
     @abc.abstractmethod
     def total_noise(self, t):
         """
         Total noise ie \int_0^t g(t) dt + g(0)
         """
-        pass
 
 
 class LogLinearNoise(Noise):

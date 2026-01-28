@@ -1,36 +1,14 @@
-from abc import ABC, abstractmethod
-from functools import partial
-import os
-from peft.mapping_func import get_peft_model
-from sentence_transformers.models import InputModule
-import torch.nn as nn
 from dataclasses import dataclass
 from typing import Optional
-from sentence_transformers import SentenceTransformer
-from torch.nn import functional as F
-from transformers.models.auto.modeling_auto import AutoModelForCausalLM, AutoModel
-from transformers.models.auto.tokenization_auto import AutoTokenizer
-import torch
-from transformers.models.m2m_100.modeling_m2m_100 import M2M100Encoder
-from x_transformers.x_transformers import AttentionLayers, ScaledSinusoidalEmbedding
+
 import einx
-import math
-import random
-from transformers import T5EncoderModel, T5Tokenizer
-from sentence_transformers import SentenceTransformer
-from abc import ABC, abstractmethod
-from contextlib import nullcontext
-from torch.nn import Sequential
-import sentence_transformers
-from lightning.pytorch.utilities.rank_zero import rank_zero_info
-from einops import rearrange
-from torch.utils.checkpoint import checkpoint
 import hydra
-from torch.distributions import Gamma
-from torch.nn.init import trunc_normal_
-from torch.nn.utils import weight_norm
+import sentence_transformers
+import torch
 import torch.nn as nn
-from torch.utils.checkpoint import checkpoint
+from torch.nn import functional as F
+from transformers.models.auto.tokenization_auto import AutoTokenizer
+from transformers.models.m2m_100.modeling_m2m_100 import M2M100Encoder
 
 
 @dataclass
@@ -409,5 +387,8 @@ class EncoderModel(nn.Module):
         z = einx.rearrange(
             "b (l d) -> b l d", z, l=self.cfg.latent_length, d=self.cfg.latent_dim
         )
+
+        # Maybe squeeze if latent_length == 1
+        z = torch.squeeze(z, dim=1) if self.cfg.latent_length == 1 else z
 
         return z, sem_out

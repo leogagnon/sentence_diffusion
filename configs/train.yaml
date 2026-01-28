@@ -6,10 +6,11 @@ defaults:
   - task/ae: null
   - task/dlc_ar: null
   - task/dlc_md: null
+  - task/declutr: null
   - model_checkpoint: null
   - early_stopping: null
   - hydra/sweeper/params : null
-  - override hydra/launcher : fir
+  - override hydra/launcher : tamia
   
 seed: 1337
 log_dir: null

@@ -1,22 +1,19 @@
 # Author: Krishna Pillutla
 # License: GPLv3
 
-import math
-import numpy as np
-import time
-from types import SimpleNamespace
 import json
+import math
 import os
 import time
-from tqdm.auto import tqdm as tqdm_original
+from types import SimpleNamespace
 
+import numpy as np
 import torch
-from transformers import AutoModel, AutoTokenizer
-
-from sklearn.preprocessing import normalize
 from sklearn.decomposition import PCA
 from sklearn.metrics import auc as compute_area_under_curve
-
+from sklearn.preprocessing import normalize
+from tqdm.auto import tqdm as tqdm_original
+from transformers import AutoModel, AutoTokenizer
 
 try:
     import torch
@@ -26,7 +23,7 @@ except (ImportError, ModuleNotFoundError):
     FOUND_TORCH = False
 
 try:
-    import transformers
+    pass
 
     FOUND_TRANSFORMERS = True
 except (ImportError, ModuleNotFoundError):

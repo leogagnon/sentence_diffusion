@@ -1,39 +1,22 @@
-from functools import partial
-import math
 import os
-import lightning as L
-from omegaconf import OmegaConf
-from dataclasses import dataclass
-from typing import Any, List, Optional
-import torch
 import random
-from torch.utils.data import DataLoader, random_split
-from torch.utils.data.dataset import Subset
-from transformers import AutoTokenizer
-from transformers.models.auto.modeling_auto import AutoModelForCausalLM
-from peft import get_peft_model
-from hydra.utils import instantiate
-from model.encoder import EncoderConfig, EncoderModel
-from model.decoder import DecoderConfig, DecoderModel
-from model.diffusion import DiTModel, DiTConfig
-import os
+from dataclasses import dataclass
+from typing import Optional
+
+import lightning as L
+import torch
 import wandb
-import hydra
-from lightning.pytorch.utilities.rank_zero import rank_zero_info, rank_zero_only
+from lightning.pytorch.utilities.rank_zero import rank_zero_only
+from omegaconf import OmegaConf
+from torch.utils.data.dataset import Subset
+from transformers import (AutoTokenizer, get_constant_schedule_with_warmup)
+from transformers.models.auto.modeling_auto import AutoModelForCausalLM
+
+from data import (InfoLabel, LanguageDataset, LanguageDatasetConfig,
+                  PrefixSuffixIterable)
+from model.diffusion import DiTConfig, DiTModel
 from tasks.autoencoder import AETask
-from data import WikipediaDataset, FineWebDataset, InfoLabel
-from tqdm import tqdm
-from mauve import compute_mauve, get_features_from_input
-import einx
-from transformers import (
-    get_constant_schedule_with_warmup,
-    get_cosine_schedule_with_warmup,
-)
-from enum import Enum
 from tasks.utils import *
-from typing import Tuple, List, ClassVar
-from dataclasses import field
-from data import get_dataloader
 
 
 @dataclass
@@ -42,7 +25,7 @@ class DLCMDTaskConfig:
     lr_warmup_steps: int
     batch_size: int
     dit: DiTConfig
-    dataset: str
+    dataset: LanguageDatasetConfig
     eval_gen_ppl: bool
     val_batch_size: Optional[int] = None
 
@@ -144,12 +127,7 @@ class DLCMDTask(L.LightningModule):
 
     def setup(self, **kwargs):
 
-        if self.cfg.dataset == "wikipedia":
-            self.dataset = WikipediaDataset()
-        elif self.cfg.dataset == "fineweb":
-            self.dataset = FineWebDataset()
-        else:
-            raise ValueError(f"Unknown dataset {self.cfg.dataset}")
+        self.dataset = LanguageDataset(self.cfg.dataset)
 
         self.train_data = Subset(self.dataset, indices=self.dataset.train_indices)
         self.val_data = Subset(self.dataset, indices=self.dataset.val_indices)
@@ -186,14 +164,14 @@ class DLCMDTask(L.LightningModule):
             return optimizer
 
     def train_dataloader(self):
-        return get_dataloader(
+        return PrefixSuffixIterable.get_dataloader(
             self.train_data,
             batch_size=self.cfg.batch_size,
             prefix_length=self.cfg.prefix_length,
             suffix_length=self.cfg.suffix_length,
             context_length=self.cfg.context_length,
-            enc_tokenizer=self.encoder.tokenizer if self.encoder is not None else None,
-            dec_tokenizer=self.dit.tokenizer,
+            enc_tok=self.encoder.tokenizer if self.encoder is not None else None,
+            dec_tok=self.dit.tokenizer,
             encoder_mode=self.cfg.encoder_mode,
             encoder_noise=False,  # No noise during DLC-LM finetuning
             seed=random.randint(0, 100000),  # Dataset should be different if restarted,
@@ -201,7 +179,7 @@ class DLCMDTask(L.LightningModule):
         )
 
     def val_dataloader(self):
-        return get_dataloader(
+        return PrefixSuffixIterable.get_dataloader(
             self.val_data,
             batch_size=(
                 self.cfg.val_batch_size
@@ -210,9 +188,9 @@ class DLCMDTask(L.LightningModule):
             ),
             prefix_length=self.cfg.prefix_length,
             suffix_length=self.cfg.suffix_length,
-            enc_tokenizer=self.encoder.tokenizer if self.encoder is not None else None,
+            enc_tok=self.encoder.tokenizer if self.encoder is not None else None,
             context_length=self.cfg.context_length,
-            dec_tokenizer=self.dit.tokenizer,
+            dec_tok=self.dit.tokenizer,
             encoder_mode=self.cfg.encoder_mode,
             encoder_noise=False,
             seed=42,  # Always the same validation set for consistency,
@@ -235,22 +213,6 @@ class DLCMDTask(L.LightningModule):
         )
         return batch
 
-    def training_step(self, batch, batch_idx):
-
-        # Fill DLCs in the batch
-        if self.encoder is not None:
-            batch = self._fill_DLCs_in_batch(batch)
-
-        if self.cfg.DLC_dropout > 0:
-            attention_mask = self._create_dlc_dropout_mask(batch)
-        else:
-            attention_mask = batch["info_mask_dec"] == InfoLabel.PAD.value
-
-        loss, _, _ = self.dit.compute_loss(
-            batch["input_ids_dec"], attention_mask=attention_mask
-        )
-        self.log("train/loss", loss, on_step=True, on_epoch=False, sync_dist=True)
-        return loss
 
     def training_step(self, batch, batch_idx):
 

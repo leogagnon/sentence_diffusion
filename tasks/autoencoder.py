@@ -1,37 +1,22 @@
-from functools import partial
-import math
-import os
-import lightning as L
-from omegaconf import OmegaConf
-from dataclasses import dataclass
-from typing import Any, List, Optional
-from peft import LoraConfig
-import torch
 import random
-from torch.utils.data import DataLoader, random_split
-from torch.utils.data.dataset import Subset
-from transformers import AutoTokenizer
-from transformers.models.auto.modeling_auto import AutoModelForCausalLM
-from peft import get_peft_model
-from hydra.utils import instantiate
-from model.encoder import EncoderConfig, EncoderModel
-from model.decoder import DecoderConfig, DecoderModel
-import os
-import wandb
-import hydra
-from lightning.pytorch.utilities.rank_zero import rank_zero_info, rank_zero_only
-from tqdm import tqdm
-from mauve import compute_mauve, get_features_from_input
-from transformers import get_constant_schedule_with_warmup
-import einx
-import os
-import torch
-from torch.utils.data import Sampler
-from typing import Iterator, Optional
-from tasks.utils import *
-from data import WikipediaDataset, FineWebDataset, get_dataloader, InfoLabel
-import torch.nn as nn
 from dataclasses import dataclass, field
+from typing import Optional
+
+import einx
+import lightning as L
+import torch
+import wandb
+from lightning.pytorch.utilities.rank_zero import (rank_zero_info,
+                                                   rank_zero_only)
+from omegaconf import OmegaConf
+from torch.utils.data.dataset import Subset
+from transformers import get_constant_schedule_with_warmup
+
+from data import (InfoLabel, LanguageDataset, LanguageDatasetConfig,
+                  PrefixSuffixIterable)
+from model.decoder import DecoderConfig, DecoderModel
+from model.encoder import EncoderConfig, EncoderModel
+from tasks.utils import *
 
 
 @dataclass
@@ -50,7 +35,7 @@ class AETaskConfig:
     batch_size: int
     encoder: EncoderConfig
     decoder: DecoderConfig
-    dataset: str
+    dataset: LanguageDatasetConfig
     lr_warmup_steps: int = 1500
     denoising: bool = True
     sem_noise: float = 0.0
@@ -102,39 +87,34 @@ class AETask(L.LightningModule):
 
     def setup(self, **kwargs):
 
-        if self.cfg.dataset == "wikipedia":
-            self.dataset = WikipediaDataset()
-        elif self.cfg.dataset == "fineweb":
-            self.dataset = FineWebDataset()
-        else:
-            raise ValueError(f"Unknown dataset {self.cfg.dataset}")
+        self.dataset = LanguageDataset(self.cfg.dataset)
 
         self.train_data = Subset(self.dataset, indices=self.dataset.train_indices)
         self.val_data = Subset(self.dataset, indices=self.dataset.val_indices)
 
     def train_dataloader(self):
-        return get_dataloader(
+        return PrefixSuffixIterable.get_dataloader(
             self.train_data,
             batch_size=self.cfg.batch_size,
             prefix_length=self.cfg.prefix_length,
             suffix_length=self.cfg.suffix_length,
             context_length=self.cfg.context_length,
-            enc_tokenizer=self.encoder.tokenizer,
-            dec_tokenizer=self.decoder.tokenizer,
+            enc_tok=self.encoder.tokenizer,
+            dec_tok=self.decoder.tokenizer,
             encoder_mode=self.cfg.encoder_mode,
             encoder_noise=self.cfg.denoising,
             seed=random.randint(0, 100000),  # Dataset should be different if restarted
         )
 
     def val_dataloader(self):
-        return get_dataloader(
+        return PrefixSuffixIterable.get_dataloader(
             self.val_data,
             batch_size=self.cfg.batch_size,
             prefix_length=self.cfg.prefix_length,
             suffix_length=self.cfg.suffix_length,
-            enc_tokenizer=self.encoder.tokenizer,
+            enc_tok=self.encoder.tokenizer,
             context_length=self.cfg.context_length,
-            dec_tokenizer=self.decoder.tokenizer,
+            dec_tok=self.decoder.tokenizer,
             encoder_mode=self.cfg.encoder_mode,
             encoder_noise=False,  # No noise at validation
             seed=42,  # Always the same validation set for consistency

@@ -1,27 +1,18 @@
-from dataclasses import dataclass
-from typing import Optional
-from datasets.load import load_from_disk, load_dataset
-from hydra.utils import to_absolute_path
-from tokenizers import Tokenizer
-import torch
-from torch.nn.utils.rnn import pad_sequence
-from torch.utils.data.dataset import Dataset
-from lightning.pytorch.utilities.rank_zero import rank_zero_info, rank_zero_only
-from transformers import DataCollatorWithPadding, PreTrainedTokenizerFast
-from functools import partial
-from model.encoder import EncoderModel
-from enum import Enum
-import os
-from transformers import AutoTokenizer
-from typing import List, Tuple
-import os
-import torch
-from torch.utils.data import IterableDataset, get_worker_info, DataLoader
-from typing import Any, Callable, Dict, List, Optional, Sequence, Union
-from torch.nn.utils.rnn import pad_sequence
-import ftfy
 import math
+import os
 import random
+from dataclasses import dataclass
+from enum import Enum
+from typing import Any, List, Optional
+
+import ftfy
+import torch
+from datasets.load import load_dataset
+from torch.nn.utils.rnn import pad_sequence
+from torch.utils.data import DataLoader, IterableDataset, get_worker_info
+from torch.utils.data.dataset import Dataset
+from transformers import PreTrainedTokenizerFast
+
 
 
 class InfoLabel(Enum):
@@ -33,68 +24,52 @@ class InfoLabel(Enum):
 
 
 @dataclass
-class WikipediaDatasetConfig:
-    max_length: int
+class LanguageDatasetConfig:
+    name: str
+    val_size: int
+    seed: int
 
 
-class WikipediaDataset(Dataset):
-    VAL_SIZE = 8192
-    SEED = 42
+class LanguageDataset(Dataset):
+    """
+    Simple dataset wrapper around HuggingFace datasets for text data
+    """
 
-    def __init__(self, cfg: Optional[WikipediaDatasetConfig] = None, **kwargs):
+    def __init__(self, cfg: Optional[LanguageDatasetConfig] = None, **kwargs):
+
         if cfg == None:
-            cfg = WikipediaDatasetConfig(**kwargs)
-        self.dataset = load_dataset(
-            "leogagnon/wikipedia-short-paragraphs", split="train"
+            cfg = LanguageDatasetConfig(**kwargs)
+
+        if cfg.name == "fineweb":
+            self.dataset = load_dataset(
+                "HuggingFaceFW/fineweb", name="sample-100BT", split="train"
+            )
+        elif cfg.name == "owt":
+            self.dataset = load_dataset("Skylion007/openwebtext", split="train")
+        elif cfg.name == "wiki":
+            self.dataset = load_dataset(
+                "leogagnon/wikipedia-short-paragraphs", split="train"
+            )
+        indices = torch.randperm(
+            len(self.dataset),
+            generator=torch.Generator().manual_seed(cfg.seed),
         )
+        self.train_indices = indices[: -cfg.val_size]
+        self.val_indices = indices[-cfg.val_size :]
+
         self.cfg = cfg
-        self.max_length = self.cfg.max_length
-
-    def get_train_val_indices(self, val_size):
-        indices = torch.randperm(
-            len(self.dataset),
-            generator=torch.Generator().manual_seed(self.SEED),
-        )
-        train_indices = indices[: -self.VAL_SIZE]
-        val_indices = indices[-self.VAL_SIZE :]
-
-        return train_indices, val_indices
-
-    def __len__(self):
-        return len(self.dataset)
-
-    def __getitems__(self, indices):
-        return {"input_str": self.dataset[indices]["input_ids"]}
-
-    def __getitem__(self, idx):
-        return {"input_str": self.dataset[int(idx)]["input_ids"]}
-
-
-class FineWebDataset(Dataset):
-    VAL_SIZE = 16384
-    SEED = 42
-
-    def __init__(self):
-
-        self.dataset = load_dataset(
-            "leogagnon/fineweb_100BT_tokenized_gpt2", split="train"
-        )
-        self.pre_tokenizer = AutoTokenizer.from_pretrained("gpt2-large")
-        indices = torch.randperm(
-            len(self.dataset),
-            generator=torch.Generator().manual_seed(self.SEED),
-        )
-        self.train_indices = indices[: -self.VAL_SIZE]
-        self.val_indices = indices[-self.VAL_SIZE :]
 
     def __len__(self):
         return len(self.dataset)
 
     def __getitem__(self, idx):
-        return {"input_ids": self.dataset[int(idx)]["input_ids"]}
+        return self.dataset[int(idx)]["text"]
 
 
 class SpanPoissonMasker:
+    """
+    Classic span masker based on Poisson distribution. Each masked span is replaced by a single mask token.
+    """
     def __init__(
         self,
         mask_id: int,
@@ -293,13 +268,93 @@ class PrefixSuffixIterable(IterableDataset):
         generator = random.Random(mixed)
         return generator
 
+    @classmethod
+    def get_dataloader(
+        cls: "PrefixSuffixIterable",
+        dataset: Dataset,
+        batch_size: int,
+        prefix_length: int,
+        suffix_length: int,
+        context_length: int,
+        enc_tok: Optional[PreTrainedTokenizerFast],
+        dec_tok: PreTrainedTokenizerFast,
+        encoder_mode: str,
+        encoder_noise: bool,
+        seed: int = 32,
+        num_dlc_ph: int = 0,
+    ):
+        # Make the collation function
+        def collate_fn(batch):
+            # Merge dicts by key
+            batch = {key: [item[key] for item in batch] for key in batch[0].keys()}
+
+            # Pad decoder input ids
+            input_ids_dec = dec_tok.pad(
+                {"input_ids": batch["input_ids_dec"]},
+                padding=True,
+                return_tensors="pt",
+                return_attention_mask=False,
+            )["input_ids"]
+            info_mask_dec = pad_sequence(
+                batch["info_mask_dec"],
+                batch_first=True,
+                padding_value=InfoLabel.PAD.value,
+            )
+
+            out = {
+                "input_ids_dec": input_ids_dec,
+                "info_mask_dec": info_mask_dec,
+                "prefix_str": batch["prefix_str"],
+                "suffix_str": batch["suffix_str"],
+            }
+
+            if "input_ids_enc" in batch.keys():
+                batch_enc = enc_tok.pad(
+                    {"input_ids": batch["input_ids_enc"]},
+                    padding=True,
+                    return_tensors="pt",
+                    return_attention_mask=True,
+                )
+
+                out.update(
+                    {
+                        "input_ids_enc": batch_enc["input_ids"],
+                        "attention_mask_enc": batch_enc["attention_mask"],
+                    }
+                )
+            return out
+
+        iterable = PrefixSuffixIterable(
+            dataset,
+            dec_tok=dec_tok,
+            enc_tok=enc_tok,
+            prefix_length=prefix_length,
+            suffix_length=suffix_length,
+            context_length=context_length,
+            encoder_mode=encoder_mode,
+            encoder_noise=encoder_noise,
+            seed=seed,
+            num_dlc_ph=num_dlc_ph,
+        )
+
+        return DataLoader(
+            iterable,
+            batch_size=batch_size,
+            collate_fn=collate_fn,
+            num_workers=int(os.environ.get("TORCH_NUM_WORKERS", 1)),
+            persistent_workers=False,
+            prefetch_factor=2,
+            pin_memory=False,
+        )
+
     def __iter__(self):
         generator = self._make_generator()
 
         while True:
             # Sample a random document
             idx = generator.randint(0, self.N - 1)
-            input_ids_dec = self.ds[idx]["input_ids"]
+            input_str = self.ds[idx]
+            input_ids_dec = self.dec_tok.encode(input_str)
             seq_length = len(input_ids_dec)
 
             # Only consider documents with enough length
@@ -386,78 +441,197 @@ class PrefixSuffixIterable(IterableDataset):
                 yield out_dict
 
 
-def get_dataloader(
-    dataset: Dataset,
-    batch_size: int,
-    prefix_length: int,
-    suffix_length: int,
-    context_length: int,
-    enc_tokenizer: Optional[PreTrainedTokenizerFast],
-    dec_tokenizer: PreTrainedTokenizerFast,
-    encoder_mode: str,
-    encoder_noise: bool,
-    seed: int = 32,
-    num_dlc_ph: int = 0,
-):
+class DeCLUTRIterable(IterableDataset):
+    """
+    Samples WITH REPLACEMENT DeCLUTR-style training examples from a text dataset (https://github.com/JohnGiorgi/DeCLUTR/)
+    - Select a document with enough tokens
+    - Sample multiple anchor spans from the document (at distance > 2 * max_span_length)
+    - For each anchor, sample multiple positive spans from the document (near the anchor, at distance < max_span_length)
+    - Tokenizes and formats everything
+    """
 
-    # Make the collation function
-    def collate_fn(batch):
-        # Merge dicts by key
-        batch = {key: [item[key] for item in batch] for key in batch[0].keys()}
+    def __init__(
+        self,
+        dataset,
+        tokenizer,
+        min_span_length: int,
+        max_span_length: int,
+        num_anchors: int,
+        num_positives: int,
+        seed: Optional[int] = None,
+    ):
+        assert hasattr(dataset, "__len__") and hasattr(dataset, "__getitem__")
+        self.ds = dataset
+        self.N = len(dataset)
+        assert self.N > 0
+        assert min_span_length < max_span_length
 
-        # Pad decoder input ids
-        input_ids_dec = dec_tokenizer.pad(
-            {"input_ids": batch["input_ids_dec"]},
-            padding=True,
-            return_tensors="pt",
-            return_attention_mask=False,
-        )["input_ids"]
-        info_mask_dec = pad_sequence(
-            batch["info_mask_dec"], batch_first=True, padding_value=InfoLabel.PAD.value
+        self.min_span_length = min_span_length
+        self.max_span_length = max_span_length
+        self.num_anchors = num_anchors
+        self.num_positives = num_positives
+        self.seed = seed
+        self.tok = tokenizer
+
+    def _make_generator(self) -> random.Random:
+        # DDP rank
+        if torch.distributed.is_available() and torch.distributed.is_initialized():
+            rank = torch.distributed.get_rank()
+        else:
+            rank = 0
+
+        # DataLoader worker id
+        wi = get_worker_info()
+        wid = wi.id if wi is not None else 0
+
+        base = self.seed
+        if base is None:
+            base = int.from_bytes(os.urandom(8), "little", signed=False)
+
+        # mix base seed with rank + worker to get independent streams
+        mixed = (
+            int(base)
+            ^ (0x9E3779B97F4A7C15 * (rank + 1))
+            ^ (0xBF58476D1CE4E5B9 * (wid + 1))
+        ) & ((1 << 63) - 1)
+
+        generator = random.Random(mixed)
+        return generator
+
+    @classmethod
+    def get_dataloader(
+        cls: "DeCLUTRIterable",
+        dataset: Dataset,
+        tokenizer: PreTrainedTokenizerFast,
+        batch_size: int,
+        min_span_length: int,
+        max_span_length: int,
+        num_anchors: int,
+        num_positives: int,
+        seed: int = 32,
+    ) -> DataLoader:
+        # Make the collation function
+        def collate_fn(batch):
+            # Merge dicts by key
+            concat_batch = {}
+            for key in batch[0].keys():
+                concat_batch[key] = []
+                for item in batch:
+                    concat_batch[key].extend(item[key])
+
+            concat_batch["anchor_ids"] = pad_sequence(
+                concat_batch["anchor_ids"],
+                batch_first=True,
+                padding_value=tokenizer.pad_token_id,
+            )
+            concat_batch["positive_ids"] = pad_sequence(
+                concat_batch["positive_ids"],
+                batch_first=True,
+                padding_value=tokenizer.pad_token_id,
+            )
+
+            out = {
+                "anchor_ids": concat_batch["anchor_ids"],
+                "positive_ids": concat_batch["positive_ids"],
+            }
+            return out
+
+        iterable = cls(
+            dataset,
+            tokenizer=tokenizer,
+            min_span_length=min_span_length,
+            max_span_length=max_span_length,
+            num_anchors=num_anchors,
+            num_positives=num_positives,
+            seed=seed,
         )
 
-        out = {
-            "input_ids_dec": input_ids_dec,
-            "info_mask_dec": info_mask_dec,
-            "prefix_str": batch["prefix_str"],
-            "suffix_str": batch["suffix_str"],
-        }
+        return DataLoader(
+            iterable,
+            batch_size=batch_size,
+            collate_fn=collate_fn,
+            num_workers=int(os.environ.get("TORCH_NUM_WORKERS", 1)),
+            persistent_workers=False,
+            prefetch_factor=2,
+            pin_memory=False,
+        )
 
-        if "input_ids_enc" in batch.keys():
-            batch_enc = enc_tokenizer.pad(
-                {"input_ids": batch["input_ids_enc"]},
-                padding=True,
-                return_tensors="pt",
-                return_attention_mask=True,
-            )
+    def __iter__(self):
+        generator = self._make_generator()
 
-            out.update(
-                {
-                    "input_ids_enc": batch_enc["input_ids"],
-                    "attention_mask_enc": batch_enc["attention_mask"],
+        while True:
+            # Sample a random document
+            idx = generator.randint(0, self.N - 1)
+            input_ids = self.tok.encode(self.ds[idx])
+            seq_length = len(input_ids)
+
+            # Only consider documents with enough length
+
+            if seq_length >= self.num_anchors * self.max_span_length * 2:
+                anchors, positives = [], []
+                valid_anchor_starts = list(
+                    range(
+                        0, seq_length - self.max_span_length + 1, self.max_span_length
+                    )
+                )
+
+                # Sample anchors
+                for i in range(self.num_anchors):
+                    anchor_len = int(
+                        generator.betavariate(4, 2)
+                        * (self.max_span_length - self.min_span_length)
+                        + self.min_span_length
+                    )
+                    # This check prevents an edge case were we run out of valid_anchor_starts.
+                    if (
+                        len(valid_anchor_starts) // (self.num_anchors - i)
+                        < self.num_anchors - i
+                    ):
+                        anchor_start_idx = generator.choice(
+                            [0, len(valid_anchor_starts) - 1]
+                        )
+                    else:
+                        anchor_start_idx = generator.randrange(
+                            0, len(valid_anchor_starts)
+                        )
+                    # When num_anchors = 1, this is equivalent to uniformly sampling that starting position.
+                    anchor_start = generator.randint(
+                        valid_anchor_starts[anchor_start_idx],
+                        valid_anchor_starts[anchor_start_idx]
+                        + self.max_span_length
+                        - anchor_len,
+                    )
+                    # Once sampled, remove an anchor (and its immediate neighbours) from consideration.
+                    del valid_anchor_starts[
+                        max(0, anchor_start_idx - 1) : anchor_start_idx + 2
+                    ]
+                    anchor_end = anchor_start + anchor_len
+                    anchors.append(input_ids[anchor_start:anchor_end])
+
+                    # For each anchor, sample positives
+
+                    for _ in range(self.num_positives):
+
+                        # Sample positive length from a beta distribution skewed towards shorter spans. The
+                        # idea is to promote diversity and minimize the amount of overlapping text.
+                        positive_len = int(
+                            generator.betavariate(2, 4)
+                            * (self.max_span_length - self.min_span_length)
+                            + self.min_span_length
+                        )
+                        # By default, spans may be adjacent or overlap with each other and the anchor.
+                        # Careful not to run off the edges of the document (this error may pass silently).
+                        positive_start = generator.randint(
+                            max(0, anchor_start - positive_len),
+                            min(anchor_end, seq_length - positive_len),
+                        )
+
+                        positive_end = positive_start + positive_len
+                        positives.append(input_ids[positive_start:positive_end])
+
+                out_dict = {
+                    "anchor_ids": [torch.LongTensor(a) for a in anchors],
+                    "positive_ids": [torch.LongTensor(p) for p in positives],
                 }
-            )
-        return out
 
-    iterable = PrefixSuffixIterable(
-        dataset,
-        dec_tok=dec_tokenizer,
-        enc_tok=enc_tokenizer,
-        prefix_length=prefix_length,
-        suffix_length=suffix_length,
-        context_length=context_length,
-        encoder_mode=encoder_mode,
-        encoder_noise=encoder_noise,
-        seed=seed,
-        num_dlc_ph=num_dlc_ph,
-    )
-
-    return DataLoader(
-        iterable,
-        batch_size=batch_size,
-        collate_fn=collate_fn,
-        num_workers=int(os.environ.get("TORCH_NUM_WORKERS", 1)),
-        persistent_workers=False,
-        prefetch_factor=2,
-        pin_memory=False,
-    )
+                yield out_dict

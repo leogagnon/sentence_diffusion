@@ -1,26 +1,12 @@
-from abc import ABC, abstractmethod
-from functools import partial
-import math
-import os
-import einx
-from peft.mapping_func import get_peft_model
-import torch.nn as nn
 from dataclasses import dataclass
-from typing import Optional
-from sentence_transformers import SentenceTransformer
-from transformers.models.auto.modeling_auto import AutoModelForCausalLM
-from transformers.models.auto.tokenization_auto import AutoTokenizer
-from transformers import GPT2TokenizerFast
-from x_transformers import Encoder
-from x_transformers.x_transformers import AttentionLayers, ScaledSinusoidalEmbedding
+from typing import List, Optional
+
 import torch
-from typing import Optional, Union, List
-from einops import rearrange
-from torch.nn import ModuleDict
-from tokenizers.processors import TemplateProcessing
+import torch.nn as nn
 from lightning.pytorch.utilities.rank_zero import rank_zero_info
-from transformers import GenerationConfig, GPT2LMHeadModel, GPT2Config
-from copy import deepcopy
+from transformers import (GenerationConfig, GPT2Config, GPT2LMHeadModel,
+                          GPT2TokenizerFast)
+from transformers.models.auto.modeling_auto import AutoModelForCausalLM
 
 
 @dataclass

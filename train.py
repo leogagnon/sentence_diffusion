@@ -1,23 +1,25 @@
 import torch
+
 torch._dynamo.config.capture_scalar_outputs = True
 
 import argparse
 import os
-from dataclasses import dataclass, fields
-from typing import Any, List, Optional
+from dataclasses import dataclass
+from typing import Optional
+
 import hydra
 import lightning as L
 import wandb
 from hydra.core.config_store import ConfigStore
-from lightning.pytorch.loggers import WandbLogger
-from omegaconf import MISSING, DictConfig, OmegaConf, SCMode
+from lightning.pytorch.utilities.rank_zero import (rank_zero_info,
+                                                   rank_zero_only)
+from omegaconf import OmegaConf, SCMode
+from transformers.utils import logging
+
 from tasks.autoencoder import AETask, AETaskConfig
+from tasks.declutr import DeCLUTRTask, DeCLUTRTaskConfig
 from tasks.dlc_ar import DLCARTask, DLCARTaskConfig
 from tasks.dlc_md import DLCMDTask, DLCMDTaskConfig
-from lightning.pytorch.callbacks import EarlyStopping
-from lightning.pytorch.utilities.rank_zero import rank_zero_info, rank_zero_only
-import warnings
-from transformers.utils import logging
 
 logging.set_verbosity_error()
 torch.set_float32_matmul_precision("medium")
@@ -27,8 +29,8 @@ os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
 os.environ["PYTHONFAULTHANDLER"] = "1"
 os.environ["TORCH_SHOW_CPP_STACKTRACES"] = "1"
 os.environ["HYDRA_FULL_ERROR"] = "1"
-#os.environ["NCCL_DEBUG"] = "INFO"
-#os.environ["TORCH_DISTRIBUTED_DEBUG"] = "DETAIL"
+# os.environ["NCCL_DEBUG"] = "INFO"
+# os.environ["TORCH_DISTRIBUTED_DEBUG"] = "DETAIL"
 os.environ["TORCH_NCCL_ASYNC_ERROR_HANDLING"] = "1"
 os.environ["TORCH_DISABLE_ADDR2LINE"] = "1"
 os.environ["TORCH_FR_BUFFER_SIZE"] = "1024"
@@ -37,6 +39,7 @@ os.environ["TORCH_FR_BUFFER_SIZE"] = "1024"
 @dataclass
 class TaskConfig:
     ae: Optional[AETaskConfig] = None
+    declutr: Optional[DeCLUTRTaskConfig] = None
     dlc_ar: Optional[DLCARTaskConfig] = None
     dlc_md: Optional[DLCMDTaskConfig] = None
 
@@ -158,6 +161,9 @@ def main(cfg: Optional[TrainConfig] = None, run_id: Optional[str] = None):
     elif cfg.task.ae != None:
         task = AETask(cfg.task.ae)
         cfg.task.ae = task.cfg
+    elif cfg.task.declutr != None:
+        task = DeCLUTRTask(cfg.task.declutr)
+        cfg.task.declutr = task.cfg
     else:
         raise ValueError("No task specified in config!")
 
