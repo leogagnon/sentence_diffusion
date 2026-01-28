@@ -44,6 +44,7 @@ class LanguageDataset(Dataset):
             self.dataset = load_dataset(
                 "HuggingFaceFW/fineweb", name="sample-100BT", split="train"
             )
+            self.dataset = self.dataset.select_columns(["text", "token_count"])
         elif cfg.name == "owt":
             self.dataset = load_dataset("Skylion007/openwebtext", split="train")
         elif cfg.name == "wiki":
@@ -61,9 +62,12 @@ class LanguageDataset(Dataset):
 
     def __len__(self):
         return len(self.dataset)
+    
+    def __getitems__(self, indices):
+        return self.dataset[indices]
 
     def __getitem__(self, idx):
-        return self.dataset[int(idx)]["text"]
+        return self.dataset[int(idx)]
 
 
 class SpanPoissonMasker:
@@ -552,22 +556,29 @@ class DeCLUTRIterable(IterableDataset):
             collate_fn=collate_fn,
             num_workers=int(os.environ.get("TORCH_NUM_WORKERS", 1)),
             persistent_workers=False,
-            prefetch_factor=2,
-            pin_memory=False,
+            prefetch_factor=8,
+            pin_memory=True,
         )
 
     def __iter__(self):
         generator = self._make_generator()
 
         while True:
-            # Sample a random document
-            idx = generator.randint(0, self.N - 1)
-            input_ids = self.tok.encode(self.ds[idx])
-            seq_length = len(input_ids)
+            # Sample a batch of 1024 random documents for I/O efficiency
+            indices = generator.choices(range(self.N), k=1024)
+            item_batch = self.ds.dataset.dataset[indices]
+            input_ids_batch = self.tok.batch_encode_plus(
+                item_batch["text"], add_special_tokens=False, return_attention_mask=False
+            )["input_ids"]
 
-            # Only consider documents with enough length
+            for i in range(1024):
 
-            if seq_length >= self.num_anchors * self.max_span_length * 2:
+                input_ids = input_ids_batch[i]
+                seq_length = len(input_ids)
+
+                if seq_length < self.num_anchors * self.max_span_length * 2:
+                    continue
+
                 anchors, positives = [], []
                 valid_anchor_starts = list(
                     range(

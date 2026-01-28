@@ -405,7 +405,8 @@ class DiTModel(nn.Module):
         if self.cfg.noise_removal:
             t = timesteps[-1] * torch.ones(x.shape[0], 1, device=device)
             unet_conditioning = self.noise(t)[0]
-            x = self.forward(x, unet_conditioning).argmax(dim=-1)
+            x_ = self.forward(x, unet_conditioning).argmax(dim=-1)
+            x = torch.where(frozen_mask, x, x_)
         return x
 
     def compute_loss(self, x0, attention_mask, cond_mask=None):

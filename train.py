@@ -180,23 +180,26 @@ def main(cfg: Optional[TrainConfig] = None, run_id: Optional[str] = None):
     num_devices = (
         cfg.num_devices if cfg.num_devices != None else torch.cuda.device_count()
     )
+
+    ddp_batch_size = task.cfg.batch_size * num_devices
+
     if cfg.effective_batch_size is None:
         accumulate_grad_batches = 1
+        cfg.effective_batch_size = ddp_batch_size
     else:
-        ddp_batch_size = task.cfg.batch_size * num_devices
         assert (
-            cfg.effective_batch_size % ddp_batch_size == 0
+        cfg.effective_batch_size % ddp_batch_size == 0
         ), f"Effective batch size ({cfg.effective_batch_size}) must be a multiple of effective ddp batch_size ({ddp_batch_size})"
         accumulate_grad_batches = cfg.effective_batch_size // ddp_batch_size
-
+        
         # just makin sure
         assert (
             accumulate_grad_batches * task.cfg.batch_size * num_devices
             == cfg.effective_batch_size
         )
-        rank_zero_info(
-            f"Running with {num_devices} devices, batch size {task.cfg.batch_size} per device, accumulating {accumulate_grad_batches} steps to reach effective batch size {cfg.effective_batch_size}"
-        )
+    rank_zero_info(
+        f"Running with {num_devices} devices, batch size {task.cfg.batch_size} per device, accumulating {accumulate_grad_batches} steps to reach effective batch size {cfg.effective_batch_size}"
+    )
 
     # Instantiate the trainer
     trainer = L.Trainer(

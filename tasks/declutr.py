@@ -148,14 +148,14 @@ class DeCLUTRTask(L.LightningModule):
             input_ids=batch["anchor_ids"],
             attention_mask=(
                 batch["anchor_ids"] != self.encoder.tokenizer.pad_token_id
-            ).float(),
+            ).long(),
             return_count=True,
         )
         z_positives, _ = self.encoder(
             input_ids=batch["positive_ids"],
             attention_mask=(
                 batch["positive_ids"] != self.encoder.tokenizer.pad_token_id
-            ).float(),
+            ).long(),
         )
         z_positives = einx.rearrange(
             "(b p) d -> b p d", z_positives, p=self.cfg.num_positives
@@ -169,7 +169,6 @@ class DeCLUTRTask(L.LightningModule):
             z_positives = einx.rearrange(
                 "w b d -> (w b) d", self.all_gather(z_positives, sync_grads=True)
             )
-            print(z_anchors.shape, z_positives.shape)
 
         loss = self.loss(z_anchors, z_positives)
         self.log("train/loss", loss, on_step=True, on_epoch=False, sync_dist=True)
@@ -185,15 +184,15 @@ class DeCLUTRTask(L.LightningModule):
             z_anchors, _ = self.encoder(
                 input_ids=batch["anchor_ids"],
                 attention_mask=(
-                    batch["anchor_mask"] != self.encoder.tokenizer.pad_token_id
-                ).float(),
+                    batch["anchor_ids"] != self.encoder.tokenizer.pad_token_id
+                ).long(),
                 temp=sem_temp,
             )
             z_positives, _ = self.encoder(
                 input_ids=batch["positive_ids"],
                 attention_mask=(
-                    batch["positive_mask"] != self.encoder.tokenizer.pad_token_id
-                ).float(),
+                    batch["positive_ids"] != self.encoder.tokenizer.pad_token_id
+                ).long(),
                 temp=sem_temp,
             )
             z_positives = einx.rearrange(
@@ -207,7 +206,6 @@ class DeCLUTRTask(L.LightningModule):
                 z_positives = einx.rearrange(
                     "w b d -> (w b) d", self.all_gather(z_positives, sync_grads=False)
                 )
-                print(z_anchors.shape, z_positives.shape)
 
             # NTXent loss
             loss = self.loss(z_anchors, z_positives)

@@ -4,7 +4,7 @@ lr_warmup_steps: 500
 
 encoder:
   model_name: FacebookAI/roberta-large
-  train_backbone: false
+  train_backbone: true
   latent_length: 1
   latent_dim: 1024
   sem: 
@@ -18,8 +18,8 @@ dataset:
   val_size: 16384
   seed: 42
 
-min_span_length: 32
-max_span_length: 512
+min_span_length: 256
+max_span_length: 257
 num_anchors: 2
 num_positives: 2
 
