@@ -17,7 +17,6 @@ class SEMHeadConfig:
     V: int
     temp: float
     input_dim: Optional[int] = None
-    logit_noise: bool = False
 
 
 class SEMHead(nn.Module):
@@ -29,10 +28,7 @@ class SEMHead(nn.Module):
 
         assert cfg.input_dim is not None, "input_dim has to be set"
         self.proj_in = nn.Linear(cfg.input_dim, cfg.L * cfg.V, bias=False)
-        if cfg.logit_noise:
-            self.norm = nn.LayerNorm((cfg.V,), elementwise_affine=False)
-        else:
-            self.norm = nn.LayerNorm((cfg.L, cfg.V))
+        self.norm = nn.LayerNorm((cfg.L, cfg.V))
 
         self.cfg = cfg
 
@@ -259,6 +255,7 @@ class EncoderConfig:
     latent_dim: Optional[int] = None
     sem: Optional[dict] = None
     train_backbone: bool = True
+    mlp_proj: bool = False
 
 
 class EncoderModel(nn.Module):
@@ -327,15 +324,30 @@ class EncoderModel(nn.Module):
 
         # Initialize SEM/output projection
         if cfg.sem is None:
-            self.out_proj = nn.Linear(
-                backbone_dim, cfg.latent_length * cfg.latent_dim, bias=False
-            )
+            dim_0 = backbone_dim
         else:
             cfg.sem["input_dim"] = backbone_dim
             self.sem = hydra.utils.instantiate(cfg.sem)
             self.sem: SEMHead | HSEMHead
+            dim_0 = self.sem.out_dim
+
+        # Build projection head
+        dim_1 = cfg.latent_length * cfg.latent_dim
+        if cfg.mlp_proj:
+            self.out_proj = nn.Sequential(
+                nn.Linear(dim_0, 1024, bias=True),
+                nn.ReLU(),
+                nn.Linear(
+                    1024,
+                    dim_1,
+                    bias=False,
+                ),
+            )
+        else:
             self.out_proj = nn.Linear(
-                self.sem.out_dim, cfg.latent_length * cfg.latent_dim, bias=False
+                dim_0,
+                dim_1,
+                bias=False,
             )
 
         self.cfg = cfg

@@ -14,6 +14,7 @@ from data import DeCLUTRIterable, LanguageDataset, LanguageDatasetConfig
 from model.encoder import EncoderConfig, EncoderModel
 from tasks.utils import *
 import torch.distributed as dist
+from pytorch_metric_learning.losses import NTXentLoss
 
 
 @dataclass
@@ -37,6 +38,7 @@ class DeCLUTRTaskConfig:
     max_span_length: int = 64
     num_anchors: int = 2
     num_positives: int = 2
+    loss_temp: float = 0.05
     sem_reset_config: SEMResetConfig = field(default_factory=SEMResetConfig)
 
     name: Optional[str] = None
@@ -65,14 +67,25 @@ class DeCLUTRTask(L.LightningModule):
         # To not eval MAUVE every validation step
         self.val_epoch_counter = 0
 
-        # NTXent loss
-        self.loss = NTXentLoss(temperature=0.05)
+        self.loss_fn = NTXentLoss(temperature=cfg.loss_temp)
 
         self.cfg = cfg
 
         self.save_hyperparameters(
             OmegaConf.to_container(OmegaConf.structured(cfg)), logger=False
         )
+
+    def compute_loss(self, anchors, positives):
+        # Format inputs for NTXentLoss (all embeddings, matching labels for positive pairs)
+        embeddings = torch.cat((anchors, positives), dim=0)
+        labels = torch.arange(
+            anchors.size(0), device=anchors.device, dtype=torch.long
+        ).repeat(2)
+
+        # Compute NTXent loss
+        loss = self.loss_fn(embeddings, labels)
+
+        return loss
 
     def compile(self):
         if self.encoder is not None:
@@ -94,7 +107,7 @@ class DeCLUTRTask(L.LightningModule):
                     for n, p in self.encoder.named_parameters()
                     if not any(nd in n.lower() for nd in no_decay)
                 ],
-                "weight_decay": 0.05,
+                "weight_decay": 0.1,
             },
             {
                 "params": [
@@ -157,6 +170,7 @@ class DeCLUTRTask(L.LightningModule):
                 batch["positive_ids"] != self.encoder.tokenizer.pad_token_id
             ).long(),
         )
+        # Group positives from the same anchor together and average their embeddings
         z_positives = einx.rearrange(
             "(b p) d -> b p d", z_positives, p=self.cfg.num_positives
         ).mean(dim=1)
@@ -170,7 +184,7 @@ class DeCLUTRTask(L.LightningModule):
                 "w b d -> (w b) d", self.all_gather(z_positives, sync_grads=True)
             )
 
-        loss = self.loss(z_anchors, z_positives)
+        loss = self.compute_loss(z_anchors, z_positives)
         self.log("train/loss", loss, on_step=True, on_epoch=False, sync_dist=True)
 
         self.sem_usage_ema.update(sem_out["usage_count"], batch_size=z_anchors.shape[0])
@@ -181,13 +195,28 @@ class DeCLUTRTask(L.LightningModule):
 
         for sem_temp, label in zip([1e-4, None], ["hard", "soft"]):
 
-            z_anchors, _ = self.encoder(
+            z_anchors, sem_out = self.encoder(
                 input_ids=batch["anchor_ids"],
                 attention_mask=(
                     batch["anchor_ids"] != self.encoder.tokenizer.pad_token_id
                 ).long(),
                 temp=sem_temp,
             )
+            if "probs" in sem_out.keys():
+                ent, m_ent = sem_entropy(sem_out["probs"])
+                self.log(
+                    "val/sem_entropy",
+                    ent.item(),
+                    on_epoch=True,
+                    sync_dist=True,
+                )
+                self.log(
+                    "val/sem_marginal_entropy",
+                    m_ent.item(),
+                    on_epoch=True,
+                    sync_dist=True,
+                )
+
             z_positives, _ = self.encoder(
                 input_ids=batch["positive_ids"],
                 attention_mask=(
@@ -208,7 +237,7 @@ class DeCLUTRTask(L.LightningModule):
                 )
 
             # NTXent loss
-            loss = self.loss(z_anchors, z_positives)
+            loss = self.compute_loss(z_anchors, z_positives)
             self.log(
                 f"val/loss_{label}", loss, on_step=False, on_epoch=True, sync_dist=True
             )

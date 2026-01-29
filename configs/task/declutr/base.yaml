@@ -1,5 +1,5 @@
 batch_size: 32
-lr: 2e-4
+lr: 5e-5
 lr_warmup_steps: 500
 
 encoder:
@@ -7,6 +7,7 @@ encoder:
   train_backbone: true
   latent_length: 1
   latent_dim: 1024
+  mlp_proj: true
   sem: 
     _target_: model.encoder.SEMHead
     L: 512
@@ -18,9 +19,10 @@ dataset:
   val_size: 16384
   seed: 42
 
-min_span_length: 256
-max_span_length: 257
+min_span_length: 64
+max_span_length: 300
 num_anchors: 2
 num_positives: 2
+loss_temp: 0.05
 
-name: base_declutr
+name: base/declutr

@@ -347,8 +347,8 @@ class PrefixSuffixIterable(IterableDataset):
             collate_fn=collate_fn,
             num_workers=int(os.environ.get("TORCH_NUM_WORKERS", 1)),
             persistent_workers=False,
-            prefetch_factor=2,
-            pin_memory=False,
+            prefetch_factor=8,
+            pin_memory=True,
         )
 
     def __iter__(self):
@@ -356,13 +356,19 @@ class PrefixSuffixIterable(IterableDataset):
 
         while True:
             # Sample a random document
-            idx = generator.randint(0, self.N - 1)
-            input_str = self.ds[idx]
-            input_ids_dec = self.dec_tok.encode(input_str)
-            seq_length = len(input_ids_dec)
+            indices = generator.choices(range(self.N), k=1024)
+            item_batch = self.ds.dataset.dataset[indices]
+            input_ids_batch = self.dec_tok.batch_encode_plus(
+                item_batch["text"], add_special_tokens=False, return_attention_mask=False
+            )["input_ids"]
 
-            # Only consider documents with enough length
-            if seq_length >= self.total_length:
+            for i in range(1024):
+                input_ids_dec = input_ids_batch[i]
+
+                # Only consider documents with enough length
+                seq_length = len(input_ids_dec)
+                if seq_length < self.total_length:
+                    continue
 
                 # Sample a random window
                 window_start = generator.randint(0, seq_length - self.total_length)
