@@ -15,6 +15,7 @@ from transformers.models.auto.modeling_auto import AutoModelForCausalLM
 from data import (InfoLabel, LanguageDataset, LanguageDatasetConfig,
                   PrefixSuffixIterable)
 from model.diffusion import DiTConfig, DiTModel
+from tasks.declutr import DeCLUTRTask
 from tasks.autoencoder import AETask
 from tasks.utils import *
 
@@ -25,16 +26,17 @@ class DLCMDTaskConfig:
     lr_warmup_steps: int
     batch_size: int
     dit: DiTConfig
-    dataset: LanguageDatasetConfig
+    
     eval_gen_ppl: bool
     val_batch_size: Optional[int] = None
 
+    dataset: Optional[LanguageDatasetConfig] = None
+    pretrained_declutr_id: Optional[str] = None
     pretrained_ae_id: Optional[str] = None
 
     prefix_length: Optional[int] = None
     suffix_length: Optional[int] = None
     context_length: Optional[int] = None
-    encoder_mode: Optional[str] = None
 
     name: Optional[str] = None
 
@@ -60,7 +62,7 @@ class DLCMDTask(L.LightningModule):
         self.encoder = None
         if cfg.pretrained_ae_id is not None:
 
-            ae_task = AETask.load_from_checkpoint(
+            task = AETask.load_from_checkpoint(
                 os.path.join(
                     os.environ["LOG_DIR"],
                     "checkpoints/",
@@ -72,21 +74,43 @@ class DLCMDTask(L.LightningModule):
             )
 
             # Sync configs
-            assert ae_task.cfg.dataset == cfg.dataset
-            cfg.prefix_length = ae_task.cfg.prefix_length
-            cfg.suffix_length = ae_task.cfg.suffix_length
-            cfg.context_length = ae_task.cfg.context_length
-            cfg.encoder_mode = ae_task.cfg.encoder_mode
+            cfg.dataset = task.cfg.dataset
+            cfg.prefix_length = task.cfg.prefix_length
+            cfg.suffix_length = task.cfg.suffix_length
+            cfg.context_length = task.cfg.context_length
 
-            self.encoder = ae_task.encoder.eval().requires_grad_(False)
+            self.encoder = task.encoder.eval().requires_grad_(False)
 
             # Set DLC params in decoder config
+            cfg.dit.dlc_vocab_size = self.encoder.sem.cfg.V
+            cfg.dit.dlc_len = self.encoder.sem.dlc_len
+
+        elif cfg.pretrained_declutr_id is not None:
+            
+            task = DeCLUTRTask.load_from_checkpoint(
+                os.path.join(
+                    os.environ["LOG_DIR"],
+                    "checkpoints/",
+                    cfg.pretrained_declutr_id,
+                    "last.ckpt",
+                ),
+                strict=False,
+                map_location=torch.device("cpu"),
+            )
+
+            # Sync configs
+            cfg.dataset = task.cfg.dataset
+            assert cfg.prefix_length is not None
+            assert cfg.suffix_length is not None
+            assert cfg.context_length is not None
+
+            self.encoder = task.encoder.eval().requires_grad_(False)
+
             cfg.dit.dlc_vocab_size = self.encoder.sem.cfg.V
             cfg.dit.dlc_len = self.encoder.sem.dlc_len
         else:
             assert cfg.prefix_length is not None
             assert cfg.suffix_length is not None
-            cfg.encoder_mode = "none"
             cfg.context_length = 0
 
         # Create decoder            
@@ -103,6 +127,13 @@ class DLCMDTask(L.LightningModule):
             ]
             self.ppl_tok = AutoTokenizer.from_pretrained("meta-llama/Llama-3.2-3B")
             self.ppl_tok.pad_token = self.ppl_tok.eos_token
+
+        self.encoder_mode = "none"
+        if self.encoder is not None:
+            if cfg.context_length > 0:
+                self.encoder_mode = "context"
+            else:
+                self.encoder_mode = "suffix"
 
         # To not eval MAUVE every validation step
         self.val_epoch_counter = 0
@@ -172,7 +203,7 @@ class DLCMDTask(L.LightningModule):
             context_length=self.cfg.context_length,
             enc_tok=self.encoder.tokenizer if self.encoder is not None else None,
             dec_tok=self.dit.tokenizer,
-            encoder_mode=self.cfg.encoder_mode,
+            encoder_mode=self.encoder_mode,
             encoder_noise=False,  # No noise during DLC-LM finetuning
             seed=random.randint(0, 100000),  # Dataset should be different if restarted,
             num_dlc_ph=self.encoder.sem.dlc_len if self.encoder is not None else 0,
@@ -191,7 +222,7 @@ class DLCMDTask(L.LightningModule):
             enc_tok=self.encoder.tokenizer if self.encoder is not None else None,
             context_length=self.cfg.context_length,
             dec_tok=self.dit.tokenizer,
-            encoder_mode=self.cfg.encoder_mode,
+            encoder_mode=self.encoder_mode,
             encoder_noise=False,
             seed=42,  # Always the same validation set for consistency,
             num_dlc_ph=self.encoder.sem.dlc_len if self.encoder is not None else 0,

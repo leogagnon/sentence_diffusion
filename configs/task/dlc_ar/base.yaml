@@ -6,9 +6,14 @@ decoder:
   cross_attention: false
   attn_implem: sdpa
 
-dataset: fineweb
 eval_gen_ppl: true
-pretrained_ae_id: 7x22772a
+
+#pretrained_ae_id: 7x22772a
+pretrained_declutr_id: bll8h3yb
 DLC_dropout: 0.0
+
+prefix_length: 16
+suffix_length: 128
+context_length: 256
 
 name: ae_base

@@ -1,13 +1,15 @@
 task/declutr: base
 model_checkpoint: base
 task.declutr.batch_size: 32
+task.declutr.lr_warmup_steps: 1000
 
-task.declutr.encoder.mlp_proj: true, false
+task.declutr.sem_noise: 0.05
+task.declutr.encoder.sem.L: 512
 
 max_steps: 20000
 
 limit_val_batches: 4
 val_check_interval: 256
 
-sweep_id: declutr/out_proj
+sweep_id: declutr/noise
 

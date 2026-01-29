@@ -1,5 +1,5 @@
-lr: 3e-4
-lr_warmup_steps: 500
+lr: 2e-4
+lr_warmup_steps: 1000
 batch_size: 64
 val_batch_size: 32
 
@@ -10,10 +10,14 @@ dit:
   nucleus_p: 0.9  
   sampling_eps: 1e-3 
 
-dataset: fineweb
+dataset:
+  name: fineweb
+  val_size: 16384
+  seed: 42
+  
 eval_gen_ppl: true
 
 prefix_length: 16
-suffix_length: 64 
+suffix_length: 128 
 
 name: md_baseline

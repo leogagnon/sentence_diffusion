@@ -1,15 +1,19 @@
 lr: 2e-4
-lr_warmup_steps: 500
+lr_warmup_steps: 1000
 batch_size: 32
 decoder:
   name: gpt2-medium # 1.5B params
   cross_attention: false
   attn_implem: sdpa
 
-dataset: fineweb
 eval_gen_ppl: true
 
+dataset:
+  name: fineweb
+  val_size: 16384
+  seed: 42
+
 prefix_length: 16
-suffix_length: 64 
+suffix_length: 128 
 
 name: ar_baseline

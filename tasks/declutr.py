@@ -7,7 +7,7 @@ import lightning as L
 import torch
 from lightning.pytorch.utilities.rank_zero import rank_zero_only
 from torch.utils.data.dataset import Subset
-from transformers import get_constant_schedule_with_warmup
+from transformers import get_cosine_schedule_with_warmup
 from omegaconf import OmegaConf
 
 from data import DeCLUTRIterable, LanguageDataset, LanguageDatasetConfig
@@ -39,6 +39,7 @@ class DeCLUTRTaskConfig:
     num_anchors: int = 2
     num_positives: int = 2
     loss_temp: float = 0.05
+    sem_noise: float = 0.0
     sem_reset_config: SEMResetConfig = field(default_factory=SEMResetConfig)
 
     name: Optional[str] = None
@@ -120,8 +121,8 @@ class DeCLUTRTask(L.LightningModule):
         ]
         optimizer = torch.optim.AdamW(optimizer_grouped_parameters, lr=self.cfg.lr)
         if self.cfg.lr_warmup_steps > 0:
-            scheduler = get_constant_schedule_with_warmup(
-                optimizer, num_warmup_steps=self.cfg.lr_warmup_steps
+            scheduler = get_cosine_schedule_with_warmup(
+                optimizer, num_warmup_steps=self.cfg.lr_warmup_steps, num_training_steps=20000
             )
             scheduler = {"scheduler": scheduler, "interval": "step", "frequency": 1}
 
@@ -163,12 +164,14 @@ class DeCLUTRTask(L.LightningModule):
                 batch["anchor_ids"] != self.encoder.tokenizer.pad_token_id
             ).long(),
             return_count=True,
+            noise=self.cfg.sem_noise
         )
         z_positives, _ = self.encoder(
             input_ids=batch["positive_ids"],
             attention_mask=(
                 batch["positive_ids"] != self.encoder.tokenizer.pad_token_id
             ).long(),
+            noise=self.cfg.sem_noise
         )
         # Group positives from the same anchor together and average their embeddings
         z_positives = einx.rearrange(

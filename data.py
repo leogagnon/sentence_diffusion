@@ -14,7 +14,6 @@ from torch.utils.data.dataset import Dataset
 from transformers import PreTrainedTokenizerFast
 
 
-
 class InfoLabel(Enum):
     SUFFIX = 0
     DLC = 1
@@ -62,7 +61,7 @@ class LanguageDataset(Dataset):
 
     def __len__(self):
         return len(self.dataset)
-    
+
     def __getitems__(self, indices):
         return self.dataset[indices]
 
@@ -74,6 +73,7 @@ class SpanPoissonMasker:
     """
     Classic span masker based on Poisson distribution. Each masked span is replaced by a single mask token.
     """
+
     def __init__(
         self,
         mask_id: int,
@@ -243,6 +243,10 @@ class PrefixSuffixIterable(IterableDataset):
             assert (
                 self.context_length > 0
             ), "If encoding the context, must have context length >0"
+        else:
+            assert (
+                self.context_length == 0
+            ), "If not encoding the context, context length must be 0"
         self.encoder_noise = encoder_noise
         if self.encoder_noise:
             self.span_masker = SpanPoissonMasker(mask_id=self.enc_tok.mask_token_id)
@@ -359,7 +363,9 @@ class PrefixSuffixIterable(IterableDataset):
             indices = generator.choices(range(self.N), k=1024)
             item_batch = self.ds.dataset.dataset[indices]
             input_ids_batch = self.dec_tok.batch_encode_plus(
-                item_batch["text"], add_special_tokens=False, return_attention_mask=False
+                item_batch["text"],
+                add_special_tokens=False,
+                return_attention_mask=False,
             )["input_ids"]
 
             for i in range(1024):
@@ -574,7 +580,9 @@ class DeCLUTRIterable(IterableDataset):
             indices = generator.choices(range(self.N), k=1024)
             item_batch = self.ds.dataset.dataset[indices]
             input_ids_batch = self.tok.batch_encode_plus(
-                item_batch["text"], add_special_tokens=False, return_attention_mask=False
+                item_batch["text"],
+                add_special_tokens=False,
+                return_attention_mask=False,
             )["input_ids"]
 
             for i in range(1024):

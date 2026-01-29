@@ -1,8 +1,7 @@
 task/declutr: base
 model_checkpoint: base
 task.declutr.batch_size: 32
-
-task.declutr.encoder.mlp_proj: true, false
+task.declutr.lr_warmup_steps: 1000
 
 max_steps: 20000
 

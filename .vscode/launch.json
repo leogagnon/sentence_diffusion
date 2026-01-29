@@ -13,7 +13,7 @@
             "justMyCode": false,
             "args": [
                 //"--wandb_id=vjf7103x"
-                "task/declutr=base",
+                "task/dlc_md=baseline",
                 //"num_devices=1",
                 //"model_checkpoint=test",
                 //"val_check_interval=20",
