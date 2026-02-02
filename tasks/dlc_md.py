@@ -333,13 +333,14 @@ class DLCMDTask(L.LightningModule):
 
         return ppl.item()
 
+    @torch.amp.autocast("cuda", dtype=torch.float32)
     def validation_step(self, batch, batch_idx):
 
         # Fill DLCs in the batch
         if self.encoder is not None:
             batch = self._fill_DLCs_in_batch(batch)
 
-        if batch_idx == 0:
+        if batch_idx <= 1:
             # Evaluate generative perplexity
             if self.cfg.eval_gen_ppl:
 
@@ -399,7 +400,7 @@ class DLCMDTask(L.LightningModule):
                         sync_dist=True,
                     )
 
-                    if rank_zero_only.rank == 0:
+                    if (rank_zero_only.rank == 0) and (wandb.run is not None):
 
                         prefix_str = batch["prefix_str"][:5]
 

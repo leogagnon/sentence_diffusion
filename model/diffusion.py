@@ -244,6 +244,8 @@ class DiTModel(nn.Module):
                 copy_flag = (x != self.tokenizer.mask_token_id).to(torch.bool)
                 q_xs = torch.where(copy_flag.unsqueeze(-1), q_xs, q_xs_2)
                 xs = sample_categorical(q_xs)
+        else:
+            raise NotImplementedError(f"Unknown sampling mode {self.cfg.sampling_mode}")
 
         # Makes sure that frozen tokens remain unchanged (e.g. by remasking)
         if frozen_mask is not None:
