@@ -7,14 +7,14 @@ task.ae.prefix_length: 16
 task.ae.suffix_length: 64
 task.ae.encoder_mode: suffix
 
-task.ae.denoising: true, false
+task.ae.denoising: true
 task.ae.encoder.train_backbone: true
-task.ae.sem_reset_config.enabled: true
+task.ae.sem_reset_config.enabled: false
 
 max_steps: 20000
 
 limit_val_batches: 4
 val_check_interval: 256
 
-sweep_id: ae/suffix_2
+sweep_id: ae/suffix_3
 

@@ -351,7 +351,7 @@ class PrefixSuffixIterable(IterableDataset):
             collate_fn=collate_fn,
             num_workers=int(os.environ.get("TORCH_NUM_WORKERS", 1)),
             persistent_workers=False,
-            prefetch_factor=8,
+            prefetch_factor=4,
             pin_memory=True,
         )
 

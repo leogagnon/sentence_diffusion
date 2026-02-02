@@ -1,17 +1,17 @@
 lr: 2e-4
 lr_warmup_steps: 1000
-batch_size: 64
+batch_size: 32
 val_batch_size: 32
 
 dit:
   name: kuleshov-group/mdlm-owt
-  sampling_steps: 256
+  sampling_steps: 512
   sampling_mode: remdm-cap  # mdlm, remdm-cap, remdm-loop  
   nucleus_p: 0.9  
   sampling_eps: 1e-3 
 
 eval_gen_ppl: true
-pretrained_declutr_id: bll8h3yb
+pretrained_declutr_id: bqjy99qs
 #pretrained_ae_id: 7x22772a #t6iwcr8a #2ixcxztl 
 
 prefix_length: 16

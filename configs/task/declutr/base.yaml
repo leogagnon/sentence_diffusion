@@ -1,6 +1,6 @@
 batch_size: 32
 lr: 5e-5
-lr_warmup_steps: 500
+lr_warmup_steps: 2000
 
 encoder:
   model_name: FacebookAI/roberta-large
@@ -19,11 +19,11 @@ dataset:
   val_size: 16384
   seed: 42
 
-min_span_length: 64
-max_span_length: 300
+min_span_length: 32
+max_span_length: 256
 num_anchors: 2
 num_positives: 2
 loss_temp: 0.05
-sem_noise: 0.0
+sem_noise: 0.05
 
 name: base/declutr

@@ -3,11 +3,12 @@ model_checkpoint: base
 task.declutr.batch_size: 32
 
 task.declutr.encoder.model_name: FacebookAI/roberta-large-mnli, FacebookAI/roberta-large
+task.declutr.sem_noise: 0.05, 0.0
 
 max_steps: 20000
 
 limit_val_batches: 4
 val_check_interval: 256
 
-sweep_id: declutr/backbone_1
+sweep_id: declutr/good
 

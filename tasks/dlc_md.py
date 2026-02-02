@@ -9,11 +9,10 @@ import wandb
 from lightning.pytorch.utilities.rank_zero import rank_zero_only
 from omegaconf import OmegaConf
 from torch.utils.data.dataset import Subset
-from transformers import (AutoTokenizer, get_constant_schedule_with_warmup)
+from transformers import AutoTokenizer, get_constant_schedule_with_warmup
 from transformers.models.auto.modeling_auto import AutoModelForCausalLM
 
-from data import (InfoLabel, LanguageDataset, LanguageDatasetConfig,
-                  PrefixSuffixIterable)
+from data import InfoLabel, LanguageDataset, LanguageDatasetConfig, PrefixSuffixIterable
 from model.diffusion import DiTConfig, DiTModel
 from tasks.declutr import DeCLUTRTask
 from tasks.autoencoder import AETask
@@ -26,8 +25,9 @@ class DLCMDTaskConfig:
     lr_warmup_steps: int
     batch_size: int
     dit: DiTConfig
-    
+
     eval_gen_ppl: bool
+    ancestral: bool = False
     val_batch_size: Optional[int] = None
 
     dataset: Optional[LanguageDatasetConfig] = None
@@ -86,7 +86,7 @@ class DLCMDTask(L.LightningModule):
             cfg.dit.dlc_len = self.encoder.sem.dlc_len
 
         elif cfg.pretrained_declutr_id is not None:
-            
+
             task = DeCLUTRTask.load_from_checkpoint(
                 os.path.join(
                     os.environ["LOG_DIR"],
@@ -104,7 +104,7 @@ class DLCMDTask(L.LightningModule):
             assert cfg.suffix_length is not None
             assert cfg.context_length is not None
 
-            self.encoder = task.encoder.eval().requires_grad_(False)
+            self.encoder = task.encoder.eval().requires_grad_(False).to(torch.bfloat16)
 
             cfg.dit.dlc_vocab_size = self.encoder.sem.cfg.V
             cfg.dit.dlc_len = self.encoder.sem.dlc_len
@@ -113,7 +113,7 @@ class DLCMDTask(L.LightningModule):
             assert cfg.suffix_length is not None
             cfg.context_length = 0
 
-        # Create decoder            
+        # Create decoder
         self.dit = DiTModel(cfg.dit).train().requires_grad_(True)
 
         # Initialize Generative PPL eval model
@@ -244,23 +244,61 @@ class DLCMDTask(L.LightningModule):
         )
         return batch
 
-
     def training_step(self, batch, batch_idx):
 
         # Fill DLCs in the batch
         if self.encoder is not None:
             batch = self._fill_DLCs_in_batch(batch)
 
-        attention_mask = batch["info_mask_dec"] != InfoLabel.PAD.value
-
-        # Start with prefix and <think> tokens unmasked
+        # Everything is conditional on the prefix and special tokens (never mask those)
         cond_mask = (batch["info_mask_dec"] == InfoLabel.PREFIX.value) + (
             batch["info_mask_dec"] == InfoLabel.SPECIAL.value
         )
-        loss, _, _ = self.dit.compute_loss(
-            batch["input_ids_dec"], attention_mask=attention_mask, cond_mask=cond_mask
-        )
+
+        if self.cfg.ancestral:
+            # Mask the suffix and don't compute loss on it (this trains the DLC sampling)
+            attention_mask_0 = (batch["info_mask_dec"] != InfoLabel.PAD.value) * (
+                batch["info_mask_dec"] != InfoLabel.SUFFIX.value
+            )
+            input_ids_0 = batch["input_ids_dec"].clone()
+            input_ids_0[batch["info_mask_dec"] == InfoLabel.SUFFIX.value] = (
+                self.dit.tokenizer.mask_token_id
+            )
+            cond_mask_0 = cond_mask
+
+            loss_0 = self.dit.compute_loss(
+                input_ids_0,
+                attention_mask=attention_mask_0,
+                cond_mask=cond_mask_0,
+            )
+
+            # Only compute loss on the suffix sampling part
+            attention_mask_1 = batch["info_mask_dec"] == InfoLabel.SUFFIX.value
+            input_ids_1 = batch["input_ids_dec"]
+            cond_mask_1 = cond_mask + (batch["info_mask_dec"] == InfoLabel.DLC.value)
+            loss_1 = self.dit.compute_loss(
+                input_ids_1,
+                attention_mask=attention_mask_1,
+                cond_mask=cond_mask_1,
+            )
+
+            # Merge the losses
+            loss = (loss_0 + loss_1) / 2
+        else:
+            attention_mask = batch["info_mask_dec"] != InfoLabel.PAD.value
+
+            # Start with prefix and <think> tokens unmasked
+            cond_mask = (batch["info_mask_dec"] == InfoLabel.PREFIX.value) + (
+                batch["info_mask_dec"] == InfoLabel.SPECIAL.value
+            )
+            loss = self.dit.compute_loss(
+                batch["input_ids_dec"],
+                attention_mask=attention_mask,
+                cond_mask=cond_mask,
+            )
+
         self.log("train/loss", loss, on_step=True, on_epoch=False, sync_dist=True)
+
         return loss
 
     def eval_ppl(self, prefix_str, suffix_str, device):
@@ -305,29 +343,30 @@ class DLCMDTask(L.LightningModule):
             # Evaluate generative perplexity
             if self.cfg.eval_gen_ppl:
 
-                # p(DLC, suffix | prefix)
-                prior = batch["input_ids_dec"].clone()
-                prior[
-                    (batch["info_mask_dec"] == InfoLabel.SUFFIX.value)
-                    + (batch["info_mask_dec"] == InfoLabel.DLC.value)
-                ] = self.dit.tokenizer.mask_token_id
-                gen_suffix_str_joint = self.dit.tokenizer.batch_decode(
-                    self.dit.sample(
-                        prior=prior,
-                    )[:, -self.cfg.suffix_length :]
-                )
-                ppl_joint = self.eval_ppl(
-                    batch["prefix_str"],
-                    gen_suffix_str_joint,
-                    device=batch["input_ids_dec"].device,
-                )
-                self.log(
-                    "val/gen_ppl",
-                    ppl_joint,
-                    on_epoch=True,
-                    on_step=False,
-                    sync_dist=True,
-                )
+                if not self.cfg.ancestral:
+                    # p(DLC, suffix | prefix)
+                    prior = batch["input_ids_dec"].clone()
+                    prior[
+                        (batch["info_mask_dec"] == InfoLabel.SUFFIX.value)
+                        + (batch["info_mask_dec"] == InfoLabel.DLC.value)
+                    ] = self.dit.tokenizer.mask_token_id
+                    gen_suffix_str_joint = self.dit.tokenizer.batch_decode(
+                        self.dit.sample(
+                            prior=prior,
+                        )[:, -self.cfg.suffix_length :]
+                    )
+                    ppl_joint = self.eval_ppl(
+                        batch["prefix_str"],
+                        gen_suffix_str_joint,
+                        device=batch["input_ids_dec"].device,
+                    )
+                    self.log(
+                        "val/gen_ppl",
+                        ppl_joint,
+                        on_epoch=True,
+                        on_step=False,
+                        sync_dist=True,
+                    )
 
                 if self.encoder is not None:
 
@@ -343,9 +382,9 @@ class DLCMDTask(L.LightningModule):
                         frozen_mask=frozen_mask,
                     )
                     gen_suffix_str_ancestral = self.dit.tokenizer.batch_decode(
-                        self.dit.sample(prior=prior, num_steps=self.dit.cfg.sampling_steps // 2)[
-                            :, -self.cfg.suffix_length :
-                        ]
+                        self.dit.sample(
+                            prior=prior, num_steps=self.dit.cfg.sampling_steps // 2
+                        )[:, -self.cfg.suffix_length :]
                     )
                     ppl_ancestral = self.eval_ppl(
                         batch["prefix_str"],

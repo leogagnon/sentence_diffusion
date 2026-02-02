@@ -1,17 +1,16 @@
 defaults:
   - submitit_slurm
 
-mem_gb: 256
+mem_gb: 300
 gpus_per_node: 4
 array_parallelism: 32
 nodes: 1 
 tasks_per_node: 4
-cpus_per_task: 6
+cpus_per_task: 12
 timeout_min: 719
 account: aip-glaj
 additional_parameters:
   no-requeue: true
 
 setup:
-  - "export NCCL_DEBUG=INFO"
   - "source ~/sentence_diffusion/venv/bin/activate"

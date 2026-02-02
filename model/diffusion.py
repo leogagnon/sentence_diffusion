@@ -409,14 +409,14 @@ class DiTModel(nn.Module):
             x = torch.where(frozen_mask, x, x_)
         return x
 
-    def compute_loss(self, x0, attention_mask, cond_mask=None):
+    def compute_loss(self, x0, attention_mask, cond_mask=None, normalize=True):
 
         loss = self.forward_pass_diffusion(x0, cond_mask=cond_mask)
 
         nlls = loss * attention_mask
-        count = attention_mask.sum()
-
         batch_nll = nlls.sum()
-        token_nll = batch_nll / count
-
-        return token_nll, nlls, attention_mask
+        
+        if normalize:
+            return batch_nll / attention_mask.sum()
+        else:
+            return batch_nll
