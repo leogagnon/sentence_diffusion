@@ -73,7 +73,8 @@ class AETask(L.LightningModule):
         cfg.encoder.latent_dim = self.decoder.latent_dim
         self.encoder = EncoderModel(cfg.encoder)
 
-        self.sem_usage_ema = SEMUsageTracker()
+        if self.encoder.cfg.sem is not None:
+            self.sem_usage_ema = SEMUsageTracker()
 
         self.cfg = cfg
 
@@ -189,7 +190,8 @@ class AETask(L.LightningModule):
             sync_dist=True,
         )
 
-        self.sem_usage_ema.update(sem_out["usage_count"], batch_size=z.shape[0])
+        if "usage_count" in sem_out.keys():
+            self.sem_usage_ema.update(sem_out["usage_count"], batch_size=z.shape[0])
 
         return loss
 

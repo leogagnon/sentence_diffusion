@@ -383,17 +383,17 @@ class EncoderModel(nn.Module):
 
         # Run through SEM / output projection
         if self.cfg.sem is None:
+            out = {"latent": z.clone()}
             z = self.out_proj(z)
-            sem_out = {}
         else:
-            sem_out = self.sem(
+            out = self.sem(
                 z,
                 return_dlc=return_dlc,
                 return_count=return_count,
                 noise=noise,
                 temp=temp,
             )
-            z = self.out_proj(sem_out.pop("z"))
+            z = self.out_proj(out.pop("z"))
 
         # Reshape latent
         z = einx.rearrange(
@@ -403,4 +403,4 @@ class EncoderModel(nn.Module):
         # Maybe squeeze if latent_length == 1
         z = torch.squeeze(z, dim=1) if self.cfg.latent_length == 1 else z
 
-        return z, sem_out
+        return z, out

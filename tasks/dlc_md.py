@@ -104,7 +104,7 @@ class DLCMDTask(L.LightningModule):
             assert cfg.suffix_length is not None
             assert cfg.context_length is not None
 
-            self.encoder = task.encoder.eval().requires_grad_(False).to(torch.bfloat16)
+            self.encoder = task.encoder.eval().requires_grad_(False)
 
             cfg.dit.dlc_vocab_size = self.encoder.sem.cfg.V
             cfg.dit.dlc_len = self.encoder.sem.dlc_len
@@ -134,9 +134,6 @@ class DLCMDTask(L.LightningModule):
                 self.encoder_mode = "context"
             else:
                 self.encoder_mode = "suffix"
-
-        # To not eval MAUVE every validation step
-        self.val_epoch_counter = 0
 
         self.cfg = cfg
 
