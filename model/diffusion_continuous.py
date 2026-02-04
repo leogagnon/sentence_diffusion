@@ -19,7 +19,6 @@ import torch.nn.functional as F
 from einops import rearrange, reduce, repeat
 from einops.layers.torch import Rearrange
 from omegaconf import MISSING
-from PIL import Image
 from torch import einsum, nn
 from torch.optim import AdamW
 from torch.optim.optimizer import Optimizer
@@ -43,7 +42,7 @@ class DiTContinuousConfig:
     n_heads: int
     n_embd: int
     seq_len: int
-    seq_conditional_dim: int
+    seq_conditional_dim: Optional[int] = None
     latent_dim: Optional[int] = None
 
     dropout: float = 0.0
@@ -64,6 +63,8 @@ class DiTContinuous(nn.Module):
 
     def __init__(self, cfg: DiTContinuousConfig):
         super().__init__()
+
+        assert cfg.latent_dim is not None, "latent_dim must be specified"
 
         self.cfg = cfg
 
@@ -110,9 +111,6 @@ class DiTContinuous(nn.Module):
         self.cond_proj = nn.Linear(cfg.seq_conditional_dim, self.cfg.n_embd)
 
         if cfg.cond_modulation:
-            self.adalnzero_cond_proj = nn.Linear(
-                cfg.seq_conditional_dim, self.cfg.n_embd
-            )
             self.adalnzero_null_embedding = nn.Embedding(1, self.cfg.n_embd)
 
         # Setup self-conditionning
@@ -123,13 +121,13 @@ class DiTContinuous(nn.Module):
         else:
             input_dim = cfg.latent_dim
 
-        # Setup input/output projections 
+        # Setup input/output projections
         # (input_dim -> [seq_len * pre_proj_dim] -> [seq_len * n_embd])
         assert cfg.latent_dim % 8 == 0, "Latent dimension must be divisible by 8"
         pre_proj_dim = 96
         self.input_proj = nn.Sequential(
             nn.Linear(input_dim, cfg.seq_len * pre_proj_dim, bias=False),
-            Rearrange("b 1 (l d) -> b l d", l=cfg.seq_len, d=pre_proj_dim),
+            Rearrange("b (l d) -> b l d", l=cfg.seq_len, d=pre_proj_dim),
             nn.Linear(pre_proj_dim, cfg.n_embd, bias=False),
         )
         self.output_proj = nn.Sequential(
@@ -144,17 +142,13 @@ class DiTContinuous(nn.Module):
         x: torch.Tensor,
         time,
         cond,
-        cond_mask,
+        cond_mask=None,
         x_self_cond=None,
         class_id=None,
         cond_input_ids=None,
     ):
 
-        # Build the time embedding
-        time_emb = self.time_mlp(time[None] * 1000)
-        time_emb = rearrange(time_emb, "b d -> b 1 d")
-
-        # Maybe concatenate self-conditionning
+        # Process the latent (maybe concatenate self-conditionning; project to internal shape, add pos_emb)
         if self.cfg.self_condition:
             if x_self_cond != None:
                 x = torch.cat((x, x_self_cond), dim=-1)
@@ -163,31 +157,50 @@ class DiTContinuous(nn.Module):
                     self.init_self_cond, "1 d -> b l d", b=x.shape[0], l=x.shape[1]
                 )
                 x = torch.cat((x, repeated_x_self_cond), dim=-1)
-
-        # Maybe also condition the adaLN-Zero layers
-        if self.cfg.cond_modulation:
-            pooled_cond = torch.where(
-                repeat(cond_mask, "b l -> b l d", d=cond.shape[-1]),
-                cond,
-                0,
-            )
-            pooled_cond = pooled_cond / einops.repeat(
-                cond_mask.sum(1), "b -> b () ()"
-            )
-            pooled_cond = pooled_cond.sum(1, keepdims=True)
-            condition = time_emb + self.adalnzero_cond_proj(pooled_cond)
-        else:
-            condition = time_emb
-
-        # Project latent to (seq_len * n_embd) and add positional embeddings
         x = self.input_proj(x)
         x = x + self.pos_emb(x)
 
-        # Project conditioning sequence to (n_embd)
-        cond = self.cond_proj(cond)
+        # Process seq condtionning (use null if any, generate mask if any, project to internal dim)
+        cond = (
+            repeat(self.null_embedding_cond.weight, "1 d -> b 1 d", b=x.shape[0])
+            if cond is None
+            else self.cond_proj(cond)
+        )
+        cond_mask = (
+            torch.ones(
+                (cond.shape[0], cond.shape[1]),
+                device=cond.device,
+                dtype=torch.bool,
+            )
+            if cond_mask is None
+            else cond_mask
+        )
+
+        # Build the AdaLN-Zero conditionning (time embedding + maybe seq conditionning)
+        condition = rearrange(self.time_mlp(time[None] * 1000), "b d -> b 1 d")
+        if self.cfg.cond_modulation:
+            if cond is None:
+                condition = condition + repeat(
+                    self.adalnzero_null_embedding.weight,
+                    "1 d -> b 1 d",
+                    b=x.shape[0],
+                )
+            else:
+                pooled_cond = torch.where(
+                    repeat(cond_mask, "b l -> b l d", d=cond.shape[-1]),
+                    cond,
+                    0,
+                )
+                pooled_cond = pooled_cond / einops.repeat(
+                    cond_mask.sum(1), "b -> b () ()"
+                )
+                pooled_cond = pooled_cond.sum(1, keepdims=True)
+                condition = condition + pooled_cond
 
         # Pass through DiT
-        x = self.latent_encoder(x, condition=condition, context=cond, mask=cond_mask)
+        x = self.latent_encoder(
+            x, condition=condition, context=cond, context_mask=cond_mask
+        )
 
         # Project back to latent dim
         x = self.output_proj(x)
@@ -245,7 +258,9 @@ def predict_v_from_start_and_eps(z_t, t, x, noise, schedule):
     return v
 
 
-def get_sampling_timesteps(batch, *, sampling_timesteps, device, dtype=None, invert=False):
+def get_sampling_timesteps(
+    batch, *, sampling_timesteps, device, dtype=None, invert=False
+):
     times = torch.linspace(1.0, 0.0, sampling_timesteps + 1, device=device, dtype=dtype)
     if invert:
         times = times.flip(dims=(0,))
@@ -270,9 +285,9 @@ def diffusion_model_predictions(
 ) -> ModelPrediction:
     time_cond = schedule(t)
     model_output = model(
-        z_t,
-        time_cond,
-        x_self_cond,
+        x=z_t,
+        time=time_cond,
+        x_self_cond=x_self_cond,
         class_id=class_id,
         cond=cond,
         cond_input_ids=cond_input_ids,
@@ -284,9 +299,9 @@ def diffusion_model_predictions(
         else:
             unc_class_id = None
         unc_model_output = model(
-            z_t,
-            time_cond,
-            x_self_cond,
+            x=z_t,
+            time=time_cond,
+            x_self_cond=x_self_cond,
             class_id=unc_class_id,
             cond=None,
             cond_input_ids=None,
@@ -333,7 +348,11 @@ def ddim_sample(
     batch, device, dtype = shape[0], param.device, param.dtype
 
     time_pairs = get_sampling_timesteps(
-        batch, sampling_timesteps=sampling_timesteps, device=device, invert=invert, dtype=dtype
+        batch,
+        sampling_timesteps=sampling_timesteps,
+        device=device,
+        invert=invert,
+        dtype=dtype,
     )
     if invert:
         assert exists(z_t)
@@ -660,16 +679,11 @@ def compute_diffusion_loss(
     schedule,
     diffusion_objective,
     loss_name,
+    cond,
+    cond_mask=None,
     class_id=None,
-    cond=None,
     cond_input_ids=None,
-    cond_ignore_mask=None,
 ):
-    # NOTE: Important to flip the <ignore_mask> to a <don't_ignore_mask>
-    cond_mask = None
-    if cond_ignore_mask != None:
-        cond_mask = torch.logical_not(cond_ignore_mask)
-
     bs = latent.shape[0]
     device = latent.device
 
@@ -682,9 +696,7 @@ def compute_diffusion_loss(
     z_t = alpha.sqrt() * latent + (1 - alpha).sqrt() * noise
 
     # Sample unconditionally with some probability
-    if model.cfg.seq_conditional and (
-        random.random() < model.cfg.seq_unconditional_prob
-    ):
+    if random.random() < model.cfg.seq_unconditional_prob:
         cond = None
         cond_input_ids = None
         cond_mask = None
@@ -738,7 +750,7 @@ def compute_diffusion_loss(
         assert exists(predictions.pred_v)
         pred = predictions.pred_v
 
-    loss = loss_fn(loss_name)(pred, target, reduction="none")
-    loss = loss.mean(dim=-1).mean() # first average over latent length
+    loss = loss_fn(loss_name)(pred.squeeze(1), target, reduction="none")
+    loss = loss.mean(dim=-1).mean()  # first average over latent length
 
     return loss

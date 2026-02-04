@@ -3,6 +3,7 @@ import random
 from dataclasses import dataclass
 from typing import Optional
 from functools import partial
+from itertools import chain
 
 import lightning as L
 import torch
@@ -26,8 +27,9 @@ class GaussianDiffusionTaskConfig:
     model: DiTContinuousConfig
     batch_size: int
     lr: float
-    lr_warmup_steps: int 
+    lr_warmup_steps: int
     decoder: DecoderConfig
+    noise_delta: float = 0.0
     eval_gen_ppl: bool = True
 
     pretrained_declutr_id: Optional[str] = None
@@ -46,7 +48,8 @@ class GaussianDiffusionTaskConfig:
     schedule_scale: float = 1.0
     sampler: str = "ddpm"
     normalize_latent: bool = False
-    max_generation_length: int = 150
+
+    name: Optional[str] = None
 
 
 class GaussianDiffusionTask(L.LightningModule):
@@ -103,10 +106,7 @@ class GaussianDiffusionTask(L.LightningModule):
             cfg.context_length = task.cfg.context_length
 
             self.encoder = task.encoder.eval().requires_grad_(False)
-
-            # Set DLC params in decoder config
-            cfg.decoder.dlc_vocab_size = self.encoder.sem.cfg.V
-            cfg.decoder.dlc_len = self.encoder.sem.dlc_len
+            self.encoder.out_proj = nn.Identity()
 
         elif cfg.pretrained_declutr_id is not None:
 
@@ -127,17 +127,14 @@ class GaussianDiffusionTask(L.LightningModule):
             assert cfg.suffix_length is not None
             assert cfg.context_length is not None
 
+            # Init encoder (and remove out proj; no longer needed)
             self.encoder = task.encoder.eval().requires_grad_(False)
+            self.encoder.out_proj = nn.Identity()
 
-            cfg.decoder.dlc_vocab_size = self.encoder.sem.cfg.V
-            cfg.decoder.dlc_len = self.encoder.sem.dlc_len
         else:
             assert cfg.prefix_length is not None
             assert cfg.suffix_length is not None
             cfg.context_length = 0
-
-        # Create decoder  
-        self.decoder = DecoderModel(cfg.decoder).train().requires_grad_(True)
 
         # Init latent normalization if needed
         if cfg.normalize_latent:
@@ -164,7 +161,13 @@ class GaussianDiffusionTask(L.LightningModule):
             self.ppl_tok = AutoTokenizer.from_pretrained("meta-llama/Llama-3.2-3B")
             self.ppl_tok.pad_token = self.ppl_tok.eos_token
 
-        # Create dit
+        # Init decoder (with cross attention dim = encoder latent dim)
+        cfg.decoder.condition_dim = self.encoder.backbone_dim
+        self.decoder = DecoderModel(cfg.decoder).train().requires_grad_(True)
+
+        # Init DiT (with seq conditional dim = decoder latent dim; latent dim = encoder latent dim)
+        cfg.model.latent_dim = self.encoder.backbone_dim
+        cfg.model.seq_conditional_dim = self.decoder.latent_dim
         self.model = DiTContinuous(cfg.model).train().requires_grad_(True)
 
         self.encoder_mode = "none"
@@ -185,7 +188,7 @@ class GaussianDiffusionTask(L.LightningModule):
         # Make sure encoder and decoder and EMA are always in eval mode
         self.encoder.eval()
         self.decoder.eval()
-        
+
         return self
 
     def setup(self, **kwargs):
@@ -206,12 +209,15 @@ class GaussianDiffusionTask(L.LightningModule):
         return x_start * (self.latent_scale.clamp(min=eps)) + self.latent_mean
 
     def configure_optimizers(self):
+        trainable_params = chain(
+            self.model.named_parameters(), self.decoder.named_parameters()
+        )
         no_decay = ["bias", "norm"]
         optimizer_grouped_parameters = [
             {
                 "params": [
                     p
-                    for n, p in self.model.named_parameters()
+                    for n, p in trainable_params
                     if not any(nd in n.lower() for nd in no_decay)
                 ],
                 "weight_decay": 0.01,
@@ -219,7 +225,7 @@ class GaussianDiffusionTask(L.LightningModule):
             {
                 "params": [
                     p
-                    for n, p in self.model.named_parameters()
+                    for n, p in trainable_params
                     if any(nd in n.lower() for nd in no_decay)
                 ],
                 "weight_decay": 0.0,
@@ -248,7 +254,7 @@ class GaussianDiffusionTask(L.LightningModule):
             encoder_mode=self.encoder_mode,
             encoder_noise=False,  # No noise during DLC-LM finetuning
             seed=random.randint(0, 100000),  # Dataset should be different if restarted,
-            num_dlc_ph=0
+            num_dlc_ph=0,
         )
 
     def val_dataloader(self):
@@ -263,7 +269,7 @@ class GaussianDiffusionTask(L.LightningModule):
             encoder_mode=self.encoder_mode,
             encoder_noise=False,
             seed=42,  # Always the same validation set for consistency,
-            num_dlc_ph=0
+            num_dlc_ph=0,
         )
 
     @torch.no_grad()
@@ -287,8 +293,11 @@ class GaussianDiffusionTask(L.LightningModule):
                 count += batch["input_ids_enc"].shape[0]
 
             latent_samples = torch.cat(latent_samples, dim=0)
-            
-            latent_samples = einx.rearrange("w b d -> (w b) d", self.all_gather(latent_samples))
+
+            if self.trainer.num_devices > 1:
+                latent_samples = einx.rearrange(
+                    "w b d -> (w b) d", self.all_gather(latent_samples)
+                )
 
             self.latent_mean = torch.mean(latent_samples, dim=0)
             self.latent_scale = torch.std(
@@ -301,65 +310,141 @@ class GaussianDiffusionTask(L.LightningModule):
 
     def training_step(self, batch, batch_idx=None):
 
-        # Compute latents
         with torch.no_grad():
-            _, out = self.encoder(
+            # Compute latent with encoder
+            z = self.encoder(
                 batch["input_ids_enc"],
                 attention_mask=batch["attention_mask_enc"],
+                only_backbone=True,
             )
-            latent = out["latent"]
             if self.cfg.normalize_latent:
-                latent = self.normalize_latent(latent)
+                z = self.normalize_latent(z)
 
-        loss = compute_diffusion_loss(
+        # Maybe add a little noise to the latent (interpolating between latents and standard normal)
+        # Supposed to help mitigate sampling errors of the diffusion model
+        if self.cfg.noise_delta > 0.0:
+            noise = torch.randn_like(z)
+            z = noise * self.cfg.noise_delta + z * math.sqrt(
+                (1.0 - self.cfg.noise_delta**2)
+            )
+
+        # Compute suffix loss (conditionned on prefix + latent)
+        logits, hidden_states = self.decoder(
+            input_ids=batch["input_ids_dec"], z=z, return_hidden_states=True
+        )
+        info_mask_dec = batch["info_mask_dec"][:, 1:]
+        targets = batch["input_ids_dec"][:, 1:].contiguous()
+        logits = logits[:, :-1].contiguous()
+        loss = torch.nn.functional.cross_entropy(
+            logits.view(-1, logits.size(-1)),
+            targets.view(-1),
+            reduction="none",
+        )
+        loss = loss.view_as(targets)
+        suffix_loss = loss[(info_mask_dec == InfoLabel.SUFFIX.value)].mean()
+        self.log(
+            "train/suffix_loss",
+            suffix_loss,
+            on_epoch=False,
+            on_step=True,
+            sync_dist=True,
+        )
+
+        # Compute diffusion loss (conditionned on prefix hidden states)
+        diffusion_loss = compute_diffusion_loss(
             self.model,
-            latent,
+            z,
+            cond=hidden_states[:, : self.cfg.prefix_length],
             schedule=self.train_schedule,
             diffusion_objective=self.cfg.diffusion_objective,
             loss_name=self.cfg.loss,
         )
+        self.log(
+            "train/diffusion_loss",
+            diffusion_loss,
+            on_epoch=False,
+            on_step=True,
+            sync_dist=True,
+        )
+
+        full_loss = suffix_loss + diffusion_loss
 
         self.log(
             "train/loss",
-            loss.detach().cpu().numpy().item(),
+            full_loss,
             prog_bar=True,
             add_dataloader_idx=False,
-            batch_size=latent.shape[0],
+            batch_size=z.shape[0],
             on_step=True,
             on_epoch=False,
             sync_dist=True,
         )
 
-        return loss
-    
+        return full_loss
+
     @torch.no_grad()
     def validation_step(self, batch, batch_idx=None):
-    
-        # Compute latents
-        _, out = self.encoder(
+
+        # Compute latent with encoder
+        z = self.encoder(
             batch["input_ids_enc"],
             attention_mask=batch["attention_mask_enc"],
+            only_backbone=True,
         )
         if self.cfg.normalize_latent:
-            latent = self.normalize_latent(latent)
+            z = self.normalize_latent(z)
 
-        loss = compute_diffusion_loss(
+        # Compute suffix loss (conditionned on prefix + latent)
+        logits, hidden_states = self.decoder(
+            input_ids=batch["input_ids_dec"], z=z, return_hidden_states=True
+        )
+        info_mask_dec = batch["info_mask_dec"][:, 1:]
+        targets = batch["input_ids_dec"][:, 1:].contiguous()
+        logits = logits[:, :-1].contiguous()
+        loss = torch.nn.functional.cross_entropy(
+            logits.view(-1, logits.size(-1)),
+            targets.view(-1),
+            reduction="none",
+        )
+        loss = loss.view_as(targets)
+        suffix_loss = loss[(info_mask_dec == InfoLabel.SUFFIX.value)].mean()
+        self.log(
+            "val/suffix_loss",
+            suffix_loss,
+            on_epoch=False,
+            on_step=True,
+            sync_dist=True,
+        )
+
+        # Compute diffusion loss (conditionned on prefix hidden states)
+        diffusion_loss = compute_diffusion_loss(
             self.model,
-            latent,
+            z,
+            cond=hidden_states[:, : self.cfg.prefix_length],
             schedule=self.train_schedule,
             diffusion_objective=self.cfg.diffusion_objective,
             loss_name=self.cfg.loss,
         )
-
         self.log(
-            "val/loss",
-            loss.cpu().numpy().item(),
-            prog_bar=True,
-            add_dataloader_idx=False,
-            batch_size=latent.shape[0],
-            on_epoch=True,
-            on_step=False,
+            "val/diffusion_loss",
+            diffusion_loss,
+            on_epoch=False,
+            on_step=True,
             sync_dist=True,
         )
 
-        return loss
+        full_loss = suffix_loss + diffusion_loss
+
+        self.log(
+            "val/loss",
+            full_loss,
+            prog_bar=True,
+            add_dataloader_idx=False,
+            batch_size=z.shape[0],
+            on_step=True,
+            on_epoch=False,
+            sync_dist=True,
+        )
+
+        
+

@@ -1,11 +1,15 @@
 from dataclasses import dataclass
 from typing import List, Optional
-
+from einops.layers.torch import Rearrange
 import torch
 import torch.nn as nn
 from lightning.pytorch.utilities.rank_zero import rank_zero_info
-from transformers import (GenerationConfig, GPT2Config, GPT2LMHeadModel,
-                          GPT2TokenizerFast)
+from transformers import (
+    GenerationConfig,
+    GPT2Config,
+    GPT2LMHeadModel,
+    GPT2TokenizerFast,
+)
 from transformers.models.auto.modeling_auto import AutoModelForCausalLM
 
 
@@ -13,9 +17,10 @@ from transformers.models.auto.modeling_auto import AutoModelForCausalLM
 class DecoderConfig:
     name: str
     cross_attention: bool = False
+    condition_dim: Optional[int] = None
     dlc_vocab_size: int = 0
     dlc_len: Optional[int] = None
-    attn_implem: str = 'sdpa'
+    attn_implem: str = "sdpa"
 
 
 class DecoderModel(nn.Module):
@@ -28,7 +33,9 @@ class DecoderModel(nn.Module):
             self.backbone = GPT2LMHeadModel.from_pretrained(
                 cfg.name,
                 config=GPT2Config.from_pretrained(
-                    cfg.name, add_cross_attention=True, is_decoder=True
+                    cfg.name,
+                    add_cross_attention=True,
+                    is_decoder=True,
                 ),
             )
         else:
@@ -38,8 +45,18 @@ class DecoderModel(nn.Module):
         try:
             self.backbone.set_attn_implementation(cfg.attn_implem)
         except:
-            rank_zero_info(
-                f"Tried to use {cfg.attn_implem} in decoder, but it failed."
+            rank_zero_info(f"Tried to use {cfg.attn_implem} in decoder, but it failed.")
+
+        if cfg.condition_dim is not None:
+            assert (
+                cfg.condition_dim % 8 == 0
+            ), "Condition dimension must be divisible by 8"
+            pre_proj_dim = 96
+            seq_len = 16
+            self.cross_attention_proj = nn.Sequential(
+                nn.Linear(cfg.condition_dim, seq_len * pre_proj_dim, bias=False),
+                Rearrange("b (l d) -> b l d", l=seq_len, d=pre_proj_dim),
+                nn.Linear(pre_proj_dim, self.latent_dim, bias=False),
             )
 
         # Disable dropout in the backbone
@@ -49,7 +66,7 @@ class DecoderModel(nn.Module):
 
         # Init tokenizer, make it put BOS and EOS tokens around inputs, and add PAD and THINK tokens.
         self.tokenizer = GPT2TokenizerFast.from_pretrained(cfg.name)
-        
+
         # Add PAD and THINK tokens, resize embeddings
         self.tokenizer.add_special_tokens(
             {"pad_token": "<|pad|>", "additional_special_tokens": ["<|think|>"]}
@@ -81,12 +98,26 @@ class DecoderModel(nn.Module):
         input_ids,
         attention_mask: Optional[torch.Tensor] = None,
         z: Optional[torch.Tensor] = None,
+        return_hidden_states: bool = False,
     ):
-        return self.backbone(
-            input_ids=input_ids,
-            attention_mask=attention_mask,
-            encoder_hidden_states=z,
-        ).logits
+        if self.cfg.condition_dim is not None and z is not None:
+            # Project z to cross-attention dimension
+            z = self.cross_attention_proj(z)
+
+        if return_hidden_states:
+            outputs = self.backbone(
+                input_ids=input_ids,
+                attention_mask=attention_mask,
+                encoder_hidden_states=z,
+                output_hidden_states=True,
+            )
+            return outputs.logits, outputs.hidden_states[-1]
+        else:
+            return self.backbone(
+                input_ids=input_ids,
+                attention_mask=attention_mask,
+                encoder_hidden_states=z,
+            ).logits
 
     @torch.inference_mode()
     def generate(
@@ -104,7 +135,7 @@ class DecoderModel(nn.Module):
         Format of the generation is : prefix <|think|> DLC <|bos|> suffix
         """
         device = next(self.parameters()).device
-        
+
         # Process prefix if provided
         if prefix is not None:
             assert isinstance(prefix, list), "Prefix should be a list of input_ids"

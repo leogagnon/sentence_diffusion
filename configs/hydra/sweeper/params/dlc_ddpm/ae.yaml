@@ -1,0 +1,12 @@
+task/dlc_ddpm: ae
+model_checkpoint: base
+
+task.dlc_ddpm.pretrained_ae_id: 3h16x36n, vd8vtsfz
+
+max_steps: 20000
+
+limit_val_batches: 4
+val_check_interval: 512
+
+sweep_id: dlc_ddpm/ae
+

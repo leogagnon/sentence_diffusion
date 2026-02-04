@@ -1,0 +1,12 @@
+task/dlc_ddpm: declutr
+model_checkpoint: base
+
+task.dlc_ddpm.pretrained_declutr_id: xdwpo3p8, 9ku0dq7a
+
+max_steps: 20000
+
+limit_val_batches: 4
+val_check_interval: 512
+
+sweep_id: dlc_ddpm/declutr
+

@@ -10,7 +10,6 @@ from torch.nn import functional as F
 from transformers.models.auto.tokenization_auto import AutoTokenizer
 from transformers.models.m2m_100.modeling_m2m_100 import M2M100Encoder
 
-
 @dataclass
 class SEMHeadConfig:
     L: int
@@ -349,6 +348,8 @@ class EncoderModel(nn.Module):
                 dim_1,
                 bias=False,
             )
+            
+        self.backbone_dim = backbone_dim
 
         self.cfg = cfg
 
@@ -371,6 +372,7 @@ class EncoderModel(nn.Module):
         return_count=False,
         noise: float = 0.0,
         temp: Optional[float] = None,
+        only_backbone: bool = False,
     ):
 
         # Make the batch dict expected by sentence_transformers models
@@ -380,6 +382,9 @@ class EncoderModel(nn.Module):
         batch = self.transformer(batch)
         batch = self.pooling(batch)
         z = batch["sentence_embedding"]
+
+        if only_backbone:
+            return z
 
         # Run through SEM / output projection
         if self.cfg.sem is None:

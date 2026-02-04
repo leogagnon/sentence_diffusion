@@ -20,6 +20,7 @@ from tasks.autoencoder import AETask, AETaskConfig
 from tasks.declutr import DeCLUTRTask, DeCLUTRTaskConfig
 from tasks.dlc_ar import DLCARTask, DLCARTaskConfig
 from tasks.dlc_md import DLCMDTask, DLCMDTaskConfig
+from tasks.dlc_ddpm import GaussianDiffusionTask, GaussianDiffusionTaskConfig
 
 logging.set_verbosity_error()
 torch.set_float32_matmul_precision("medium")
@@ -42,6 +43,7 @@ class TaskConfig:
     declutr: Optional[DeCLUTRTaskConfig] = None
     dlc_ar: Optional[DLCARTaskConfig] = None
     dlc_md: Optional[DLCMDTaskConfig] = None
+    dlc_ddpm: Optional[GaussianDiffusionTaskConfig] = None
 
 
 @dataclass
@@ -157,6 +159,31 @@ def main(cfg: Optional[TrainConfig] = None, run_id: Optional[str] = None):
             )
             cfg.task.ae = OmegaConf.merge(
                 OmegaConf.structured(AETaskConfig), run.config["task"]["ae"]
+            )
+        elif cfg.task.dlc_md.pretrained_declutr_id is not None:
+            run = wandb.Api().run(
+                f"guillaume-lajoie/dlc_lm_2/{cfg.task.dlc_md.pretrained_declutr_id}"
+            )
+            cfg.task.declutr = OmegaConf.merge(
+                OmegaConf.structured(DeCLUTRTaskConfig), run.config["task"]["declutr"]
+            )
+    elif cfg.task.dlc_ddpm != None:
+        task = GaussianDiffusionTask(cfg.task.dlc_ddpm)
+        cfg.task.dlc_ddpm = task.cfg
+
+        if cfg.task.dlc_ddpm.pretrained_ae_id is not None:
+            run = wandb.Api().run(
+                f"guillaume-lajoie/dlc_lm_2/{cfg.task.dlc_ddpm.pretrained_ae_id}"
+            )
+            cfg.task.ae = OmegaConf.merge(
+                OmegaConf.structured(AETaskConfig), run.config["task"]["ae"]
+            )
+        elif cfg.task.dlc_ddpm.pretrained_declutr_id is not None:
+            run = wandb.Api().run(
+                f"guillaume-lajoie/dlc_lm_2/{cfg.task.dlc_ddpm.pretrained_declutr_id}"
+            )
+            cfg.task.declutr = OmegaConf.merge(
+                OmegaConf.structured(DeCLUTRTaskConfig), run.config["task"]["declutr"]
             )
     elif cfg.task.ae != None:
         task = AETask(cfg.task.ae)

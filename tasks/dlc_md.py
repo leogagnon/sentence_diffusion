@@ -330,7 +330,7 @@ class DLCMDTask(L.LightningModule):
 
         return ppl.item()
 
-    @torch.amp.autocast("cuda", dtype=torch.float32)
+    @torch.amp.autocast("cuda", enabled=False)
     def validation_step(self, batch, batch_idx):
 
         # Fill DLCs in the batch

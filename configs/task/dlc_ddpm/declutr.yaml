@@ -1,0 +1,35 @@
+lr: 5e-4
+lr_warmup_steps: 1000
+batch_size: 128
+
+decoder:
+  name: gpt2-medium # 1.5B params
+  cross_attention: true
+  attn_implem: sdpa
+
+model:
+  n_layers: 12
+  n_heads: 12
+  n_embd: 768
+  seq_len: 64
+  dropout: 0.0
+  cond_modulation: false
+
+eval_gen_ppl: true
+
+pretrained_declutr_id: bll8h3yb
+
+prefix_length: 16
+suffix_length: 64
+context_length: 112
+
+noise_delta: 0.2
+loss: l2
+sampling_timesteps: 50
+train_schedule: cosine
+diffusion_objective: pred_v
+schedule_scale: 1.0
+sampler: ddpm
+normalize_latent: true
+
+name: ddpm_base

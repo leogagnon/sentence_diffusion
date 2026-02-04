@@ -63,10 +63,8 @@ class DeCLUTRTask(L.LightningModule):
 
         self.encoder = EncoderModel(cfg.encoder)
 
-        self.sem_usage_ema = SEMUsageTracker()
-
-        # To not eval MAUVE every validation step
-        self.val_epoch_counter = 0
+        if cfg.encoder.sem is not None:   
+            self.sem_usage_ema = SEMUsageTracker()
 
         self.loss_fn = NTXentLoss(temperature=cfg.loss_temp)
 
@@ -190,14 +188,16 @@ class DeCLUTRTask(L.LightningModule):
         loss = self.compute_loss(z_anchors, z_positives)
         self.log("train/loss", loss, on_step=True, on_epoch=False, sync_dist=True)
 
-        self.sem_usage_ema.update(sem_out["usage_count"], batch_size=z_anchors.shape[0])
+        if self.cfg.encoder.sem is not None:
+            self.sem_usage_ema.update(sem_out["usage_count"], batch_size=z_anchors.shape[0])
 
         return loss
 
     def validation_step(self, batch, batch_idx):
-
-        for sem_temp, label in zip([1e-4, None], ["hard", "soft"]):
-
+        
+        temps = [1e-4, None] if self.cfg.encoder.sem is not None else [None]
+        names = ["hard", "soft"] if self.cfg.encoder.sem is not None else ["soft"]
+        for sem_temp, label in zip(temps, names):
             z_anchors, sem_out = self.encoder(
                 input_ids=batch["anchor_ids"],
                 attention_mask=(
@@ -248,29 +248,30 @@ class DeCLUTRTask(L.LightningModule):
         if (batch_idx == 0) and (rank_zero_only.rank == 0):
 
             # Log % of dead words/simplices
-            is_dead = self.sem_usage_ema.usage < self.cfg.sem_reset_config.threshold
-            dead_words_ratio = torch.sum(is_dead).item() / is_dead.numel()
-            dead_simplices = torch.sum((~is_dead).sum(1) == 1).item()
-            dead_words_per_simplex = torch.sum(is_dead, dim=1).float().mean().item()
+            if self.cfg.encoder.sem is not None:
+                is_dead = self.sem_usage_ema.usage < self.cfg.sem_reset_config.threshold
+                dead_words_ratio = torch.sum(is_dead).item() / is_dead.numel()
+                dead_simplices = torch.sum((~is_dead).sum(1) == 1).item()
+                dead_words_per_simplex = torch.sum(is_dead, dim=1).float().mean().item()
 
-            self.log(
-                "val/dead_words_ratio",
-                dead_words_ratio,
-                on_epoch=True,
-                sync_dist=False,
-                rank_zero_only=True,
-            )
-            self.log(
-                "val/dead_simplices",
-                dead_simplices,
-                on_epoch=True,
-                sync_dist=False,
-                rank_zero_only=True,
-            )
-            self.log(
-                "val/dead_words_per_simplex",
-                dead_words_per_simplex,
-                on_epoch=True,
-                sync_dist=False,
-                rank_zero_only=True,
-            )
+                self.log(
+                    "val/dead_words_ratio",
+                    dead_words_ratio,
+                    on_epoch=True,
+                    sync_dist=False,
+                    rank_zero_only=True,
+                )
+                self.log(
+                    "val/dead_simplices",
+                    dead_simplices,
+                    on_epoch=True,
+                    sync_dist=False,
+                    rank_zero_only=True,
+                )
+                self.log(
+                    "val/dead_words_per_simplex",
+                    dead_words_per_simplex,
+                    on_epoch=True,
+                    sync_dist=False,
+                    rank_zero_only=True,
+                )

@@ -197,11 +197,32 @@ class AETask(L.LightningModule):
 
     @torch.no_grad()
     def validation_step(self, batch, batch_idx):
-
+        
+        # Decode with soft latents
         soft_z, sem_out = self.encoder(
             batch["input_ids_enc"],
             batch["attention_mask_enc"],
             noise=0.0,
+        )
+        logits = self.decoder(input_ids=batch["input_ids_dec"], z=soft_z)
+
+        info_mask_dec = batch["info_mask_dec"][:, 1:]
+        targets = batch["input_ids_dec"][:, 1:].contiguous()
+        logits = logits[:, :-1].contiguous()
+        loss = torch.nn.functional.cross_entropy(
+            logits.view(-1, logits.size(-1)),
+            targets.view(-1),
+            ignore_index=self.decoder.tokenizer.pad_token_id,
+            reduction="none",
+        )
+        loss = loss.view_as(targets)
+
+        suffix_loss = loss[info_mask_dec == InfoLabel.SUFFIX.value].mean()
+        self.log(
+            f"val/loss_soft",
+            suffix_loss.item(),
+            on_epoch=True,
+            sync_dist=True,
         )
 
         # Log entropy, marginal entropy and dead words fraction
@@ -220,16 +241,16 @@ class AETask(L.LightningModule):
                 sync_dist=True,
             )
 
-        # Decode with hard latents
-        hard_z, _ = self.encoder(
-            batch["input_ids_enc"],
-            batch["attention_mask_enc"],
-            noise=0.0,
-            temp=1e-4,
-        )
+        if self.encoder.cfg.sem is not None:
+            # Decode with hard latents
+            hard_z, _ = self.encoder(
+                batch["input_ids_enc"],
+                batch["attention_mask_enc"],
+                noise=0.0,
+                temp=1e-4,
+            )
 
-        for latent, latent_type in zip([hard_z, soft_z], ["hard", "soft"]):
-            logits = self.decoder(input_ids=batch["input_ids_dec"], z=latent)
+            logits = self.decoder(input_ids=batch["input_ids_dec"], z=hard_z)
 
             info_mask_dec = batch["info_mask_dec"][:, 1:]
             targets = batch["input_ids_dec"][:, 1:].contiguous()
@@ -244,57 +265,72 @@ class AETask(L.LightningModule):
 
             suffix_loss = loss[info_mask_dec == InfoLabel.SUFFIX.value].mean()
             self.log(
-                f"val/loss_{latent_type}",
+                f"val/loss_hard",
                 suffix_loss.item(),
                 on_epoch=True,
                 sync_dist=True,
             )
+        
         if (batch_idx == 0) and (rank_zero_only.rank == 0):
 
             # Log % of dead words/simplices
-            is_dead = self.sem_usage_ema.usage < self.cfg.sem_reset_config.threshold
-            dead_words_ratio = torch.sum(is_dead).item() / is_dead.numel()
-            dead_simplices = torch.sum((~is_dead).sum(1) == 1).item()
-            dead_words_per_simplex = torch.sum(is_dead, dim=1).float().mean().item()
+            if self.encoder.cfg.sem is not None:
+                is_dead = self.sem_usage_ema.usage < self.cfg.sem_reset_config.threshold
+                dead_words_ratio = torch.sum(is_dead).item() / is_dead.numel()
+                dead_simplices = torch.sum((~is_dead).sum(1) == 1).item()
+                dead_words_per_simplex = torch.sum(is_dead, dim=1).float().mean().item()
 
-            self.log(
-                "val/dead_words_ratio",
-                dead_words_ratio,
-                on_epoch=True,
-                sync_dist=False,
-                rank_zero_only=True,
-            )
-            self.log(
-                "val/dead_simplices",
-                dead_simplices,
-                on_epoch=True,
-                sync_dist=False,
-                rank_zero_only=True,
-            )
-            self.log(
-                "val/dead_words_per_simplex",
-                dead_words_per_simplex,
-                on_epoch=True,
-                sync_dist=False,
-                rank_zero_only=True,
-            )
+                self.log(
+                    "val/dead_words_ratio",
+                    dead_words_ratio,
+                    on_epoch=True,
+                    sync_dist=False,
+                    rank_zero_only=True,
+                )
+                self.log(
+                    "val/dead_simplices",
+                    dead_simplices,
+                    on_epoch=True,
+                    sync_dist=False,
+                    rank_zero_only=True,
+                )
+                self.log(
+                    "val/dead_words_per_simplex",
+                    dead_words_per_simplex,
+                    on_epoch=True,
+                    sync_dist=False,
+                    rank_zero_only=True,
+                )
 
-            # Reconstruct a few (5) samples from hard SEMs
-            prefix_str = batch["prefix_str"][:5]
-            prefix_ids = self.decoder.tokenizer.batch_encode_plus(prefix_str)[
-                "input_ids"
-            ]
-            true_suffix_str = batch["suffix_str"][:5]
-            generated_suffix_str = self.decoder.tokenizer.batch_decode(
-                self.decoder.generate(
-                    z=hard_z[:5], max_length=self.cfg.suffix_length, prefix=prefix_ids
-                ),
-                skip_special_tokens=True,
-            )
+                # Reconstruct a few (5) samples from hard SEMs
+                prefix_str = batch["prefix_str"][:5]
+                prefix_ids = self.decoder.tokenizer.batch_encode_plus(prefix_str)[
+                    "input_ids"
+                ]
+                true_suffix_str = batch["suffix_str"][:5]
+                generated_suffix_str = self.decoder.tokenizer.batch_decode(
+                    self.decoder.generate(
+                        z=hard_z[:5], max_length=self.cfg.suffix_length, prefix=prefix_ids
+                    ),
+                    skip_special_tokens=True,
+                )
+            else:
+                # Reconstruct a few (5) samples from soft latents
+                prefix_str = batch["prefix_str"][:5]
+                prefix_ids = self.decoder.tokenizer.batch_encode_plus(prefix_str)[
+                    "input_ids"
+                ]
+                true_suffix_str = batch["suffix_str"][:5]
+                generated_suffix_str = self.decoder.tokenizer.batch_decode(
+                    self.decoder.generate(
+                        z=soft_z[:5], max_length=self.cfg.suffix_length, prefix=prefix_ids
+                    ),
+                    skip_special_tokens=True,
+                )
 
             # Log to wandb
             table = wandb.Table(columns=["Prefix", "True Suffix", "Generated Suffix"])
-            for i in range(1):
+            for i in range(5):
                 table.add_data(
                     prefix_str[i], true_suffix_str[i], generated_suffix_str[i]
                 )
