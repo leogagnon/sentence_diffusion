@@ -3,7 +3,7 @@ import os
 import random
 from dataclasses import dataclass
 from enum import Enum
-from typing import Any, List, Optional
+from typing import Any, List, Optional, Tuple
 
 import ftfy
 import torch
@@ -77,13 +77,13 @@ class SpanPoissonMasker:
     def __init__(
         self,
         mask_id: int,
-        mask_ratio: float = 0.3,
+        mask_ratio_range: Tuple[float, float] = (0.1, 0.5),
         poisson_lambda: float = 3.5,
         max_span_len: int = 128,
         keep_bos_eos: bool = True,
     ):
         self.mask_id = mask_id
-        self.mask_ratio = mask_ratio
+        self.mask_ratio_range = mask_ratio_range
         self.poisson_lambda = poisson_lambda
         self.max_span_len = max_span_len
         self.keep_bos_eos = keep_bos_eos
@@ -133,8 +133,10 @@ class SpanPoissonMasker:
         eligible = end - start
         if eligible <= 0:
             return tokens
+        
+        mask_ratio = rng.uniform(self.mask_ratio_range[0], self.mask_ratio_range[1])
 
-        budget = int(math.ceil(eligible * self.mask_ratio))
+        budget = int(math.ceil(eligible * mask_ratio))
         if budget <= 0:
             return tokens
 

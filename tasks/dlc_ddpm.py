@@ -29,6 +29,7 @@ class GaussianDiffusionTaskConfig:
     lr: float
     lr_warmup_steps: int
     decoder: DecoderConfig
+    diffusion_beta: float = 5.0
     noise_delta: float = 0.0
     eval_gen_ppl: bool = True
 
@@ -136,19 +137,6 @@ class GaussianDiffusionTask(L.LightningModule):
             assert cfg.suffix_length is not None
             cfg.context_length = 0
 
-        # Init latent normalization if needed
-        if cfg.normalize_latent:
-            self.register_buffer(
-                "latent_mean",
-                torch.zeros(size=(cfg.model.latent_dim)).float(),
-            )
-            self.latent_mean: torch.FloatTensor
-            self.register_buffer(
-                "latent_scale",
-                torch.ones(size=(cfg.model.latent_dim)).float(),
-            )
-            self.latent_scale: torch.FloatTensor
-
         # Initialize Generative PPL eval model
         if cfg.eval_gen_ppl:
             # NOTE: Putting a module in a list avoids Lightning auto-moving it to device
@@ -169,6 +157,19 @@ class GaussianDiffusionTask(L.LightningModule):
         cfg.model.latent_dim = self.encoder.backbone_dim
         cfg.model.seq_conditional_dim = self.decoder.latent_dim
         self.model = DiTContinuous(cfg.model).train().requires_grad_(True)
+
+        # Init latent normalization if needed
+        if cfg.normalize_latent:
+            self.register_buffer(
+                "latent_mean",
+                torch.zeros(size=(cfg.model.latent_dim,)).float(),
+            )
+            self.latent_mean: torch.FloatTensor
+            self.register_buffer(
+                "latent_scale",
+                torch.ones(size=(cfg.model.latent_dim,)).float(),
+            )
+            self.latent_scale: torch.FloatTensor
 
         self.encoder_mode = "none"
         if self.encoder is not None:
@@ -277,36 +278,75 @@ class GaussianDiffusionTask(L.LightningModule):
 
         # Compute latent mean and scale if needed (on 10000 samples, per rank)
         if self.cfg.normalize_latent:
-            print("Computing latent mean and scale...")
+            if rank_zero_only.rank == 0:
+                print("Computing latent mean and scale...")
 
-            dl_iter = iter(self.train_dataloader())
-            count = 0
-            latent_samples = []
-            while count < 10000:
-                batch = next(dl_iter)
-                latent_samples.append(
-                    self.encoder(
-                        batch["input_ids_enc"].cuda(),
-                        attention_mask=batch["attention_mask_enc"].cuda(),
+                dl_iter = iter(self.train_dataloader())
+                latent_samples = []
+                for _ in tqdm(range(10000 // self.cfg.batch_size)):
+                    batch = next(dl_iter)
+                    latent_samples.append(
+                        self.encoder(
+                            batch["input_ids_enc"].cuda(),
+                            attention_mask=batch["attention_mask_enc"].cuda(),
+                            only_backbone=True,
+                        )
                     )
-                )
-                count += batch["input_ids_enc"].shape[0]
 
-            latent_samples = torch.cat(latent_samples, dim=0)
+                latent_samples = torch.cat(latent_samples, dim=0)
+
+                latent_mean = torch.mean(latent_samples, dim=0)
+                latent_scale = torch.std(
+                    latent_samples - latent_mean, unbiased=False, dim=0
+                )
+
+                del dl_iter
+            else:
+                latent_mean = torch.zeros(size=(self.cfg.model.latent_dim,)).float()
+                latent_scale = torch.zeros(size=(self.cfg.model.latent_dim,)).float()
 
             if self.trainer.num_devices > 1:
-                latent_samples = einx.rearrange(
-                    "w b d -> (w b) d", self.all_gather(latent_samples)
-                )
-
-            self.latent_mean = torch.mean(latent_samples, dim=0)
-            self.latent_scale = torch.std(
-                latent_samples - self.latent_mean, unbiased=False, dim=0
-            )
-
-            del dl_iter
+                # We do it this way (compute stats on rank 0 only) to avoid all_gather memory issues
+                latent_mean = self.trainer.strategy.broadcast(latent_mean, src_rank=0)
+                latent_scale = self.trainer.strategy.broadcast(latent_scale, src_rank=0)
+            
+            self.latent_mean.copy_(latent_mean)
+            self.latent_scale.copy_(latent_scale)
 
             print("Done!")
+
+    @torch.no_grad()
+    def eval_ppl(self, prefix_str, suffix_str, device):
+        ppl_batch = self.ppl_tok.batch_encode_plus(
+            [p + c for p, c in zip(prefix_str, suffix_str)],
+            padding=True,
+            return_tensors="pt",
+            return_offsets_mapping=True,
+            add_special_tokens=False,
+            return_attention_mask=False,
+        ).to(device)
+
+        # Compute token index where continuation starts in the new indices
+        split_idx = split_index_from_offsets(
+            ppl_batch["offset_mapping"],
+            [len(p) for p in prefix_str],
+        )
+
+        # Compute conditional perplexity of suffix given prefix
+        # I.e. ignore prompt and padding tokens in loss (set to -100)
+        # Move generative PPL eval model to GPU
+        ppl_model = self.ppl_model[0].to(device)
+
+        labels = ppl_batch["input_ids"].clone()
+        labels[labels == self.ppl_tok.pad_token_id] = -100
+        for i in range(len(labels)):
+            labels[i, : split_idx[i]] = -100
+        ppl = torch.exp(ppl_model(input_ids=ppl_batch["input_ids"], labels=labels).loss)
+
+        del ppl_model
+        torch.cuda.empty_cache()
+
+        return ppl.item()
 
     def training_step(self, batch, batch_idx=None):
 
@@ -367,7 +407,7 @@ class GaussianDiffusionTask(L.LightningModule):
             sync_dist=True,
         )
 
-        full_loss = suffix_loss + diffusion_loss
+        full_loss = suffix_loss + self.cfg.diffusion_beta * diffusion_loss
 
         self.log(
             "train/loss",
@@ -433,7 +473,7 @@ class GaussianDiffusionTask(L.LightningModule):
             sync_dist=True,
         )
 
-        full_loss = suffix_loss + diffusion_loss
+        full_loss = suffix_loss + self.cfg.diffusion_beta * diffusion_loss
 
         self.log(
             "val/loss",
@@ -446,5 +486,40 @@ class GaussianDiffusionTask(L.LightningModule):
             sync_dist=True,
         )
 
-        
+        # Generate samples and compute perplexity with LLaMA 3B
+        if self.cfg.eval_gen_ppl and batch_idx <= 2:
 
+            z_samples = sample(
+                self.model,
+                schedule=self.sampling_schedule,
+                batch_size=z.shape[0],
+                sampling_timesteps=self.cfg.sampling_timesteps,
+                sampler=self.cfg.sampler,
+                diffusion_objective=self.cfg.diffusion_objective,
+                cond=hidden_states[:, : self.cfg.prefix_length],
+            )
+
+            if self.cfg.normalize_latent:
+                z_samples = self.unnormalize_latent(z_samples)
+
+            suffix_sample_str = self.decoder.tokenizer.batch_decode(
+                self.decoder.generate(
+                    max_length=self.cfg.suffix_length,
+                    z=z_samples,
+                    prefix=batch["input_ids_dec"][:, : self.cfg.prefix_length],
+                ),
+                skip_special_tokens=True,
+            )
+
+            ppl_samples = self.eval_ppl(
+                batch["prefix_str"],
+                suffix_sample_str,
+                device=batch["input_ids_dec"].device,
+            )
+            self.log(
+                "val/gen_ppl",
+                ppl_samples,
+                on_epoch=False,
+                on_step=True,
+                sync_dist=True,
+            )

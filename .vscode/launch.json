@@ -13,8 +13,10 @@
             "justMyCode": false,
             "args": [
                 //"--wandb_id=vjf7103x"
-                "task/dlc_ddpm=base",
+                "task/dlc_ddpm=ae",
                 "num_devices=1",
+                "workers=6",
+                "val_check_interval=1"
                 //"model_checkpoint=test",
                 //"val_check_interval=20",
                 //"workers=4",

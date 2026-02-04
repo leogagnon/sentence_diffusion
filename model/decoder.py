@@ -138,18 +138,26 @@ class DecoderModel(nn.Module):
 
         # Process prefix if provided
         if prefix is not None:
-            assert isinstance(prefix, list), "Prefix should be a list of input_ids"
-            # NOTE: We use left padding for generation
-            prefix = self.tokenizer.pad(
-                {"input_ids": prefix},
-                padding=True,
-                padding_side="left",
-                return_tensors="pt",
-            ).to(device=device)
-            prefix_ids, prefix_attention_mask = (
-                prefix["input_ids"],
-                prefix["attention_mask"],
-            )
+            if isinstance(prefix, list):
+                # NOTE: We use left padding for generation
+                prefix = self.tokenizer.pad(
+                    {"input_ids": prefix},
+                    padding=True,
+                    padding_side="left",
+                    return_tensors="pt",
+                ).to(device=device)
+                prefix_ids, prefix_attention_mask = (
+                    prefix["input_ids"],
+                    prefix["attention_mask"],
+                )
+            else:
+                # If given a tensor, assume there is no padding (all sequences have the same length)
+                assert torch.is_tensor(prefix)
+                prefix_ids = prefix.to(device=device)
+                prefix_attention_mask = torch.ones_like(
+                    prefix_ids, dtype=torch.bool, device=device
+                )
+
             if batch_size is None:
                 batch_size = prefix_ids.shape[0]
 

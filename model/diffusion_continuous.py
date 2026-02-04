@@ -127,7 +127,7 @@ class DiTContinuous(nn.Module):
         pre_proj_dim = 96
         self.input_proj = nn.Sequential(
             nn.Linear(input_dim, cfg.seq_len * pre_proj_dim, bias=False),
-            Rearrange("b (l d) -> b l d", l=cfg.seq_len, d=pre_proj_dim),
+            Rearrange("b 1 (l d) -> b l d", l=cfg.seq_len, d=pre_proj_dim),
             nn.Linear(pre_proj_dim, cfg.n_embd, bias=False),
         )
         self.output_proj = nn.Sequential(
@@ -581,7 +581,7 @@ def sample(
         raise ValueError(f"invalid sampler {sampler}")
     return sample_fn(
         model=model,
-        shape=(batch_size, model.cfg.latent_len, model.cfg.latent_dim),
+        shape=(batch_size, 1, model.cfg.latent_dim),
         class_id=class_id,
         cond=cond,
         cond_input_ids=cond_input_ids,
@@ -686,6 +686,12 @@ def compute_diffusion_loss(
 ):
     bs = latent.shape[0]
     device = latent.device
+    
+    # Make sure latent has shape (B, 1, D)
+    if latent.ndim == 2:
+        latent = latent.unsqueeze(1)
+    else:
+        assert latent.ndim == 3 and latent.shape[1] == 1, "Latent must have shape (B, 1, D)"
 
     times = torch.zeros((bs,), device=device).float().uniform_(0, 1.0)
     noise = torch.randn_like(latent)
@@ -750,7 +756,7 @@ def compute_diffusion_loss(
         assert exists(predictions.pred_v)
         pred = predictions.pred_v
 
-    loss = loss_fn(loss_name)(pred.squeeze(1), target, reduction="none")
+    loss = loss_fn(loss_name)(pred, target, reduction="none")
     loss = loss.mean(dim=-1).mean()  # first average over latent length
 
     return loss

@@ -25,7 +25,7 @@ context_length: null
 
 noise_delta: 0.2
 loss: l2
-sampling_timesteps: 50
+sampling_timesteps: 150
 train_schedule: cosine
 diffusion_objective: pred_v
 schedule_scale: 1.0
