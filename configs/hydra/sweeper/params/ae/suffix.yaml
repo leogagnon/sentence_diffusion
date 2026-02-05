@@ -4,17 +4,16 @@ effective_batch_size: 1024
 task.ae.batch_size: 64
 
 task.ae.prefix_length: 16
-task.ae.suffix_length: 64
+task.ae.suffix_length: 128
+task.ae.context_length: 0
 task.ae.encoder_mode: suffix
 
-task.ae.denoising: true
-task.ae.encoder.train_backbone: true
-task.ae.sem_reset_config.enabled: false
+task.ae.encoder.sem.L: 512, 128
 
 max_steps: 20000
 
 limit_val_batches: 4
 val_check_interval: 256
 
-sweep_id: ae/suffix_3
+sweep_id: ae/suffix
 

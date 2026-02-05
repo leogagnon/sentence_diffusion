@@ -40,6 +40,7 @@ class DeCLUTRTaskConfig:
     num_positives: int = 2
     loss_temp: float = 0.05
     sem_noise: float = 0.0
+    adjacent_positives: bool = False
     sem_reset_config: SEMResetConfig = field(default_factory=SEMResetConfig)
 
     name: Optional[str] = None
@@ -60,6 +61,12 @@ class DeCLUTRTask(L.LightningModule):
                     OmegaConf.create(kwargs),
                 )
             )
+
+        # TODO: Quick fix, change at some point
+        if cfg.adjacent_positives:
+            cfg.num_positives = 1
+        else:
+            cfg.num_positives = 2
 
         self.encoder = EncoderModel(cfg.encoder)
 
@@ -137,6 +144,7 @@ class DeCLUTRTask(L.LightningModule):
             max_span_length=self.cfg.max_span_length,
             num_anchors=self.cfg.num_anchors,
             num_positives=self.cfg.num_positives,
+            adjacent_positives=self.cfg.adjacent_positives,
             seed=random.randint(
                 0, 100000
             ),  # Dataset should be different if restarted,,
@@ -151,7 +159,8 @@ class DeCLUTRTask(L.LightningModule):
             max_span_length=self.cfg.max_span_length,
             num_anchors=self.cfg.num_anchors,
             num_positives=self.cfg.num_positives,
-            seed=32,
+            adjacent_positives=self.cfg.adjacent_positives,
+            seed=42,
         )
 
     def training_step(self, batch, batch_idx):

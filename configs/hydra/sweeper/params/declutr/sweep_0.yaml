@@ -1,14 +1,15 @@
-task/declutr: continuous
+task/declutr: base
 model_checkpoint: base
 
 task.declutr.batch_size: 64
 
 task.declutr.adjacent_positives: true, false
+task.declutr.encoder.sem.L: 512, 128
 
 max_steps: 20000
 
 limit_val_batches: 4
 val_check_interval: 256
 
-sweep_id: declutr/cont
+sweep_id: declutr/sweep_0
 

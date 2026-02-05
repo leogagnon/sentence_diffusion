@@ -1,10 +1,10 @@
 batch_size: 64
-lr: 2e-4
-lr_warmup_steps: 500
+lr: 5e-4
+lr_warmup_steps: 1000
 sem_noise: 0.0
 sem_noise_warmup_steps: 0
 prefix_length: 16
-suffix_length: 64
+suffix_length: 112
 context_length: 0
 denoising: true
 encoder_mode: suffix
@@ -20,7 +20,7 @@ encoder:
   latent_length: 32
 
 decoder:
-  name: gpt2-large # 1.5B params
+  name: gpt2-medium # 1.5B params
   cross_attention: True
   attn_implem: sdpa
 

@@ -6,14 +6,12 @@ import einx
 import lightning as L
 import torch
 import wandb
-from lightning.pytorch.utilities.rank_zero import (rank_zero_info,
-                                                   rank_zero_only)
+from lightning.pytorch.utilities.rank_zero import rank_zero_info, rank_zero_only
 from omegaconf import OmegaConf
 from torch.utils.data.dataset import Subset
-from transformers import get_constant_schedule_with_warmup
+from transformers import get_cosine_schedule_with_warmup
 
-from data import (InfoLabel, LanguageDataset, LanguageDatasetConfig,
-                  PrefixSuffixIterable)
+from data import InfoLabel, LanguageDataset, LanguageDatasetConfig, PrefixSuffixIterable
 from model.decoder import DecoderConfig, DecoderModel
 from model.encoder import EncoderConfig, EncoderModel
 from tasks.utils import *
@@ -130,7 +128,7 @@ class AETask(L.LightningModule):
                     for n, p in self.named_parameters()
                     if not any(nd in n.lower() for nd in no_decay)
                 ],
-                "weight_decay": 0.01,
+                "weight_decay": 0.1,
             },
             {
                 "params": [
@@ -143,8 +141,10 @@ class AETask(L.LightningModule):
         ]
         optimizer = torch.optim.AdamW(optimizer_grouped_parameters, lr=self.cfg.lr)
         if self.cfg.lr_warmup_steps > 0:
-            scheduler = get_constant_schedule_with_warmup(
-                optimizer, num_warmup_steps=self.cfg.lr_warmup_steps
+            scheduler = get_cosine_schedule_with_warmup(
+                optimizer,
+                num_warmup_steps=self.cfg.lr_warmup_steps,
+                num_training_steps=20000
             )
             scheduler = {"scheduler": scheduler, "interval": "step", "frequency": 1}
 
@@ -197,7 +197,7 @@ class AETask(L.LightningModule):
 
     @torch.no_grad()
     def validation_step(self, batch, batch_idx):
-        
+
         # Decode with soft latents
         soft_z, sem_out = self.encoder(
             batch["input_ids_enc"],
@@ -270,7 +270,7 @@ class AETask(L.LightningModule):
                 on_epoch=True,
                 sync_dist=True,
             )
-        
+
         if (batch_idx == 0) and (rank_zero_only.rank == 0):
 
             # Log % of dead words/simplices
@@ -310,7 +310,9 @@ class AETask(L.LightningModule):
                 true_suffix_str = batch["suffix_str"][:5]
                 generated_suffix_str = self.decoder.tokenizer.batch_decode(
                     self.decoder.generate(
-                        z=hard_z[:5], max_length=self.cfg.suffix_length, prefix=prefix_ids
+                        z=hard_z[:5],
+                        max_length=self.cfg.suffix_length,
+                        prefix=prefix_ids,
                     ),
                     skip_special_tokens=True,
                 )
@@ -323,7 +325,9 @@ class AETask(L.LightningModule):
                 true_suffix_str = batch["suffix_str"][:5]
                 generated_suffix_str = self.decoder.tokenizer.batch_decode(
                     self.decoder.generate(
-                        z=soft_z[:5], max_length=self.cfg.suffix_length, prefix=prefix_ids
+                        z=soft_z[:5],
+                        max_length=self.cfg.suffix_length,
+                        prefix=prefix_ids,
                     ),
                     skip_special_tokens=True,
                 )

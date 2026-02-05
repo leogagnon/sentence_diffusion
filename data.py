@@ -77,7 +77,7 @@ class SpanPoissonMasker:
     def __init__(
         self,
         mask_id: int,
-        mask_ratio_range: Tuple[float, float] = (0.1, 0.5),
+        mask_ratio_range: Tuple[float, float] = (0.2, 0.4),
         poisson_lambda: float = 3.5,
         max_span_len: int = 128,
         keep_bos_eos: bool = True,
@@ -133,7 +133,7 @@ class SpanPoissonMasker:
         eligible = end - start
         if eligible <= 0:
             return tokens
-        
+
         mask_ratio = rng.uniform(self.mask_ratio_range[0], self.mask_ratio_range[1])
 
         budget = int(math.ceil(eligible * mask_ratio))
@@ -476,6 +476,7 @@ class DeCLUTRIterable(IterableDataset):
         max_span_length: int,
         num_anchors: int,
         num_positives: int,
+        adjacent_positives: bool,
         seed: Optional[int] = None,
     ):
         assert hasattr(dataset, "__len__") and hasattr(dataset, "__getitem__")
@@ -490,6 +491,7 @@ class DeCLUTRIterable(IterableDataset):
         self.num_positives = num_positives
         self.seed = seed
         self.tok = tokenizer
+        self.adjacent_positives = adjacent_positives
 
     def _make_generator(self) -> random.Random:
         # DDP rank
@@ -526,6 +528,7 @@ class DeCLUTRIterable(IterableDataset):
         max_span_length: int,
         num_anchors: int,
         num_positives: int,
+        adjacent_positives: bool,
         seed: int = 32,
     ) -> DataLoader:
         # Make the collation function
@@ -561,6 +564,7 @@ class DeCLUTRIterable(IterableDataset):
             max_span_length=max_span_length,
             num_anchors=num_anchors,
             num_positives=num_positives,
+            adjacent_positives=adjacent_positives,
             seed=seed,
         )
 
@@ -639,19 +643,42 @@ class DeCLUTRIterable(IterableDataset):
 
                     for _ in range(self.num_positives):
 
-                        # Sample positive length from a beta distribution skewed towards shorter spans. The
-                        # idea is to promote diversity and minimize the amount of overlapping text.
-                        positive_len = int(
-                            generator.betavariate(2, 4)
-                            * (self.max_span_length - self.min_span_length)
-                            + self.min_span_length
-                        )
-                        # By default, spans may be adjacent or overlap with each other and the anchor.
-                        # Careful not to run off the edges of the document (this error may pass silently).
-                        positive_start = generator.randint(
-                            max(0, anchor_start - positive_len),
-                            min(anchor_end, seq_length - positive_len),
-                        )
+                        if self.adjacent_positives:
+                            max_positive_len = min(
+                                self.max_span_length,
+                                max(anchor_start, seq_length - anchor_end),
+                            )
+
+                            positive_len = int(
+                                generator.betavariate(2, 4)
+                                * (max_positive_len - self.min_span_length)
+                                + self.min_span_length
+                            )
+                            # There are two types of adjacent positives, those that border the beginning of the
+                            # anchor and those that border the end. The checks above guarantee at least one of
+                            # these is valid. Here we just choose from the valid positive starts at random.
+                            valid_starts = []
+                            if anchor_start - positive_len > 0:
+                                valid_starts.append(anchor_start - positive_len)
+                            if anchor_end + positive_len <= seq_length:
+                                valid_starts.append(anchor_end)
+                            positive_start = generator.choice(valid_starts)
+
+                        else:
+
+                            # Sample positive length from a beta distribution skewed towards shorter spans. The
+                            # idea is to promote diversity and minimize the amount of overlapping text.
+                            positive_len = int(
+                                generator.betavariate(2, 4)
+                                * (self.max_span_length - self.min_span_length)
+                                + self.min_span_length
+                            )
+                            # By default, spans may be adjacent or overlap with each other and the anchor.
+                            # Careful not to run off the edges of the document (this error may pass silently).
+                            positive_start = generator.randint(
+                                max(0, anchor_start - positive_len),
+                                min(anchor_end, seq_length - positive_len),
+                            )
 
                         positive_end = positive_start + positive_len
                         positives.append(input_ids[positive_start:positive_end])
