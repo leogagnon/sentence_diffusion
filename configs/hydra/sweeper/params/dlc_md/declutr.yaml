@@ -1,6 +1,7 @@
 task/dlc_md: declutr
 model_checkpoint: base
-effective_batch_size: 1024
+
+effective_batch_size: 512
 
 task.dlc_md.pretrained_declutr_id: bqjy99qs
 task.dlc_md.context_length: 112, 0

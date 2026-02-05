@@ -8,12 +8,12 @@ decoder:
 
 eval_gen_ppl: true
 
-dataset:
-  name: fineweb
-  val_size: 16384
-  seed: 42
+pretrained_ae_id: 7v1d8xvl
+#pretrained_declutr_id: bll8h3yb
+DLC_dropout: 0.0
 
-prefix_length: 16
-suffix_length: 64 
+prefix_length: null
+suffix_length: null
+context_length: null
 
-name: ar_baseline
+name: dlc_ar/ae

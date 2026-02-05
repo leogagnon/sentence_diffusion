@@ -9,11 +9,10 @@ import wandb
 from lightning.pytorch.utilities.rank_zero import rank_zero_only
 from omegaconf import OmegaConf
 from torch.utils.data.dataset import Subset
-from transformers import (AutoTokenizer, get_constant_schedule_with_warmup)
+from transformers import AutoTokenizer, get_cosine_schedule_with_warmup
 from transformers.models.auto.modeling_auto import AutoModelForCausalLM
 
-from data import (InfoLabel, LanguageDataset, LanguageDatasetConfig,
-                  PrefixSuffixIterable)
+from data import InfoLabel, LanguageDataset, LanguageDatasetConfig, PrefixSuffixIterable
 from model.decoder import DecoderConfig, DecoderModel
 from tasks.autoencoder import AETask
 from tasks.declutr import DeCLUTRTask
@@ -94,7 +93,7 @@ class DLCARTask(L.LightningModule):
                 strict=False,
                 map_location=torch.device("cpu"),
             )
-            
+
             cfg.dataset = task.cfg.dataset
             assert cfg.prefix_length is not None
             assert cfg.suffix_length is not None
@@ -110,7 +109,7 @@ class DLCARTask(L.LightningModule):
             assert cfg.suffix_length is not None
             cfg.context_length = 0
 
-        # Create decoder  
+        # Create decoder
         self.decoder = DecoderModel(cfg.decoder).train().requires_grad_(True)
 
         # Initialize Generative PPL eval model
@@ -182,8 +181,10 @@ class DLCARTask(L.LightningModule):
         ]
         optimizer = torch.optim.AdamW(optimizer_grouped_parameters, lr=self.cfg.lr)
         if self.cfg.lr_warmup_steps > 0:
-            scheduler = get_constant_schedule_with_warmup(
-                optimizer, num_warmup_steps=self.cfg.lr_warmup_steps
+            scheduler = get_cosine_schedule_with_warmup(
+                optimizer,
+                num_warmup_steps=self.cfg.lr_warmup_steps,
+                num_training_steps=20000,
             )
             scheduler = {"scheduler": scheduler, "interval": "step", "frequency": 1}
 

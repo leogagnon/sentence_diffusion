@@ -9,7 +9,7 @@ import wandb
 from lightning.pytorch.utilities.rank_zero import rank_zero_only
 from omegaconf import OmegaConf
 from torch.utils.data.dataset import Subset
-from transformers import AutoTokenizer, get_constant_schedule_with_warmup
+from transformers import AutoTokenizer, get_cosine_schedule_with_warmup
 from transformers.models.auto.modeling_auto import AutoModelForCausalLM
 
 from data import InfoLabel, LanguageDataset, LanguageDatasetConfig, PrefixSuffixIterable
@@ -182,8 +182,10 @@ class DLCMDTask(L.LightningModule):
         ]
         optimizer = torch.optim.AdamW(optimizer_grouped_parameters, lr=self.cfg.lr)
         if self.cfg.lr_warmup_steps > 0:
-            scheduler = get_constant_schedule_with_warmup(
-                optimizer, num_warmup_steps=self.cfg.lr_warmup_steps
+            scheduler = get_cosine_schedule_with_warmup(
+                optimizer,
+                num_warmup_steps=self.cfg.lr_warmup_steps,
+                num_training_steps=20000,
             )
             scheduler = {"scheduler": scheduler, "interval": "step", "frequency": 1}
 
@@ -261,7 +263,7 @@ class DLCMDTask(L.LightningModule):
             input_ids_0[batch["info_mask_dec"] == InfoLabel.SUFFIX.value] = (
                 self.dit.tokenizer.mask_token_id
             )
-            cond_mask_0 = cond_mask
+            cond_mask_0 = cond_mask + (batch["info_mask_dec"] == InfoLabel.SUFFIX.value)
 
             loss_0 = self.dit.compute_loss(
                 input_ids_0,
@@ -280,7 +282,10 @@ class DLCMDTask(L.LightningModule):
             )
 
             # Merge the losses
-            loss = (loss_0 + loss_1) / 2
+            loss = (
+                loss_0 * float(self.encoder.sem.cfg.L)
+                + loss_1 * float(self.cfg.suffix_length)
+            ) / float(self.encoder.sem.cfg.L + self.cfg.suffix_length)
         else:
             attention_mask = batch["info_mask_dec"] != InfoLabel.PAD.value
 

@@ -4,7 +4,7 @@ lr_warmup_steps: 1000
 sem_noise: 0.0
 sem_noise_warmup_steps: 0
 prefix_length: 16
-suffix_length: 112
+suffix_length: 64
 context_length: 0
 denoising: true
 encoder_mode: suffix

@@ -1,6 +1,6 @@
 lr: 2e-4
-lr_warmup_steps: 1000
-batch_size: 32
+lr_warmup_steps: 2000
+batch_size: 64
 val_batch_size: 32
 
 dit:
@@ -10,12 +10,12 @@ dit:
   nucleus_p: 0.9  
   sampling_eps: 1e-3 
 
+ancestral: false
 eval_gen_ppl: true
-pretrained_declutr_id: bqjy99qs
-#pretrained_ae_id: 7x22772a #t6iwcr8a #2ixcxztl 
+pretrained_declutr_id: nb4vdxxb
 
 prefix_length: 16
-suffix_length: 128
-context_length: 240
+suffix_length: 64
+context_length: 112
 
-name: md_base
+name: dlc_md/declutr

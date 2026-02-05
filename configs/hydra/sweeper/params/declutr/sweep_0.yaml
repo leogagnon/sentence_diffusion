@@ -3,7 +3,7 @@ model_checkpoint: base
 
 task.declutr.batch_size: 64
 
-task.declutr.adjacent_positives: true, false
+task.declutr.adjacent_positives: true
 task.declutr.encoder.sem.L: 512, 128
 
 max_steps: 20000

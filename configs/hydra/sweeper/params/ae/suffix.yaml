@@ -4,7 +4,7 @@ effective_batch_size: 1024
 task.ae.batch_size: 64
 
 task.ae.prefix_length: 16
-task.ae.suffix_length: 128
+task.ae.suffix_length: 64
 task.ae.context_length: 0
 task.ae.encoder_mode: suffix
 

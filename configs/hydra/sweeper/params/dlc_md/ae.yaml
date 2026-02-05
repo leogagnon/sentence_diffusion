@@ -1,14 +1,14 @@
 task/dlc_md: ae
 model_checkpoint: base
-effective_batch_size: 1024
+effective_batch_size: 512
 
-task.dlc_md.pretrained_ae_id: 3d7awf56, muzkxbo3
-task.dlc_md.ancestral: True, False
+task.dlc_md.pretrained_ae_id: 7v1d8xvl, vbc8szze, buzjmsmb, zzgjp12e
+task.dlc_md.ancestral: False
 
 max_steps: 20000
 
 limit_val_batches: 4
 val_check_interval: 512
 
-sweep_id: dlc_md/ae_5
+sweep_id: dlc_md/ae
 

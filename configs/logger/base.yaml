@@ -1,6 +1,6 @@
 _target_: lightning.pytorch.loggers.WandbLogger
 entity: guillaume-lajoie
-project: dlc_lm_2
+project: dlc_lm_3
 save_dir: ${log_dir}
 offline: False
 tags: null

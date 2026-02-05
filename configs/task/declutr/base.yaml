@@ -20,7 +20,7 @@ dataset:
   seed: 42
 
 adjacent_positives: true
-min_span_length: 64
+min_span_length: 32
 max_span_length: 160
 num_anchors: 2
 num_positives: 2

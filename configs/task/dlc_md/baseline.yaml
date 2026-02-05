@@ -18,6 +18,6 @@ dataset:
 eval_gen_ppl: true
 
 prefix_length: 16
-suffix_length: 128 
+suffix_length: 64 
 
 name: md_baseline

@@ -1,14 +1,15 @@
-task/dlc_md: base
+task/dlc_md: baseline
 model_checkpoint: base
-effective_batch_size: 1024
+
+effective_batch_size: 512
 
 max_steps: 20000
 
 limit_val_batches: 4
-val_check_interval: 256
+val_check_interval: 512
+
 task.dlc_md.prefix_length: 16
 task.dlc_md.suffix_length: 64
 
-compile: false
 sweep_id: dlc_md/baseline
 

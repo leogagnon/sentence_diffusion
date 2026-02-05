@@ -148,6 +148,14 @@ def main(cfg: Optional[TrainConfig] = None, run_id: Optional[str] = None):
             cfg.task.ae = OmegaConf.merge(
                 OmegaConf.structured(AETaskConfig), run.config["task"]["ae"]
             )
+        elif cfg.task.dlc_ar.pretrained_declutr_id is not None:
+            run = wandb.Api().run(
+                f"guillaume-lajoie/dlc_lm_3/{cfg.task.dlc_ar.pretrained_declutr_id}"
+            )
+            cfg.task.declutr = OmegaConf.merge(
+                OmegaConf.structured(DeCLUTRTaskConfig), run.config["task"]["declutr"]
+            )
+        
     elif cfg.task.dlc_md != None:
         task = DLCMDTask(cfg.task.dlc_md)
         cfg.task.dlc_md = task.cfg
