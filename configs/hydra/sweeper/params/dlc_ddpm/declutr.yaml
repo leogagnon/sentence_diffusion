@@ -1,10 +1,10 @@
 task/dlc_ddpm: declutr
 model_checkpoint: base
 
-task.dlc_ddpm.pretrained_declutr_id: xdwpo3p8, 9ku0dq7a
+task.dlc_ddpm.pretrained_declutr_id: v6jqgrwj
 task.dlc_ddpm.normalize_latent: true
-task.dlc_ddpm.noise_delta: 0.2
-
+task.dlc_ddpm.noise_delta: 0.2, 0.0
+task.dlc_ddpm.context_length: 112, 0
 
 max_steps: 20000
 

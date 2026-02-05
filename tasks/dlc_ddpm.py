@@ -283,7 +283,7 @@ class GaussianDiffusionTask(L.LightningModule):
 
                 dl_iter = iter(self.train_dataloader())
                 latent_samples = []
-                for _ in tqdm(range(10000 // self.cfg.batch_size)):
+                for _ in tqdm(range(30000 // self.cfg.batch_size)):
                     batch = next(dl_iter)
                     latent_samples.append(
                         self.encoder(
@@ -300,18 +300,24 @@ class GaussianDiffusionTask(L.LightningModule):
                     latent_samples - latent_mean, unbiased=False, dim=0
                 )
 
+                latent_mean = latent_mean.cpu().float()
+                latent_scale = latent_scale.cpu().float()
+
                 del dl_iter
             else:
-                latent_mean = torch.zeros(size=(self.cfg.model.latent_dim,)).float()
-                latent_scale = torch.zeros(size=(self.cfg.model.latent_dim,)).float()
+                latent_mean = torch.zeros(size=(self.cfg.model.latent_dim,)).cpu().float()
+                latent_scale = torch.zeros(size=(self.cfg.model.latent_dim,)).cpu().float()
 
             if self.trainer.num_devices > 1:
                 # We do it this way (compute stats on rank 0 only) to avoid all_gather memory issues
-                latent_mean = self.trainer.strategy.broadcast(latent_mean, src_rank=0)
-                latent_scale = self.trainer.strategy.broadcast(latent_scale, src_rank=0)
+                latent_mean = self.trainer.strategy.broadcast(latent_mean, src=0)
+                latent_scale = self.trainer.strategy.broadcast(latent_scale, src=0)
             
             self.latent_mean.copy_(latent_mean)
             self.latent_scale.copy_(latent_scale)
+
+            self.latent_mean = self.latent_mean.to(self.device)
+            self.latent_scale = self.latent_scale.to(self.device)
 
             print("Done!")
 
