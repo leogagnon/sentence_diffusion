@@ -111,6 +111,7 @@ class DLCMDTask(L.LightningModule):
         else:
             assert cfg.prefix_length is not None
             assert cfg.suffix_length is not None
+            assert cfg.ancestral == False
             cfg.context_length = 0
 
         # Create decoder
@@ -255,15 +256,13 @@ class DLCMDTask(L.LightningModule):
         )
 
         if self.cfg.ancestral:
-            # Mask the suffix and don't compute loss on it (this trains the DLC sampling)
-            attention_mask_0 = (batch["info_mask_dec"] != InfoLabel.PAD.value) * (
-                batch["info_mask_dec"] != InfoLabel.SUFFIX.value
-            )
+            # Mask the suffix, only compute loss on the DLC, condition on everything else
             input_ids_0 = batch["input_ids_dec"].clone()
             input_ids_0[batch["info_mask_dec"] == InfoLabel.SUFFIX.value] = (
                 self.dit.tokenizer.mask_token_id
             )
-            cond_mask_0 = cond_mask + (batch["info_mask_dec"] == InfoLabel.SUFFIX.value)
+            attention_mask_0 = batch["info_mask_dec"] == InfoLabel.DLC.value
+            cond_mask_0 = torch.logical_not(attention_mask_0)
 
             loss_0 = self.dit.compute_loss(
                 input_ids_0,
@@ -271,12 +270,11 @@ class DLCMDTask(L.LightningModule):
                 cond_mask=cond_mask_0,
             )
 
-            # Only compute loss on the suffix sampling part
+            # Compute loss only on suffix, condition on everything but suffix
             attention_mask_1 = batch["info_mask_dec"] == InfoLabel.SUFFIX.value
-            input_ids_1 = batch["input_ids_dec"]
-            cond_mask_1 = cond_mask + (batch["info_mask_dec"] == InfoLabel.DLC.value)
+            cond_mask_1 = torch.logical_not(attention_mask_1)
             loss_1 = self.dit.compute_loss(
-                input_ids_1,
+                batch["input_ids_dec"],
                 attention_mask=attention_mask_1,
                 cond_mask=cond_mask_1,
             )
@@ -287,12 +285,12 @@ class DLCMDTask(L.LightningModule):
                 + loss_1 * float(self.cfg.suffix_length)
             ) / float(self.encoder.sem.cfg.L + self.cfg.suffix_length)
         else:
-            attention_mask = batch["info_mask_dec"] != InfoLabel.PAD.value
 
-            # Start with prefix and <think> tokens unmasked
-            cond_mask = (batch["info_mask_dec"] == InfoLabel.PREFIX.value) + (
-                batch["info_mask_dec"] == InfoLabel.SPECIAL.value
+            # Compute loss on suffix + DLC, condition on everthing else
+            attention_mask = (batch["info_mask_dec"] == InfoLabel.SUFFIX.value) + (
+                batch["info_mask_dec"] == InfoLabel.DLC.value
             )
+            cond_mask = torch.logical_not(attention_mask)
             loss = self.dit.compute_loss(
                 batch["input_ids_dec"],
                 attention_mask=attention_mask,
