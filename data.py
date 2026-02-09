@@ -398,7 +398,7 @@ class PrefixSuffixIterable(IterableDataset):
                     input_ids_dec = (
                         prefix_ids_dec
                         + [self.dec_tok.think_token_id]
-                        + ([-1] * self.num_dlc_ph)
+                        + ([0] * self.num_dlc_ph)
                         + [self.dec_tok.think_token_id]
                         + suffix_ids_dec
                     )

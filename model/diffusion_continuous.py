@@ -49,7 +49,7 @@ class DiTContinuousConfig:
     class_conditional: bool = False
     num_classes: int = 0
     cond_modulation: Optional[bool] = False
-    seq_unconditional_prob: Optional[float] = 0.1
+    seq_unconditional_prob: Optional[float] = 0.0
     class_unconditional_prob: Optional[float] = 0.1
     self_condition: Optional[bool] = False
     train_prob_self_cond: Optional[float] = 0.5
@@ -579,7 +579,7 @@ def sample(
         sample_fn = dpmpp_sample
     else:
         raise ValueError(f"invalid sampler {sampler}")
-    return sample_fn(
+    z = sample_fn(
         model=model,
         shape=(batch_size, 1, model.cfg.latent_dim),
         class_id=class_id,
@@ -591,7 +591,7 @@ def sample(
         cls_free_guidance=cls_free_guidance,
         diffusion_objective=diffusion_objective,
     )
-
+    return z.squeeze(1)
 
 def right_pad_dims_to(x, t):
     padding_dims = x.ndim - t.ndim
@@ -686,12 +686,14 @@ def compute_diffusion_loss(
 ):
     bs = latent.shape[0]
     device = latent.device
-    
+
     # Make sure latent has shape (B, 1, D)
     if latent.ndim == 2:
         latent = latent.unsqueeze(1)
     else:
-        assert latent.ndim == 3 and latent.shape[1] == 1, "Latent must have shape (B, 1, D)"
+        assert (
+            latent.ndim == 3 and latent.shape[1] == 1
+        ), "Latent must have shape (B, 1, D)"
 
     times = torch.zeros((bs,), device=device).float().uniform_(0, 1.0)
     noise = torch.randn_like(latent)

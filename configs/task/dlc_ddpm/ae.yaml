@@ -4,7 +4,7 @@ batch_size: 128
 
 decoder:
   name: gpt2-medium # 1.5B params
-  cross_attention: true
+  cross_attention: false
   attn_implem: sdpa
 
 model:
@@ -13,7 +13,7 @@ model:
   n_embd: 768
   seq_len: 64
   dropout: 0.0
-  cond_modulation: false
+  cond_modulation: true
 
 eval_gen_ppl: true
 
@@ -23,13 +23,14 @@ prefix_length: null
 suffix_length: null
 context_length: null
 
-noise_delta: 0.2
+use_ema: false
+noise_delta: 0.3
 loss: l2
 sampling_timesteps: 50
 train_schedule: cosine
 diffusion_objective: pred_v
 schedule_scale: 1.0
 sampler: ddpm
-normalize_latent: true
+normalize_latent: false
 
 name: ddpm_base

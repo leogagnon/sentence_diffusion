@@ -20,6 +20,7 @@ from tasks.autoencoder import AETask
 from tasks.utils import *
 from model.decoder import DecoderModel, DecoderConfig
 from model.diffusion_continuous import *
+from torch.optim.swa_utils import AveragedModel, get_ema_avg_fn
 
 
 @dataclass
@@ -29,9 +30,11 @@ class GaussianDiffusionTaskConfig:
     lr: float
     lr_warmup_steps: int
     decoder: DecoderConfig
+    use_ema: bool = False
     diffusion_beta: float = 5.0
     noise_delta: float = 0.0
     eval_gen_ppl: bool = True
+    soft_prompt_len: int = 16
 
     pretrained_declutr_id: Optional[str] = None
     pretrained_ae_id: Optional[str] = None
@@ -150,13 +153,20 @@ class GaussianDiffusionTask(L.LightningModule):
             self.ppl_tok.pad_token = self.ppl_tok.eos_token
 
         # Init decoder (with cross attention dim = encoder latent dim)
-        cfg.decoder.condition_dim = self.encoder.backbone_dim
         self.decoder = DecoderModel(cfg.decoder).train().requires_grad_(True)
 
         # Init DiT (with seq conditional dim = decoder latent dim; latent dim = encoder latent dim)
         cfg.model.latent_dim = self.encoder.backbone_dim
         cfg.model.seq_conditional_dim = self.decoder.latent_dim
         self.model = DiTContinuous(cfg.model).train().requires_grad_(True)
+
+        # Maybe init EMA model
+        if cfg.use_ema:
+            self.ema_model = (
+                AveragedModel(self.model, avg_fn=get_ema_avg_fn())
+                .eval()
+                .requires_grad_(False)
+            )
 
         # Init latent normalization if needed
         if cfg.normalize_latent:
@@ -178,6 +188,29 @@ class GaussianDiffusionTask(L.LightningModule):
             else:
                 self.encoder_mode = "suffix"
 
+        # A small network which transforms the diffusion latent into a soft prompt for the decoder
+        pre_proj_dim = 96
+        self.soft_thought_gen = nn.Sequential(
+            nn.Linear(
+                self.encoder.backbone_dim,
+                cfg.soft_prompt_len * pre_proj_dim,
+                bias=False,
+            ),
+            Rearrange("b (l d) -> b l d", l=cfg.soft_prompt_len, d=pre_proj_dim),
+            nn.Linear(pre_proj_dim, self.decoder.latent_dim, bias=False),
+            AttentionLayers(
+                causal=False,
+                dim=self.decoder.latent_dim,
+                depth=3,
+                heads=8,
+                attn_dropout=0.0,
+                ff_dropout=0.0,
+                rel_pos_bias=False,
+                ff_glu=True,
+                ff_swish=True,
+            ),
+        )
+
         self.cfg = cfg
         # Important for checkpoints
         self.save_hyperparameters(
@@ -186,9 +219,10 @@ class GaussianDiffusionTask(L.LightningModule):
 
     def train(self, mode: bool = True):
         super().train(mode)
-        # Make sure encoder and decoder and EMA are always in eval mode
+        # Make sure encoder is always in eval mode
         self.encoder.eval()
-        self.decoder.eval()
+        if self.cfg.use_ema:
+            self.ema_model.eval()
 
         return self
 
@@ -255,7 +289,7 @@ class GaussianDiffusionTask(L.LightningModule):
             encoder_mode=self.encoder_mode,
             encoder_noise=False,  # No noise during DLC-LM finetuning
             seed=random.randint(0, 100000),  # Dataset should be different if restarted,
-            num_dlc_ph=0,
+            num_dlc_ph=self.cfg.soft_prompt_len,
         )
 
     def val_dataloader(self):
@@ -270,7 +304,7 @@ class GaussianDiffusionTask(L.LightningModule):
             encoder_mode=self.encoder_mode,
             encoder_noise=False,
             seed=42,  # Always the same validation set for consistency,
-            num_dlc_ph=0,
+            num_dlc_ph=self.cfg.soft_prompt_len,
         )
 
     @torch.no_grad()
@@ -305,14 +339,18 @@ class GaussianDiffusionTask(L.LightningModule):
 
                 del dl_iter
             else:
-                latent_mean = torch.zeros(size=(self.cfg.model.latent_dim,)).cpu().float()
-                latent_scale = torch.zeros(size=(self.cfg.model.latent_dim,)).cpu().float()
+                latent_mean = (
+                    torch.zeros(size=(self.cfg.model.latent_dim,)).cpu().float()
+                )
+                latent_scale = (
+                    torch.zeros(size=(self.cfg.model.latent_dim,)).cpu().float()
+                )
 
             if self.trainer.num_devices > 1:
                 # We do it this way (compute stats on rank 0 only) to avoid all_gather memory issues
                 latent_mean = self.trainer.strategy.broadcast(latent_mean, src=0)
                 latent_scale = self.trainer.strategy.broadcast(latent_scale, src=0)
-            
+
             self.latent_mean.copy_(latent_mean)
             self.latent_scale.copy_(latent_scale)
 
@@ -341,7 +379,7 @@ class GaussianDiffusionTask(L.LightningModule):
         # Compute conditional perplexity of suffix given prefix
         # I.e. ignore prompt and padding tokens in loss (set to -100)
         # Move generative PPL eval model to GPU
-        ppl_model = self.ppl_model[0].to(device)
+        ppl_model = self.ppl_model[0]
 
         labels = ppl_batch["input_ids"].clone()
         labels[labels == self.ppl_tok.pad_token_id] = -100
@@ -349,15 +387,30 @@ class GaussianDiffusionTask(L.LightningModule):
             labels[i, : split_idx[i]] = -100
         ppl = torch.exp(ppl_model(input_ids=ppl_batch["input_ids"], labels=labels).loss)
 
-        del ppl_model
-        torch.cuda.empty_cache()
-
         return ppl.item()
+
+    def get_input_embeds(self, batch, z):
+        """
+        Given a batch and the corresponding diffusion latents z, compute the soft thoughts with self.soft_thought_gen
+        and fill them in the placeholders of the input_ids (with the DLC tags)
+        """
+        # Embed the input_ids
+        input_ids = batch["input_ids_dec"]
+        input_embeds = self.decoder.backbone.get_input_embeddings()(input_ids)
+
+        # Compute soft thoughts
+        soft_thought = self.soft_thought_gen(z).to(input_embeds.dtype)
+
+        # Replace the DLC ph tokens with the corresponding soft thoughts
+        dlc_ph_mask = batch["info_mask_dec"] == InfoLabel.DLC.value
+        input_embeds[dlc_ph_mask] = soft_thought.view(-1, self.decoder.latent_dim)
+
+        return input_embeds
 
     def training_step(self, batch, batch_idx=None):
 
+        # Compute continuous latent
         with torch.no_grad():
-            # Compute latent with encoder
             z = self.encoder(
                 batch["input_ids_enc"],
                 attention_mask=batch["attention_mask_enc"],
@@ -366,17 +419,18 @@ class GaussianDiffusionTask(L.LightningModule):
             if self.cfg.normalize_latent:
                 z = self.normalize_latent(z)
 
-        # Maybe add a little noise to the latent (interpolating between latents and standard normal)
-        # Supposed to help mitigate sampling errors of the diffusion model
-        if self.cfg.noise_delta > 0.0:
-            noise = torch.randn_like(z)
-            z = noise * self.cfg.noise_delta + z * math.sqrt(
-                (1.0 - self.cfg.noise_delta**2)
-            )
-
-        # Compute suffix loss (conditionned on prefix + latent)
+        # Run the decoder on prefix <think> soft thought <think> suffix
+        # NOTE:
+        # 1) We apply noise to z if noise_delta > 0;
+        # 2) The prefix embeds are used condition the DiT
+        # 3) The decoder is only trained on the suffix
+        input_embeds = self.get_input_embeds(
+            batch,
+            torch.randn_like(z) * self.cfg.noise_delta
+            + z * math.sqrt((1.0 - self.cfg.noise_delta**2)),
+        )
         logits, hidden_states = self.decoder(
-            input_ids=batch["input_ids_dec"], z=z, return_hidden_states=True
+            input_embeds=input_embeds, return_hidden_states=True
         )
         info_mask_dec = batch["info_mask_dec"][:, 1:]
         targets = batch["input_ids_dec"][:, 1:].contiguous()
@@ -397,6 +451,7 @@ class GaussianDiffusionTask(L.LightningModule):
         )
 
         # Compute diffusion loss (conditionned on prefix hidden states)
+        # NOTE: The latent here is not noised
         diffusion_loss = compute_diffusion_loss(
             self.model,
             z,
@@ -431,7 +486,9 @@ class GaussianDiffusionTask(L.LightningModule):
     @torch.no_grad()
     def validation_step(self, batch, batch_idx=None):
 
-        # Compute latent with encoder
+        val_model = self.ema_model.module if self.cfg.use_ema else self.model
+
+        # Compute continuous latent
         z = self.encoder(
             batch["input_ids_enc"],
             attention_mask=batch["attention_mask_enc"],
@@ -440,9 +497,17 @@ class GaussianDiffusionTask(L.LightningModule):
         if self.cfg.normalize_latent:
             z = self.normalize_latent(z)
 
-        # Compute suffix loss (conditionned on prefix + latent)
+        # Run the decoder on prefix <think> soft thought <think> suffix
+        # NOTE:
+        # 1) We apply noise to z if noise_delta > 0;
+        # 2) The prefix embeds are used condition the DiT
+        # 3) The decoder is only trained on the suffix
+        input_embeds = self.get_input_embeds(
+            batch,
+            z,
+        )
         logits, hidden_states = self.decoder(
-            input_ids=batch["input_ids_dec"], z=z, return_hidden_states=True
+            input_embeds=input_embeds, return_hidden_states=True
         )
         info_mask_dec = batch["info_mask_dec"][:, 1:]
         targets = batch["input_ids_dec"][:, 1:].contiguous()
@@ -457,14 +522,14 @@ class GaussianDiffusionTask(L.LightningModule):
         self.log(
             "val/suffix_loss",
             suffix_loss,
-            on_epoch=False,
-            on_step=True,
+            on_epoch=True,
+            on_step=False,
             sync_dist=True,
         )
 
         # Compute diffusion loss (conditionned on prefix hidden states)
         diffusion_loss = compute_diffusion_loss(
-            self.model,
+            val_model,
             z,
             cond=hidden_states[:, : self.cfg.prefix_length],
             schedule=self.train_schedule,
@@ -474,8 +539,8 @@ class GaussianDiffusionTask(L.LightningModule):
         self.log(
             "val/diffusion_loss",
             diffusion_loss,
-            on_epoch=False,
-            on_step=True,
+            on_epoch=True,
+            on_step=False,
             sync_dist=True,
         )
 
@@ -484,11 +549,10 @@ class GaussianDiffusionTask(L.LightningModule):
         self.log(
             "val/loss",
             full_loss,
-            prog_bar=True,
             add_dataloader_idx=False,
             batch_size=z.shape[0],
-            on_step=True,
-            on_epoch=False,
+            on_step=False,
+            on_epoch=True,
             sync_dist=True,
         )
 
@@ -496,7 +560,7 @@ class GaussianDiffusionTask(L.LightningModule):
         if self.cfg.eval_gen_ppl and batch_idx <= 2:
 
             z_samples = sample(
-                self.model,
+                val_model,
                 schedule=self.sampling_schedule,
                 batch_size=z.shape[0],
                 sampling_timesteps=self.cfg.sampling_timesteps,
@@ -505,14 +569,12 @@ class GaussianDiffusionTask(L.LightningModule):
                 cond=hidden_states[:, : self.cfg.prefix_length],
             )
 
-            if self.cfg.normalize_latent:
-                z_samples = self.unnormalize_latent(z_samples)
+            input_embeds_samples = self.get_input_embeds(batch, z_samples)
 
             suffix_sample_str = self.decoder.tokenizer.batch_decode(
                 self.decoder.generate(
+                    prefix_embeds=input_embeds_samples[:, : -self.cfg.suffix_length],
                     max_length=self.cfg.suffix_length,
-                    z=z_samples,
-                    prefix=batch["input_ids_dec"][:, : self.cfg.prefix_length],
                 ),
                 skip_special_tokens=True,
             )
@@ -525,7 +587,51 @@ class GaussianDiffusionTask(L.LightningModule):
             self.log(
                 "val/gen_ppl",
                 ppl_samples,
-                on_epoch=False,
-                on_step=True,
+                on_epoch=True,
+                on_step=False,
                 sync_dist=True,
             )
+
+            suffix_sample_str_recon = self.decoder.tokenizer.batch_decode(
+                self.decoder.generate(
+                    prefix_embeds=input_embeds[:, : -self.cfg.suffix_length],
+                    max_length=self.cfg.suffix_length,
+                ),
+                skip_special_tokens=True,
+            )
+
+            ppl_samples_recon = self.eval_ppl(
+                batch["prefix_str"],
+                suffix_sample_str_recon,
+                device=batch["input_ids_dec"].device,
+            )
+            self.log(
+                "val/gen_ppl_true",
+                ppl_samples_recon,
+                on_epoch=True,
+                on_step=False,
+                sync_dist=True,
+            )
+
+            table = wandb.Table(columns=["Prefix", "True Suffix", "Generated Suffix"])
+            for i in range(5):
+                table.add_data(batch["prefix_str"][i], batch["suffix_str"][i], suffix_sample_str_recon[i])
+            wandb.log({"val/samples": table})
+            del table
+
+    def on_train_batch_end(self, outputs, batch, batch_idx):
+        # Update EMA model every step
+        if (batch_idx % self.trainer.accumulate_grad_batches == 0) and self.cfg.use_ema:
+            self.ema_model.update_parameters(self.model)
+
+    def on_validation_epoch_start(self):
+        if self.cfg.use_ema:
+            self.ema_model = self.ema_model.to(self.device)
+        self.ppl_model[0] = self.ppl_model[0].to(self.device)
+        torch.cuda.empty_cache()
+
+    def on_validation_epoch_end(self):
+        if self.cfg.use_ema:
+            self.ema_model = self.ema_model.cpu()
+        self.ppl_model[0] = self.ppl_model[0].cpu()
+        torch.cuda.empty_cache()

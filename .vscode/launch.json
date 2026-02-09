@@ -13,10 +13,10 @@
             "justMyCode": false,
             "args": [
                 //"--wandb_id=vjf7103x"
-                "task/declutr=base",
+                "task/dlc_ddpm=ae",
                 "num_devices=1",
                 "workers=4",
-                //"val_check_interval=1"
+                "val_check_interval=1"
                 //"model_checkpoint=test",
                 //"val_check_interval=20",
                 //"workers=4",

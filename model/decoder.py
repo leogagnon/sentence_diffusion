@@ -17,10 +17,10 @@ from transformers.models.auto.modeling_auto import AutoModelForCausalLM
 class DecoderConfig:
     name: str
     cross_attention: bool = False
-    condition_dim: Optional[int] = None
     dlc_vocab_size: int = 0
     dlc_len: Optional[int] = None
     attn_implem: str = "sdpa"
+    condition_dim: Optional[int] = None # For backwards compatibility
 
 
 class DecoderModel(nn.Module):
@@ -46,18 +46,6 @@ class DecoderModel(nn.Module):
             self.backbone.set_attn_implementation(cfg.attn_implem)
         except:
             rank_zero_info(f"Tried to use {cfg.attn_implem} in decoder, but it failed.")
-
-        if cfg.condition_dim is not None:
-            assert (
-                cfg.condition_dim % 8 == 0
-            ), "Condition dimension must be divisible by 8"
-            pre_proj_dim = 96
-            seq_len = 16
-            self.cross_attention_proj = nn.Sequential(
-                nn.Linear(cfg.condition_dim, seq_len * pre_proj_dim, bias=False),
-                Rearrange("b (l d) -> b l d", l=seq_len, d=pre_proj_dim),
-                nn.Linear(pre_proj_dim, self.latent_dim, bias=False),
-            )
 
         # Disable dropout in the backbone
         for module in self.backbone.modules():
@@ -95,18 +83,20 @@ class DecoderModel(nn.Module):
 
     def forward(
         self,
-        input_ids,
+        input_ids: Optional[torch.Tensor] = None,
+        input_embeds: Optional[torch.Tensor] = None,
         attention_mask: Optional[torch.Tensor] = None,
         z: Optional[torch.Tensor] = None,
         return_hidden_states: bool = False,
     ):
-        if self.cfg.condition_dim is not None and z is not None:
-            # Project z to cross-attention dimension
-            z = self.cross_attention_proj(z)
+        assert (input_ids is not None) or (
+            input_embeds is not None
+        ), "Must provide either input_ids or input_embeds"
 
         if return_hidden_states:
             outputs = self.backbone(
                 input_ids=input_ids,
+                inputs_embeds=input_embeds,
                 attention_mask=attention_mask,
                 encoder_hidden_states=z,
                 output_hidden_states=True,
@@ -115,6 +105,7 @@ class DecoderModel(nn.Module):
         else:
             return self.backbone(
                 input_ids=input_ids,
+                inputs_embeds=input_embeds,
                 attention_mask=attention_mask,
                 encoder_hidden_states=z,
             ).logits
@@ -125,6 +116,7 @@ class DecoderModel(nn.Module):
         max_length: int,
         z: Optional[torch.Tensor] = None,
         prefix: Optional[List[List[int]]] = None,
+        prefix_embeds: Optional[torch.Tensor] = None,
         dlc: Optional[List[List[int]]] = None,
         batch_size: Optional[int] = None,
         gen_kwargs: Optional[dict] = None,
@@ -225,10 +217,11 @@ class DecoderModel(nn.Module):
         else:
             # This means we are in normal generation mode, maybe with z conditioning
             assert (
-                prefix is not None
-            ), "Right now, generation without DLC must be conditionned on a prefix"
-            input_ids = prefix_ids
-            attention_mask = prefix_attention_mask
+                (prefix is not None) or (prefix_embeds is not None)
+            )
+            if prefix is not None:
+                input_ids = prefix_ids
+                attention_mask = prefix_attention_mask
             # NOTE: Final input_ids are : prefix
 
         gen_cfg = {
@@ -245,14 +238,20 @@ class DecoderModel(nn.Module):
         if gen_kwargs is not None:
             gen_cfg.update(gen_kwargs)
 
-        output = self.backbone.generate(
-            input_ids=input_ids,
-            generation_config=GenerationConfig(**gen_cfg),
-            encoder_hidden_states=z,
-            attention_mask=attention_mask,
-        )
-
-        # Remove the input_ids prefix
-        output = output[:, input_ids.shape[1] :]
+        if prefix_embeds is not None:
+            output = self.backbone.generate(
+                inputs_embeds=prefix_embeds,
+                generation_config=GenerationConfig(**gen_cfg),
+                encoder_hidden_states=z,
+            )        
+            output = output[:, prefix_embeds.shape[1] :]  # Remove the prefix
+        else:
+            output = self.backbone.generate(
+                input_ids=input_ids,
+                generation_config=GenerationConfig(**gen_cfg),
+                encoder_hidden_states=z,
+                attention_mask=attention_mask,
+            )
+            output = output[:, input_ids.shape[1] :]  # Remove the prefix
 
         return output

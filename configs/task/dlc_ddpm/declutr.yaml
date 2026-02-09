@@ -4,7 +4,7 @@ batch_size: 128
 
 decoder:
   name: gpt2-medium # 1.5B params
-  cross_attention: true
+  cross_attention: false
   attn_implem: sdpa
 
 model:
@@ -23,7 +23,7 @@ prefix_length: 16
 suffix_length: 64
 context_length: 112
 
-noise_delta: 0.2
+noise_delta: 0.3
 loss: l2
 sampling_timesteps: 50
 train_schedule: cosine
