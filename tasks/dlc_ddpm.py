@@ -11,7 +11,7 @@ import wandb
 from lightning.pytorch.utilities.rank_zero import rank_zero_only
 from omegaconf import OmegaConf
 from torch.utils.data.dataset import Subset
-from transformers import AutoTokenizer, get_constant_schedule_with_warmup
+from transformers import AutoTokenizer, get_cosine_schedule_with_warmup
 from transformers.models.auto.modeling_auto import AutoModelForCausalLM
 
 from data import InfoLabel, LanguageDataset, LanguageDatasetConfig, PrefixSuffixIterable
@@ -162,11 +162,11 @@ class GaussianDiffusionTask(L.LightningModule):
 
         # Maybe init EMA model
         if cfg.use_ema:
-            self.ema_model = (
+            self.ema_model = [
                 AveragedModel(self.model, avg_fn=get_ema_avg_fn())
                 .eval()
                 .requires_grad_(False)
-            )
+            ]
 
         # Init latent normalization if needed
         if cfg.normalize_latent:
@@ -222,7 +222,7 @@ class GaussianDiffusionTask(L.LightningModule):
         # Make sure encoder is always in eval mode
         self.encoder.eval()
         if self.cfg.use_ema:
-            self.ema_model.eval()
+            self.ema_model[0].eval()
 
         return self
 
@@ -268,8 +268,8 @@ class GaussianDiffusionTask(L.LightningModule):
         ]
         optimizer = torch.optim.AdamW(optimizer_grouped_parameters, lr=self.cfg.lr)
         if self.cfg.lr_warmup_steps > 0:
-            scheduler = get_constant_schedule_with_warmup(
-                optimizer, num_warmup_steps=self.cfg.lr_warmup_steps
+            scheduler = get_cosine_schedule_with_warmup(
+                optimizer, num_warmup_steps=self.cfg.lr_warmup_steps, num_training_steps=20000
             )
             scheduler = {"scheduler": scheduler, "interval": "step", "frequency": 1}
 
@@ -486,7 +486,7 @@ class GaussianDiffusionTask(L.LightningModule):
     @torch.no_grad()
     def validation_step(self, batch, batch_idx=None):
 
-        val_model = self.ema_model.module if self.cfg.use_ema else self.model
+        val_model = self.ema_model[0].module if self.cfg.use_ema else self.model
 
         # Compute continuous latent
         z = self.encoder(
@@ -612,26 +612,48 @@ class GaussianDiffusionTask(L.LightningModule):
                 on_step=False,
                 sync_dist=True,
             )
-
-            table = wandb.Table(columns=["Prefix", "True Suffix", "Generated Suffix"])
-            for i in range(5):
-                table.add_data(batch["prefix_str"][i], batch["suffix_str"][i], suffix_sample_str_recon[i])
-            wandb.log({"val/samples": table})
-            del table
+            if (rank_zero_only.rank == 0) and (wandb.run is not None):
+                table = wandb.Table(
+                    columns=["Prefix", "True Suffix", "Generated Suffix"]
+                )
+                for i in range(5):
+                    table.add_data(
+                        batch["prefix_str"][i],
+                        batch["suffix_str"][i],
+                        suffix_sample_str_recon[i],
+                    )
+                wandb.log({"val/samples": table})
+                del table
 
     def on_train_batch_end(self, outputs, batch, batch_idx):
         # Update EMA model every step
-        if (batch_idx % self.trainer.accumulate_grad_batches == 0) and self.cfg.use_ema:
-            self.ema_model.update_parameters(self.model)
+        if (
+            (batch_idx % self.trainer.accumulate_grad_batches == 0)
+            and self.cfg.use_ema
+            and (rank_zero_only.rank == 0)
+        ):
+            self.ema_model[0].update_parameters(self.model)
 
     def on_validation_epoch_start(self):
         if self.cfg.use_ema:
-            self.ema_model = self.ema_model.to(self.device)
+
+            # Broadcast EMA model from rank 0 to all ranks (on CPU)
+            if self.trainer.num_devices > 1:
+                for param in self.ema_model[0].parameters():
+                    self.trainer.strategy.broadcast(param.data, src=0)
+
+                for buffer in self.ema_model[0].buffers():
+                    self.trainer.strategy.broadcast(buffer.data, src=0)
+
+            # Move EMA model to GPU for validation
+            self.ema_model[0] = self.ema_model[0].to(self.device)
+
         self.ppl_model[0] = self.ppl_model[0].to(self.device)
         torch.cuda.empty_cache()
 
     def on_validation_epoch_end(self):
+        # Move EMA model back to CPU after validation to save GPU memory
         if self.cfg.use_ema:
-            self.ema_model = self.ema_model.cpu()
+            self.ema_model[0] = self.ema_model[0].cpu()
         self.ppl_model[0] = self.ppl_model[0].cpu()
         torch.cuda.empty_cache()

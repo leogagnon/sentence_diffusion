@@ -2,8 +2,8 @@ task/dlc_ddpm: ae
 model_checkpoint: base
 
 task.dlc_ddpm.pretrained_ae_id: uw5t6rkg, p2d8csdo
-task.dlc_ddpm.normalize_latent: true, false
-task.dlc_ddpm.use_ema: true, false
+task.dlc_ddpm.normalize_latent: true
+task.dlc_ddpm.use_ema: true
 task.dlc_ddpm.noise_delta: 0.3
 
 

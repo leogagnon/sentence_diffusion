@@ -1,4 +1,4 @@
-lr: 5e-4
+lr: 1e-4
 lr_warmup_steps: 2000
 batch_size: 128
 
@@ -13,17 +13,17 @@ model:
   n_embd: 768
   seq_len: 64
   dropout: 0.0
-  cond_modulation: true
+  cond_modulation: false
 
 eval_gen_ppl: true
 
-pretrained_ae_id: uw5t6rkg
+pretrained_ae_id: p2d8csdo
 
 prefix_length: null
 suffix_length: null
 context_length: null
 
-use_ema: false
+use_ema: true
 noise_delta: 0.3
 loss: l2
 sampling_timesteps: 50
@@ -31,6 +31,6 @@ train_schedule: cosine
 diffusion_objective: pred_v
 schedule_scale: 1.0
 sampler: ddpm
-normalize_latent: false
+normalize_latent: true
 
 name: ddpm_base
