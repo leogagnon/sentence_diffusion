@@ -320,16 +320,13 @@ class DLCMDTask(L.LightningModule):
         # Compute conditional perplexity of suffix given prefix
         # I.e. ignore prompt and padding tokens in loss (set to -100)
         # Move generative PPL eval model to GPU
-        ppl_model = self.ppl_model[0].to(device)
+        ppl_model = self.ppl_model[0]
 
         labels = ppl_batch["input_ids"].clone()
         labels[labels == self.ppl_tok.pad_token_id] = -100
         for i in range(len(labels)):
             labels[i, : split_idx[i]] = -100
         ppl = torch.exp(ppl_model(input_ids=ppl_batch["input_ids"], labels=labels).loss)
-
-        del ppl_model
-        torch.cuda.empty_cache()
 
         return ppl.item()
 
@@ -345,6 +342,7 @@ class DLCMDTask(L.LightningModule):
             if self.cfg.eval_gen_ppl:
 
                 if not self.cfg.ancestral:
+
                     # p(DLC, suffix | prefix)
                     prior = batch["input_ids_dec"].clone()
                     prior[
@@ -370,6 +368,29 @@ class DLCMDTask(L.LightningModule):
                     )
 
                 if self.encoder is not None:
+
+                    # p(suffix | prefix, true_DLC)
+                    prior = batch["input_ids_dec"].clone()
+                    prior[(batch["info_mask_dec"] == InfoLabel.SUFFIX.value)] = (
+                        self.dit.tokenizer.mask_token_id
+                    )
+                    gen_suffix_str_recon = self.dit.tokenizer.batch_decode(
+                        self.dit.sample(
+                            prior=prior,
+                        )[:, -self.cfg.suffix_length :]
+                    )
+                    ppl_recon = self.eval_ppl(
+                        batch["prefix_str"],
+                        gen_suffix_str_recon,
+                        device=batch["input_ids_dec"].device,
+                    )
+                    self.log(
+                        "val/gen_ppl_recon",
+                        ppl_recon,
+                        on_epoch=True,
+                        on_step=False,
+                        sync_dist=True,
+                    )
 
                     # p(DLC | prefix) * p(suffix | prefix, DLC)
                     prior = batch["input_ids_dec"].clone()
@@ -424,3 +445,11 @@ class DLCMDTask(L.LightningModule):
                             )
                         wandb.log({"val/samples": table})
                         del table
+
+    def on_validation_epoch_start(self):
+        self.ppl_model[0] = self.ppl_model[0].to(self.device)
+        torch.cuda.empty_cache()
+
+    def on_validation_epoch_end(self):
+        self.ppl_model[0] = self.ppl_model[0].cpu()
+        torch.cuda.empty_cache()

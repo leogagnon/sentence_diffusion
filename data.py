@@ -347,13 +347,14 @@ class PrefixSuffixIterable(IterableDataset):
             num_dlc_ph=num_dlc_ph,
         )
 
+        num_workers = int(os.environ.get("TORCH_NUM_WORKERS", 0))
         return DataLoader(
             iterable,
             batch_size=batch_size,
             collate_fn=collate_fn,
-            num_workers=int(os.environ.get("TORCH_NUM_WORKERS", 1)),
+            num_workers=num_workers,
             persistent_workers=False,
-            prefetch_factor=4,
+            prefetch_factor=4 if num_workers > 0 else None,
             pin_memory=True,
         )
 
@@ -568,13 +569,14 @@ class DeCLUTRIterable(IterableDataset):
             seed=seed,
         )
 
+        num_workers = int(os.environ.get("TORCH_NUM_WORKERS", 0))
         return DataLoader(
             iterable,
             batch_size=batch_size,
             collate_fn=collate_fn,
-            num_workers=int(os.environ.get("TORCH_NUM_WORKERS", 1)),
+            num_workers=num_workers,
             persistent_workers=False,
-            prefetch_factor=8,
+            prefetch_factor=8 if num_workers > 0 else None,
             pin_memory=True,
         )
 

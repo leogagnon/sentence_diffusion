@@ -3,7 +3,7 @@ model_checkpoint: base
 
 effective_batch_size: 512
 
-task.dlc_ar.pretrained_ae_id: nb4vdxxb, 5cd19sua
+task.dlc_ar.pretrained_ae_id: 5cd19sua
 task.dlc_ar.context_length: 112, 0
 
 max_steps: 20000
