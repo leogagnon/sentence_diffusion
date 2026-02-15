@@ -478,6 +478,7 @@ class DeCLUTRIterable(IterableDataset):
         num_anchors: int,
         num_positives: int,
         adjacent_positives: bool,
+        masked_anchors: bool = False,
         seed: Optional[int] = None,
     ):
         assert hasattr(dataset, "__len__") and hasattr(dataset, "__getitem__")
@@ -493,6 +494,48 @@ class DeCLUTRIterable(IterableDataset):
         self.seed = seed
         self.tok = tokenizer
         self.adjacent_positives = adjacent_positives
+        self.masked_anchors = masked_anchors
+        if self.masked_anchors:
+            assert (
+                self.tok.mask_token_id is not None
+            ), "Tokenizer must define mask_token_id when masked_anchors is enabled"
+            assert (
+                self.tok.pad_token_id is not None
+            ), "Tokenizer must define pad_token_id when masked_anchors is enabled"
+            assert (
+                self.tok.vocab_size is not None
+            ), "Tokenizer must define vocab_size when masked_anchors is enabled"
+
+    def _apply_anchor_mlm(
+        self,
+        anchor_ids: List[int],
+        rng: random.Random,
+    ) -> Tuple[List[int], List[int]]:
+        if len(anchor_ids) == 0:
+            return anchor_ids, []
+
+        num_to_mask = int(round(len(anchor_ids) * 0.15))
+        if num_to_mask <= 0:
+            return anchor_ids, [-100] * len(anchor_ids)
+
+        positions = rng.sample(range(len(anchor_ids)), k=num_to_mask)
+        mlm_labels = [-100] * len(anchor_ids)
+        masked_ids = list(anchor_ids)
+
+        for pos in positions:
+            mlm_labels[pos] = anchor_ids[pos]
+            coin = rng.random()
+            if coin < 0.8:
+                masked_ids[pos] = self.tok.mask_token_id
+            elif coin < 0.9:
+                rand_id = rng.randrange(self.tok.vocab_size)
+                while rand_id in {self.tok.pad_token_id, self.tok.mask_token_id}:
+                    rand_id = rng.randrange(self.tok.vocab_size)
+                masked_ids[pos] = rand_id
+            else:
+                masked_ids[pos] = anchor_ids[pos]
+
+        return masked_ids, mlm_labels
 
     def _make_generator(self) -> random.Random:
         # DDP rank
@@ -530,6 +573,7 @@ class DeCLUTRIterable(IterableDataset):
         num_anchors: int,
         num_positives: int,
         adjacent_positives: bool,
+        masked_anchors: bool = False,
         seed: int = 32,
     ) -> DataLoader:
         # Make the collation function
@@ -551,11 +595,19 @@ class DeCLUTRIterable(IterableDataset):
                 batch_first=True,
                 padding_value=tokenizer.pad_token_id,
             )
+            if "anchor_labels" in concat_batch:
+                concat_batch["anchor_labels"] = pad_sequence(
+                    concat_batch["anchor_labels"],
+                    batch_first=True,
+                    padding_value=-100,
+                )
 
             out = {
                 "anchor_ids": concat_batch["anchor_ids"],
                 "positive_ids": concat_batch["positive_ids"],
             }
+            if "anchor_labels" in concat_batch:
+                out["anchor_labels"] = concat_batch["anchor_labels"]
             return out
 
         iterable = cls(
@@ -566,6 +618,7 @@ class DeCLUTRIterable(IterableDataset):
             num_anchors=num_anchors,
             num_positives=num_positives,
             adjacent_positives=adjacent_positives,
+            masked_anchors=masked_anchors,
             seed=seed,
         )
 
@@ -689,5 +742,17 @@ class DeCLUTRIterable(IterableDataset):
                     "anchor_ids": [torch.LongTensor(a) for a in anchors],
                     "positive_ids": [torch.LongTensor(p) for p in positives],
                 }
+
+                if self.masked_anchors:
+                    masked_anchors = []
+                    anchor_labels = []
+                    for anchor in anchors:
+                        masked_ids, mlm_labels = self._apply_anchor_mlm(
+                            anchor, generator
+                        )
+                        masked_anchors.append(torch.LongTensor(masked_ids))
+                        anchor_labels.append(torch.LongTensor(mlm_labels))
+                    out_dict["anchor_ids"] = masked_anchors
+                    out_dict["anchor_labels"] = anchor_labels
 
                 yield out_dict

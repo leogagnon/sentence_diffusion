@@ -2,10 +2,7 @@ task/dlc_ddpm: ae
 model_checkpoint: base
 
 task.dlc_ddpm.pretrained_ae_id: uw5t6rkg, p2d8csdo
-task.dlc_ddpm.normalize_latent: true
-task.dlc_ddpm.use_ema: true
-task.dlc_ddpm.noise_delta: 0.3
-
+task.dlc_ddpm.prompt_generator_noise: true, false
 
 max_steps: 20000
 
@@ -13,5 +10,5 @@ limit_val_batches: 4
 val_check_interval: 512
 strategy: ddp_find_unused_parameters_true
 
-sweep_id: dlc_ddpm/ae_0
+sweep_id: dlc_ddpm/ae_noise_cond
 

@@ -3,12 +3,12 @@ from typing import Optional
 
 import einx
 import hydra
-import sentence_transformers
 import torch
 import torch.nn as nn
 from torch.nn import functional as F
-from transformers.models.auto.tokenization_auto import AutoTokenizer
+from transformers import AutoModel, AutoModelForMaskedLM, AutoTokenizer
 from transformers.models.m2m_100.modeling_m2m_100 import M2M100Encoder
+
 
 @dataclass
 class SEMHeadConfig:
@@ -231,22 +231,6 @@ class HSEMHead(nn.Module):
         return counts
 
 
-class SONARTransformer(nn.Module):
-    def __init__(self):
-        super().__init__()
-        self.auto_model = M2M100Encoder.from_pretrained(
-            "cointegrated/SONAR_200_text_encoder"
-        )
-
-    def get_sentence_embedding_dimension(self):
-        return self.auto_model.config.hidden_size
-
-    def forward(self, features, **kwargs):
-        token_embeddings = self.auto_model(**features).last_hidden_state
-        features.update({"token_embeddings": token_embeddings})
-        return features
-
-
 @dataclass
 class EncoderConfig:
     model_name: str
@@ -268,53 +252,35 @@ class EncoderModel(nn.Module):
 
         # Initialize backbone
         if "SONAR" in cfg.model_name:
-            self.transformer = SONARTransformer()
-            self.pooling = sentence_transformers.models.Pooling(
-                self.transformer.get_sentence_embedding_dimension(), pooling_mode="mean"
+            self.transformer = M2M100Encoder.from_pretrained(
+                "cointegrated/SONAR_200_text_encoder"
             )
             self.tokenizer = AutoTokenizer.from_pretrained(
                 "cointegrated/SONAR_200_text_encoder"
             )
             self.tokenizer.src_lang = "eng_Latn"
-            backbone_dim = self.transformer.get_sentence_embedding_dimension()
+            backbone_dim = self.transformer.config.hidden_size
         else:
             model_kwargs = {}
 
-            # Some model-specific kwargs
             if "roberta" in cfg.model_name.lower():
-                model_kwargs.update({"add_pooling_layer": False})
-
-            if "qwen" in cfg.model_name.lower():
-                model_kwargs.update({"attn_implementation": "flash_attention_2"})
-
-            if "nemotron" in cfg.model_name.lower():
-                model_kwargs.update(
-                    {
-                        "attn_implementation": "flash_attention_2",
-                        "dtype": "bfloat16",
-                    }
+                self.transformer = AutoModelForMaskedLM.from_pretrained(
+                    cfg.model_name,
+                    trust_remote_code=True,
+                    **model_kwargs,
+                )
+            else:
+                self.transformer = AutoModel.from_pretrained(
+                    cfg.model_name,
+                    trust_remote_code=True,
+                    **model_kwargs,
                 )
 
-            backbone = sentence_transformers.SentenceTransformer(
+            self.tokenizer = AutoTokenizer.from_pretrained(
                 cfg.model_name,
-                model_kwargs=model_kwargs,
                 trust_remote_code=True,
             )
-
-            self.transformer = backbone[0]
-            assert isinstance(
-                self.transformer, sentence_transformers.models.Transformer
-            ), "Expected Transformer as first module"
-
-            self.pooling = backbone[1]
-            assert isinstance(
-                self.pooling, sentence_transformers.models.Pooling
-            ), "Expected Pooling as second module"
-
-            self.tokenizer = backbone.tokenizer
-            backbone_dim = (
-                self.transformer.auto_model.get_input_embeddings().weight.shape[1]
-            )
+            backbone_dim = self.transformer.config.hidden_size
 
         # Maybe freeze backbone
         self.transformer = self.transformer.train(cfg.train_backbone).requires_grad_(
@@ -348,7 +314,7 @@ class EncoderModel(nn.Module):
                 dim_1,
                 bias=False,
             )
-            
+
         self.backbone_dim = backbone_dim
 
         self.cfg = cfg
@@ -372,31 +338,41 @@ class EncoderModel(nn.Module):
         return_count=False,
         noise: float = 0.0,
         temp: Optional[float] = None,
+        return_logits: bool = False,
         only_backbone: bool = False,
     ):
 
-        # Make the batch dict expected by sentence_transformers models
-        batch = {"input_ids": input_ids, "attention_mask": attention_mask}
+        outputs = self.transformer(
+            input_ids=input_ids,
+            attention_mask=attention_mask,
+            output_hidden_states=True,
+            return_dict=True,
+        )
+        token_embeddings = outputs.hidden_states[-1]
 
-        # Run through transformer and pooling
-        batch = self.transformer(batch)
-        batch = self.pooling(batch)
-        z = batch["sentence_embedding"]
+        z = self._mean_pool(token_embeddings, attention_mask)
 
         if only_backbone:
             return z
 
+        out = {}
+
+        if return_logits:
+            out["logits"] = outputs.logits
+
         # Run through SEM / output projection
         if self.cfg.sem is None:
-            out = {"latent": z.clone()}
+            out["latent"] = z.clone()
             z = self.out_proj(z)
         else:
-            out = self.sem(
-                z,
-                return_dlc=return_dlc,
-                return_count=return_count,
-                noise=noise,
-                temp=temp,
+            out.update(
+                self.sem(
+                    z,
+                    return_dlc=return_dlc,
+                    return_count=return_count,
+                    noise=noise,
+                    temp=temp,
+                )
             )
             z = self.out_proj(out.pop("z"))
 
@@ -409,3 +385,10 @@ class EncoderModel(nn.Module):
         z = torch.squeeze(z, dim=1) if self.cfg.latent_length == 1 else z
 
         return z, out
+
+    @staticmethod
+    def _mean_pool(token_embeddings: torch.Tensor, attention_mask: torch.Tensor):
+        mask = attention_mask.unsqueeze(-1).type_as(token_embeddings)
+        summed = (token_embeddings * mask).sum(dim=1)
+        denom = mask.sum(dim=1).clamp(min=1)
+        return summed / denom

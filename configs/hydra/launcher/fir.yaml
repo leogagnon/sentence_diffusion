@@ -7,10 +7,11 @@ array_parallelism: 32
 nodes: 1 
 tasks_per_node: 4
 cpus_per_task: 12
-timeout_min: 300
+timeout_min: 400
 account: rrg-bengioy-ad
 additional_parameters:
   no-requeue: true
 
 setup:
   - "source ~/sentence_diffusion/venv/bin/activate"
+  - "bash ~/sentence_diffusion/scripts/move_dataset_to_tmpdir.sh"

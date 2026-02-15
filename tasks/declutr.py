@@ -5,6 +5,7 @@ from typing import Optional
 import einx
 import lightning as L
 import torch
+import torch.nn.functional as F
 from lightning.pytorch.utilities.rank_zero import rank_zero_only
 from torch.utils.data.dataset import Subset
 from transformers import get_cosine_schedule_with_warmup
@@ -41,6 +42,8 @@ class DeCLUTRTaskConfig:
     loss_temp: float = 0.05
     sem_noise: float = 0.0
     adjacent_positives: bool = False
+    mlm_loss: bool = False
+    mlm_loss_weight: float = 1.0
     sem_reset_config: SEMResetConfig = field(default_factory=SEMResetConfig)
 
     name: Optional[str] = None
@@ -60,13 +63,7 @@ class DeCLUTRTask(L.LightningModule):
                     OmegaConf.create(DeCLUTRTaskConfig),
                     OmegaConf.create(kwargs),
                 )
-            )
-
-        # TODO: Quick fix, change at some point
-        if cfg.adjacent_positives:
-            cfg.num_positives = 1
-        else:
-            cfg.num_positives = 2
+            )       
 
         self.encoder = EncoderModel(cfg.encoder)
 
@@ -92,6 +89,13 @@ class DeCLUTRTask(L.LightningModule):
         loss = self.loss_fn(embeddings, labels)
 
         return loss
+
+    def compute_mlm_loss(self, anchor_logits, anchor_labels):
+        return F.cross_entropy(
+            anchor_logits.view(-1, anchor_logits.size(-1)),
+            anchor_labels.view(-1),
+            ignore_index=-100,
+        )
 
     def compile(self):
         if self.encoder is not None:
@@ -145,6 +149,7 @@ class DeCLUTRTask(L.LightningModule):
             num_anchors=self.cfg.num_anchors,
             num_positives=self.cfg.num_positives,
             adjacent_positives=self.cfg.adjacent_positives,
+            masked_anchors=self.cfg.mlm_loss,
             seed=random.randint(
                 0, 100000
             ),  # Dataset should be different if restarted,,
@@ -160,6 +165,7 @@ class DeCLUTRTask(L.LightningModule):
             num_anchors=self.cfg.num_anchors,
             num_positives=self.cfg.num_positives,
             adjacent_positives=self.cfg.adjacent_positives,
+            masked_anchors=self.cfg.mlm_loss,
             seed=42,
         )
 
@@ -171,7 +177,8 @@ class DeCLUTRTask(L.LightningModule):
                 batch["anchor_ids"] != self.encoder.tokenizer.pad_token_id
             ).long(),
             return_count=True,
-            noise=self.cfg.sem_noise
+            noise=self.cfg.sem_noise,
+            return_logits=self.cfg.mlm_loss,
         )
         z_positives, _ = self.encoder(
             input_ids=batch["positive_ids"],
@@ -194,7 +201,29 @@ class DeCLUTRTask(L.LightningModule):
                 "w b d -> (w b) d", self.all_gather(z_positives, sync_grads=True)
             )
 
-        loss = self.compute_loss(z_anchors, z_positives)
+        contrastive_loss = self.compute_loss(z_anchors, z_positives)
+        self.log(
+                "train/contrastive_loss",
+                contrastive_loss,
+                on_step=True,
+                on_epoch=False,
+                sync_dist=True,
+            )
+        if self.cfg.mlm_loss:
+            mlm_loss = self.compute_mlm_loss(
+                sem_out["logits"],
+                batch["anchor_labels"],
+            )
+            loss = contrastive_loss + mlm_loss * self.cfg.mlm_loss_weight
+            self.log(
+                "train/mlm_loss",
+                mlm_loss,
+                on_step=True,
+                on_epoch=False,
+                sync_dist=True,
+            )
+        else:
+            loss = contrastive_loss
         self.log("train/loss", loss, on_step=True, on_epoch=False, sync_dist=True)
 
         if self.cfg.encoder.sem is not None:
@@ -203,17 +232,32 @@ class DeCLUTRTask(L.LightningModule):
         return loss
 
     def validation_step(self, batch, batch_idx):
-        
+
+        mlm_loss = None
+
         temps = [1e-4, None] if self.cfg.encoder.sem is not None else [None]
         names = ["hard", "soft"] if self.cfg.encoder.sem is not None else ["soft"]
-        for sem_temp, label in zip(temps, names):
+        for idx, (sem_temp, label) in enumerate(zip(temps, names)):
             z_anchors, sem_out = self.encoder(
                 input_ids=batch["anchor_ids"],
                 attention_mask=(
                     batch["anchor_ids"] != self.encoder.tokenizer.pad_token_id
                 ).long(),
                 temp=sem_temp,
+                return_logits=self.cfg.mlm_loss and idx == 0,
             )
+            if self.cfg.mlm_loss and mlm_loss is None:
+                mlm_loss = self.compute_mlm_loss(
+                    sem_out["logits"],
+                    batch["anchor_labels"],
+                )
+                self.log(
+                    "val/mlm_loss",
+                    mlm_loss,
+                    on_step=False,
+                    on_epoch=True,
+                    sync_dist=True,
+                )
             if "probs" in sem_out.keys():
                 ent, m_ent = sem_entropy(sem_out["probs"])
                 self.log(
@@ -250,6 +294,8 @@ class DeCLUTRTask(L.LightningModule):
 
             # NTXent loss
             loss = self.compute_loss(z_anchors, z_positives)
+            if mlm_loss is not None:
+                loss = loss + mlm_loss * self.cfg.mlm_loss_weight
             self.log(
                 f"val/loss_{label}", loss, on_step=False, on_epoch=True, sync_dist=True
             )

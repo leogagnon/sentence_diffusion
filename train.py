@@ -4,6 +4,7 @@ torch._dynamo.config.capture_scalar_outputs = True
 
 import argparse
 import os
+import subprocess
 from dataclasses import dataclass
 from typing import Optional
 
@@ -11,8 +12,7 @@ import hydra
 import lightning as L
 import wandb
 from hydra.core.config_store import ConfigStore
-from lightning.pytorch.utilities.rank_zero import (rank_zero_info,
-                                                   rank_zero_only)
+from lightning.pytorch.utilities.rank_zero import rank_zero_info, rank_zero_only
 from omegaconf import OmegaConf, SCMode
 from transformers.utils import logging
 
@@ -155,7 +155,7 @@ def main(cfg: Optional[TrainConfig] = None, run_id: Optional[str] = None):
             cfg.task.declutr = OmegaConf.merge(
                 OmegaConf.structured(DeCLUTRTaskConfig), run.config["task"]["declutr"]
             )
-        
+
     elif cfg.task.dlc_md != None:
         task = DLCMDTask(cfg.task.dlc_md)
         cfg.task.dlc_md = task.cfg
@@ -223,10 +223,10 @@ def main(cfg: Optional[TrainConfig] = None, run_id: Optional[str] = None):
         cfg.effective_batch_size = ddp_batch_size
     else:
         assert (
-        cfg.effective_batch_size % ddp_batch_size == 0
+            cfg.effective_batch_size % ddp_batch_size == 0
         ), f"Effective batch size ({cfg.effective_batch_size}) must be a multiple of effective ddp batch_size ({ddp_batch_size})"
         accumulate_grad_batches = cfg.effective_batch_size // ddp_batch_size
-        
+
         # just makin sure
         assert (
             accumulate_grad_batches * task.cfg.batch_size * num_devices
@@ -245,6 +245,7 @@ def main(cfg: Optional[TrainConfig] = None, run_id: Optional[str] = None):
         val_check_interval=cfg.val_check_interval
         * accumulate_grad_batches,  # to account for accumulation
         gradient_clip_val=cfg.gradient_clip_val,
+        gradient_clip_algorithm="norm",
         num_sanity_val_steps=0,
         max_steps=cfg.max_steps,
         log_every_n_steps=50,
@@ -254,7 +255,7 @@ def main(cfg: Optional[TrainConfig] = None, run_id: Optional[str] = None):
         devices=num_devices,
         strategy=cfg.strategy,
         num_nodes=1,
-        use_distributed_sampler=False,
+        use_distributed_sampler=False
     )
     trainer.fit(
         model=task,

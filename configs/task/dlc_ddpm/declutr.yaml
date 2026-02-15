@@ -17,20 +17,21 @@ model:
 
 eval_gen_ppl: true
 
-pretrained_declutr_id: bll8h3yb
+pretrained_declutr_id: v6jqgrwj
 
 prefix_length: 16
 suffix_length: 64
 context_length: 112
 
 use_ema: true
-noise_delta: 0.3
+prompt_generator_noise: true
 loss: l2
-sampling_timesteps: 50
+sampling_timesteps: 100
 train_schedule: cosine
 diffusion_objective: pred_v
 schedule_scale: 1.0
 sampler: ddpm
 normalize_latent: true
+num_latent_for_precomputed_stats: 30000
 
 name: ddpm_base

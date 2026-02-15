@@ -24,13 +24,14 @@ suffix_length: null
 context_length: null
 
 use_ema: true
-noise_delta: 0.3
+prompt_generator_noise: true
 loss: l2
-sampling_timesteps: 50
+sampling_timesteps: 100
 train_schedule: cosine
 diffusion_objective: pred_v
 schedule_scale: 1.0
 sampler: ddpm
 normalize_latent: true
+num_latent_for_precomputed_stats: 30000
 
 name: ddpm_base

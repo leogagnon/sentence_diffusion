@@ -2,11 +2,13 @@ task/declutr: continuous
 model_checkpoint: base
 
 task.declutr.batch_size: 16
+task.declutr.mlm_loss: true
+task.declutr.mlm_loss_weight: 0.1, 0.5, 1.0
 
 max_steps: 20000
 
 limit_val_batches: 4
 val_check_interval: 256
 
-sweep_id: declutr/cont_1
+sweep_id: declutr/cont_mlm
 

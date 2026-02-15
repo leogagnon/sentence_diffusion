@@ -1,15 +1,14 @@
 task/declutr: base
 model_checkpoint: base
 
-task.declutr.batch_size: 64
-
-task.declutr.adjacent_positives: true
 task.declutr.encoder.sem.L: 512, 128
+task.declutr.sem_noise: 0.05, 0.2
+task.declutr.mlm_loss_weight: 0.1, 1.0
 
 max_steps: 20000
 
 limit_val_batches: 4
 val_check_interval: 256
 
-sweep_id: declutr/sweep_0
+sweep_id: declutr/dlc
 

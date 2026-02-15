@@ -32,7 +32,6 @@ class GaussianDiffusionTaskConfig:
     decoder: DecoderConfig
     use_ema: bool = False
     diffusion_beta: float = 5.0
-    noise_delta: float = 0.0
     eval_gen_ppl: bool = True
     soft_prompt_len: int = 16
 
@@ -52,6 +51,8 @@ class GaussianDiffusionTaskConfig:
     schedule_scale: float = 1.0
     sampler: str = "ddpm"
     normalize_latent: bool = False
+    prompt_generator_noise: bool = False
+    num_latent_for_precomputed_stats: int = 30000
 
     name: Optional[str] = None
 
@@ -190,7 +191,7 @@ class GaussianDiffusionTask(L.LightningModule):
 
         # A small network which transforms the diffusion latent into a soft prompt for the decoder
         pre_proj_dim = 96
-        self.soft_thought_gen = nn.Sequential(
+        self.soft_thought_proj = nn.Sequential(
             nn.Linear(
                 self.encoder.backbone_dim,
                 cfg.soft_prompt_len * pre_proj_dim,
@@ -198,18 +199,30 @@ class GaussianDiffusionTask(L.LightningModule):
             ),
             Rearrange("b (l d) -> b l d", l=cfg.soft_prompt_len, d=pre_proj_dim),
             nn.Linear(pre_proj_dim, self.decoder.latent_dim, bias=False),
-            AttentionLayers(
-                causal=False,
-                dim=self.decoder.latent_dim,
-                depth=3,
-                heads=8,
-                attn_dropout=0.0,
-                ff_dropout=0.0,
-                rel_pos_bias=False,
-                ff_glu=True,
-                ff_swish=True,
-            ),
         )
+        self.soft_thought_enc = AttentionLayers(
+            causal=False,
+            dim=self.decoder.latent_dim,
+            depth=3,
+            heads=8,
+            attn_dropout=0.0,
+            ff_dropout=0.0,
+            rel_pos_bias=False,
+            ff_glu=True,
+            ff_swish=True,
+            # Noise conditioning stuff
+            use_adaptive_rmsnorm=cfg.prompt_generator_noise,
+            use_adaptive_layerscale=cfg.prompt_generator_noise,
+            dim_condition=(
+                self.decoder.latent_dim if cfg.prompt_generator_noise else None
+            ),
+            adaptive_condition_mlp_expansion=4 if cfg.prompt_generator_noise else None,
+            adaptive_condition_mlp=cfg.prompt_generator_noise,
+        )
+        if cfg.prompt_generator_noise:
+            self.soft_thought_noise_emb = ScaledSinusoidalEmbedding(
+                self.decoder.latent_dim
+            )
 
         self.cfg = cfg
         # Important for checkpoints
@@ -269,7 +282,9 @@ class GaussianDiffusionTask(L.LightningModule):
         optimizer = torch.optim.AdamW(optimizer_grouped_parameters, lr=self.cfg.lr)
         if self.cfg.lr_warmup_steps > 0:
             scheduler = get_cosine_schedule_with_warmup(
-                optimizer, num_warmup_steps=self.cfg.lr_warmup_steps, num_training_steps=20000
+                optimizer,
+                num_warmup_steps=self.cfg.lr_warmup_steps,
+                num_training_steps=20000,
             )
             scheduler = {"scheduler": scheduler, "interval": "step", "frequency": 1}
 
@@ -317,7 +332,7 @@ class GaussianDiffusionTask(L.LightningModule):
 
                 dl_iter = iter(self.train_dataloader())
                 latent_samples = []
-                for _ in tqdm(range(30000 // self.cfg.batch_size)):
+                for _ in tqdm(range(self.cfg.num_latent_for_precomputed_stats // self.cfg.batch_size)):
                     batch = next(dl_iter)
                     latent_samples.append(
                         self.encoder(
@@ -389,7 +404,7 @@ class GaussianDiffusionTask(L.LightningModule):
 
         return ppl.item()
 
-    def get_input_embeds(self, batch, z):
+    def get_input_embeds(self, batch, z, alpha=None):
         """
         Given a batch and the corresponding diffusion latents z, compute the soft thoughts with self.soft_thought_gen
         and fill them in the placeholders of the input_ids (with the DLC tags)
@@ -398,8 +413,16 @@ class GaussianDiffusionTask(L.LightningModule):
         input_ids = batch["input_ids_dec"]
         input_embeds = self.decoder.backbone.get_input_embeddings()(input_ids)
 
+        # Compute noise embedding
+        if alpha is not None:
+            noise_embd = self.soft_thought_noise_emb(alpha[None] * 1000)
+            noise_embd = rearrange(noise_embd, "b d -> b 1 d")
+        else:
+            noise_embd = None
+
         # Compute soft thoughts
-        soft_thought = self.soft_thought_gen(z).to(input_embeds.dtype)
+        soft_thought = self.soft_thought_proj(z).to(input_embeds.dtype)
+        soft_thought = self.soft_thought_enc(soft_thought, condition=noise_embd)
 
         # Replace the DLC ph tokens with the corresponding soft thoughts
         dlc_ph_mask = batch["info_mask_dec"] == InfoLabel.DLC.value
@@ -424,11 +447,16 @@ class GaussianDiffusionTask(L.LightningModule):
         # 1) We apply noise to z if noise_delta > 0;
         # 2) The prefix embeds are used condition the DiT
         # 3) The decoder is only trained on the suffix
-        input_embeds = self.get_input_embeds(
-            batch,
-            torch.randn_like(z) * self.cfg.noise_delta
-            + z * math.sqrt((1.0 - self.cfg.noise_delta**2)),
-        )
+        if self.cfg.prompt_generator_noise:
+            t = torch.zeros((z.size(0),), device=z.device).float().uniform_(0, 1.0)
+            alpha = time_to_alpha(t=t, alpha_schedule=cosine_schedule, scale=3.0)
+            alpha = right_pad_dims_to(z, alpha)
+            z_noised = alpha.sqrt() * z + (1 - alpha).sqrt() * torch.randn_like(z)
+
+            input_embeds = self.get_input_embeds(batch, z_noised, alpha)
+        else:
+            input_embeds = self.get_input_embeds(batch, z)
+
         logits, hidden_states = self.decoder(
             input_embeds=input_embeds, return_hidden_states=True
         )
@@ -505,6 +533,11 @@ class GaussianDiffusionTask(L.LightningModule):
         input_embeds = self.get_input_embeds(
             batch,
             z,
+            alpha=(
+                torch.full((z.size(0),1), 0.05, device=z.device)
+                if self.cfg.prompt_generator_noise
+                else None
+            ),
         )
         logits, hidden_states = self.decoder(
             input_embeds=input_embeds, return_hidden_states=True
@@ -569,7 +602,15 @@ class GaussianDiffusionTask(L.LightningModule):
                 cond=hidden_states[:, : self.cfg.prefix_length],
             )
 
-            input_embeds_samples = self.get_input_embeds(batch, z_samples)
+            input_embeds_samples = self.get_input_embeds(
+                batch,
+                z_samples,
+                alpha=(
+                    torch.full((z_samples.size(0),), 0.05, device=z_samples.device)
+                    if self.cfg.prompt_generator_noise
+                    else None
+                ),
+            )
 
             suffix_sample_str = self.decoder.tokenizer.batch_decode(
                 self.decoder.generate(

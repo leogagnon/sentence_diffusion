@@ -243,8 +243,7 @@ class DecoderModel(nn.Module):
                 inputs_embeds=prefix_embeds,
                 generation_config=GenerationConfig(**gen_cfg),
                 encoder_hidden_states=z,
-            )        
-            output = output[:, prefix_embeds.shape[1] :]  # Remove the prefix
+            ) 
         else:
             output = self.backbone.generate(
                 input_ids=input_ids,
