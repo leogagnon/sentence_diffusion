@@ -255,47 +255,32 @@ class DLCMDTask(L.LightningModule):
             batch["info_mask_dec"] == InfoLabel.SPECIAL.value
         )
 
+        # Compute loss on suffix + DLC, condition on everthing else
+        attention_mask = (batch["info_mask_dec"] == InfoLabel.SUFFIX.value) + (
+            batch["info_mask_dec"] == InfoLabel.DLC.value
+        )
+        cond_mask = torch.logical_not(attention_mask)
+        loss = self.dit.compute_loss(
+            batch["input_ids_dec"],
+            attention_mask=attention_mask,
+            cond_mask=cond_mask,
+        )
+
         if self.cfg.ancestral:
             # Mask the suffix, only compute loss on the DLC, condition on everything else
-            input_ids_0 = batch["input_ids_dec"].clone()
-            input_ids_0[batch["info_mask_dec"] == InfoLabel.SUFFIX.value] = (
+            input_ids_dlc = batch["input_ids_dec"].clone()
+            input_ids_dlc[batch["info_mask_dec"] == InfoLabel.SUFFIX.value] = (
                 self.dit.tokenizer.mask_token_id
             )
-            attention_mask_0 = batch["info_mask_dec"] == InfoLabel.DLC.value
-            cond_mask_0 = torch.logical_not(attention_mask_0)
+            attention_mask_dlc = batch["info_mask_dec"] == InfoLabel.DLC.value
+            cond_mask_dlc = torch.logical_not(attention_mask_dlc)
 
-            loss_0 = self.dit.compute_loss(
-                input_ids_0,
-                attention_mask=attention_mask_0,
-                cond_mask=cond_mask_0,
+            dlc_loss = self.dit.compute_loss(
+                input_ids_dlc,
+                attention_mask=attention_mask_dlc,
+                cond_mask=cond_mask_dlc,
             )
-
-            # Compute loss only on suffix, condition on everything but suffix
-            attention_mask_1 = batch["info_mask_dec"] == InfoLabel.SUFFIX.value
-            cond_mask_1 = torch.logical_not(attention_mask_1)
-            loss_1 = self.dit.compute_loss(
-                batch["input_ids_dec"],
-                attention_mask=attention_mask_1,
-                cond_mask=cond_mask_1,
-            )
-
-            # Merge the losses
-            loss = (
-                loss_0 * float(self.encoder.sem.cfg.L)
-                + loss_1 * float(self.cfg.suffix_length)
-            ) / float(self.encoder.sem.cfg.L + self.cfg.suffix_length)
-        else:
-
-            # Compute loss on suffix + DLC, condition on everthing else
-            attention_mask = (batch["info_mask_dec"] == InfoLabel.SUFFIX.value) + (
-                batch["info_mask_dec"] == InfoLabel.DLC.value
-            )
-            cond_mask = torch.logical_not(attention_mask)
-            loss = self.dit.compute_loss(
-                batch["input_ids_dec"],
-                attention_mask=attention_mask,
-                cond_mask=cond_mask,
-            )
+            loss = 0.5 * loss + 0.5 * dlc_loss
 
         self.log("train/loss", loss, on_step=True, on_epoch=False, sync_dist=True)
 
@@ -398,14 +383,18 @@ class DLCMDTask(L.LightningModule):
                         (batch["info_mask_dec"] == InfoLabel.SUFFIX.value)
                         + (batch["info_mask_dec"] == InfoLabel.DLC.value)
                     ] = self.dit.tokenizer.mask_token_id
-                    frozen_mask = batch["info_mask_dec"] != InfoLabel.DLC.value
                     prior = self.dit.sample(
                         prior=prior,
-                        frozen_mask=frozen_mask,
+                        frozen_mask=batch["info_mask_dec"] != InfoLabel.DLC.value,
                     )
                     gen_suffix_str_ancestral = self.dit.tokenizer.batch_decode(
                         self.dit.sample(
-                            prior=prior, num_steps=self.dit.cfg.sampling_steps // 2
+                            prior=prior,
+                            frozen_mask=torch.logical_not(
+                                (batch["info_mask_dec"] == InfoLabel.DLC.value)
+                                + (batch["info_mask_dec"] == InfoLabel.SUFFIX.value)
+                            ),
+                            num_steps=self.dit.cfg.sampling_steps // 2,
                         )[:, -self.cfg.suffix_length :]
                     )
                     ppl_ancestral = self.eval_ppl(

@@ -8,8 +8,8 @@ decoder:
 
 eval_gen_ppl: true
 
-pretrained_ae_id: 7v1d8xvl
-#pretrained_declutr_id: bll8h3yb
+pretrained_declutr_id: 5cd19sua
+
 DLC_dropout: 0.0
 
 prefix_length: 16
