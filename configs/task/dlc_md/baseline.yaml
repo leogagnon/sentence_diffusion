@@ -5,7 +5,7 @@ val_batch_size: 32
 
 dit:
   name: kuleshov-group/mdlm-owt
-  sampling_steps: 256
+  sampling_steps: 512
   sampling_mode: remdm-cap  # mdlm, remdm-cap, remdm-loop  
   nucleus_p: 0.9  
   sampling_eps: 1e-3 

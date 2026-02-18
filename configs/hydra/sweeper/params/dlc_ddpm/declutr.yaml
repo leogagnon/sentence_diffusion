@@ -1,16 +1,16 @@
 task/dlc_ddpm: declutr
 model_checkpoint: base
 
-task.dlc_ddpm.pretrained_declutr_id: 0qevw4bi, 8q8o8xff, 4bpbbo4z
+task.dlc_ddpm.pretrained_declutr_id: 8q8o8xff #0qevw4bi, 8q8o8xff, 4bpbbo4z
 task.dlc_ddpm.prompt_generator_noise: true
 
-task.dlc_ddpm.context_length: 112, 0
+task.dlc_ddpm.context_length: 112
 
 max_steps: 20000
 
-limit_val_batches: 4
+limit_val_batches: 6
 val_check_interval: 512
 strategy: ddp_find_unused_parameters_true
 
-sweep_id: dlc_ddpm/declutr_2
+sweep_id: dlc_ddpm/declutr_mauve
 

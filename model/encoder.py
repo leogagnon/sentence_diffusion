@@ -6,7 +6,7 @@ import hydra
 import torch
 import torch.nn as nn
 from torch.nn import functional as F
-from transformers import AutoModel, AutoModelForMaskedLM, AutoTokenizer
+from transformers import AutoModel, AutoModelForMaskedLM, AutoTokenizer, T5EncoderModel
 from transformers.models.m2m_100.modeling_m2m_100 import M2M100Encoder
 
 
@@ -234,18 +234,17 @@ class HSEMHead(nn.Module):
 @dataclass
 class EncoderConfig:
     model_name: str
-    latent_length: int
+    latent_length: Optional[int] = 1
     latent_dim: Optional[int] = None
     sem: Optional[dict] = None
-    train_backbone: bool = True
+    train_backbone: bool = False
     mlp_proj: bool = False
+    no_out_proj: bool = False
 
 
 class EncoderModel(nn.Module):
     def __init__(self, cfg: Optional[EncoderConfig] = None, **kwargs):
         super().__init__()
-
-        assert cfg.latent_dim is not None, "latent_dim has to be set"
 
         if cfg == None:
             cfg = EncoderConfig(**kwargs)
@@ -267,6 +266,11 @@ class EncoderModel(nn.Module):
                 self.transformer = AutoModelForMaskedLM.from_pretrained(
                     cfg.model_name,
                     trust_remote_code=True,
+                    **model_kwargs,
+                )
+            elif "t5" in cfg.model_name.lower():
+                self.transformer = T5EncoderModel.from_pretrained(
+                    cfg.model_name,
                     **model_kwargs,
                 )
             else:
@@ -297,23 +301,29 @@ class EncoderModel(nn.Module):
             dim_0 = self.sem.out_dim
 
         # Build projection head
-        dim_1 = cfg.latent_length * cfg.latent_dim
-        if cfg.mlp_proj:
-            self.out_proj = nn.Sequential(
-                nn.Linear(dim_0, 1024, bias=True),
-                nn.ReLU(),
-                nn.Linear(
-                    1024,
+        
+        if cfg.no_out_proj:
+            self.out_proj = nn.Identity()
+            assert cfg.latent_length == 1, "latent_length has to be 1 if no_out_proj is True"
+        else:
+            assert cfg.latent_dim is not None, "latent_dim has to be set if no_out_proj is False"
+            dim_1 = cfg.latent_length * cfg.latent_dim
+            if cfg.mlp_proj:
+                self.out_proj = nn.Sequential(
+                    nn.Linear(dim_0, 1024, bias=True),
+                    nn.ReLU(),
+                    nn.Linear(
+                        1024,
+                        dim_1,
+                        bias=False,
+                    ),
+                )
+            else:
+                self.out_proj = nn.Linear(
+                    dim_0,
                     dim_1,
                     bias=False,
-                ),
-            )
-        else:
-            self.out_proj = nn.Linear(
-                dim_0,
-                dim_1,
-                bias=False,
-            )
+                )
 
         self.backbone_dim = backbone_dim
 

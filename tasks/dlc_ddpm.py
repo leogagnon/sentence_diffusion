@@ -6,6 +6,7 @@ from functools import partial
 from itertools import chain
 
 import lightning as L
+import numpy as np
 import torch
 import wandb
 from lightning.pytorch.utilities.rank_zero import rank_zero_only
@@ -14,26 +15,37 @@ from torch.utils.data.dataset import Subset
 from transformers import AutoTokenizer, get_cosine_schedule_with_warmup
 from transformers.models.auto.modeling_auto import AutoModelForCausalLM
 
+from mauve import get_features_from_input, compute_mauve
+
 from data import InfoLabel, LanguageDataset, LanguageDatasetConfig, PrefixSuffixIterable
 from tasks.declutr import DeCLUTRTask
 from tasks.autoencoder import AETask
 from tasks.utils import *
 from model.decoder import DecoderModel, DecoderConfig
+from model.encoder import EncoderModel, EncoderConfig
 from model.diffusion_continuous import *
 from torch.optim.swa_utils import AveragedModel, get_ema_avg_fn
 
 
 @dataclass
 class GaussianDiffusionTaskConfig:
-    model: DiTContinuousConfig
     batch_size: int
     lr: float
     lr_warmup_steps: int
     decoder: DecoderConfig
+    encoder: Optional[EncoderConfig] = None
+    model: Optional[DiTContinuousConfig] = None
     use_ema: bool = False
     diffusion_beta: float = 5.0
     eval_gen_ppl: bool = True
     soft_prompt_len: int = 16
+
+    eval_mauve: bool = True
+    mauve_reference_features_path: Optional[str] = "mauve_reference_features.npy"
+    mauve_model_name: str = "gpt2-large"
+    mauve_max_len: int = 150
+    mauve_device_id: int = 0
+    mauve_batch_size: int = 64
 
     pretrained_declutr_id: Optional[str] = None
     pretrained_ae_id: Optional[str] = None
@@ -90,8 +102,8 @@ class GaussianDiffusionTask(L.LightningModule):
         else:
             self.sampling_schedule = self.train_schedule
 
-        self.encoder = None
         if cfg.pretrained_ae_id is not None:
+            assert cfg.encoder is None, "Cannot specify both pretrained_ae_id and encoder in config"
 
             task = AETask.load_from_checkpoint(
                 os.path.join(
@@ -114,6 +126,7 @@ class GaussianDiffusionTask(L.LightningModule):
             self.encoder.out_proj = nn.Identity()
 
         elif cfg.pretrained_declutr_id is not None:
+            assert cfg.encoder is None, "Cannot specify both pretrained_declutr_id and encoder in config"
 
             task = DeCLUTRTask.load_from_checkpoint(
                 os.path.join(
@@ -135,11 +148,19 @@ class GaussianDiffusionTask(L.LightningModule):
             # Init encoder (and remove out proj; no longer needed)
             self.encoder = task.encoder.eval().requires_grad_(False)
             self.encoder.out_proj = nn.Identity()
+        elif cfg.encoder is not None:
+
+            assert cfg.prefix_length is not None
+            assert cfg.suffix_length is not None
+            assert cfg.context_length is not None
+
+            self.encoder = EncoderModel(cfg.encoder).eval().requires_grad_(False)
 
         else:
             assert cfg.prefix_length is not None
             assert cfg.suffix_length is not None
             cfg.context_length = 0
+            self.encoder = None
 
         # Initialize Generative PPL eval model
         if cfg.eval_gen_ppl:
@@ -153,34 +174,83 @@ class GaussianDiffusionTask(L.LightningModule):
             self.ppl_tok = AutoTokenizer.from_pretrained("meta-llama/Llama-3.2-3B")
             self.ppl_tok.pad_token = self.ppl_tok.eos_token
 
+        # Load MAUVE reference features if needed
+        self.val_generated_texts = []
+        if cfg.eval_mauve:
+            assert cfg.mauve_reference_features_path is not None, \
+                "mauve_reference_features_path must be provided when eval_mauve=True"
+            print(f"Loading MAUVE reference features from {cfg.mauve_reference_features_path}")
+            self.mauve_reference_features = np.load(cfg.mauve_reference_features_path)
+            print(f"Loaded {self.mauve_reference_features.shape[0]} reference features")
+
         # Init decoder (with cross attention dim = encoder latent dim)
         self.decoder = DecoderModel(cfg.decoder).train().requires_grad_(True)
 
         # Init DiT (with seq conditional dim = decoder latent dim; latent dim = encoder latent dim)
-        cfg.model.latent_dim = self.encoder.backbone_dim
-        cfg.model.seq_conditional_dim = self.decoder.latent_dim
-        self.model = DiTContinuous(cfg.model).train().requires_grad_(True)
+        if cfg.model is not None:
+            cfg.model.latent_dim = self.encoder.backbone_dim
+            cfg.model.seq_conditional_dim = self.decoder.latent_dim
+            self.model = DiTContinuous(cfg.model).train().requires_grad_(True)
 
-        # Maybe init EMA model
-        if cfg.use_ema:
-            self.ema_model = [
-                AveragedModel(self.model, avg_fn=get_ema_avg_fn())
-                .eval()
-                .requires_grad_(False)
-            ]
+            # Maybe init EMA model
+            if cfg.use_ema:
+                self.ema_model = [
+                    AveragedModel(self.model, avg_fn=get_ema_avg_fn())
+                    .eval()
+                    .requires_grad_(False)
+                ]
 
-        # Init latent normalization if needed
-        if cfg.normalize_latent:
-            self.register_buffer(
-                "latent_mean",
-                torch.zeros(size=(cfg.model.latent_dim,)).float(),
+            # Init latent normalization if needed
+            if cfg.normalize_latent:
+                self.register_buffer(
+                    "latent_mean",
+                    torch.zeros(size=(cfg.model.latent_dim,)).float(),
+                )
+                self.latent_mean: torch.FloatTensor
+                self.register_buffer(
+                    "latent_scale",
+                    torch.ones(size=(cfg.model.latent_dim,)).float(),
+                )
+                self.latent_scale: torch.FloatTensor
+
+            # A small network which transforms the diffusion latent into a soft prompt for the decoder
+            pre_proj_dim = 96
+            self.soft_thought_proj = nn.Sequential(
+                nn.Linear(
+                    self.encoder.backbone_dim,
+                    cfg.soft_prompt_len * pre_proj_dim,
+                    bias=False,
+                ),
+                Rearrange("b (l d) -> b l d", l=cfg.soft_prompt_len, d=pre_proj_dim),
+                nn.Linear(pre_proj_dim, self.decoder.latent_dim, bias=False),
             )
-            self.latent_mean: torch.FloatTensor
-            self.register_buffer(
-                "latent_scale",
-                torch.ones(size=(cfg.model.latent_dim,)).float(),
+            self.soft_thought_enc = AttentionLayers(
+                causal=False,
+                dim=self.decoder.latent_dim,
+                depth=3,
+                heads=8,
+                attn_dropout=0.0,
+                ff_dropout=0.0,
+                rel_pos_bias=False,
+                ff_glu=True,
+                ff_swish=True,
+                # Noise conditioning stuff
+                use_adaptive_rmsnorm=cfg.prompt_generator_noise,
+                use_adaptive_layerscale=cfg.prompt_generator_noise,
+                dim_condition=(
+                    self.decoder.latent_dim if cfg.prompt_generator_noise else None
+                ),
+                adaptive_condition_mlp_expansion=(
+                    4 if cfg.prompt_generator_noise else None
+                ),
+                adaptive_condition_mlp=cfg.prompt_generator_noise,
             )
-            self.latent_scale: torch.FloatTensor
+            if cfg.prompt_generator_noise:
+                self.soft_thought_noise_emb = ScaledSinusoidalEmbedding(
+                    self.decoder.latent_dim
+                )
+        else:
+            self.model = None
 
         self.encoder_mode = "none"
         if self.encoder is not None:
@@ -188,41 +258,6 @@ class GaussianDiffusionTask(L.LightningModule):
                 self.encoder_mode = "context"
             else:
                 self.encoder_mode = "suffix"
-
-        # A small network which transforms the diffusion latent into a soft prompt for the decoder
-        pre_proj_dim = 96
-        self.soft_thought_proj = nn.Sequential(
-            nn.Linear(
-                self.encoder.backbone_dim,
-                cfg.soft_prompt_len * pre_proj_dim,
-                bias=False,
-            ),
-            Rearrange("b (l d) -> b l d", l=cfg.soft_prompt_len, d=pre_proj_dim),
-            nn.Linear(pre_proj_dim, self.decoder.latent_dim, bias=False),
-        )
-        self.soft_thought_enc = AttentionLayers(
-            causal=False,
-            dim=self.decoder.latent_dim,
-            depth=3,
-            heads=8,
-            attn_dropout=0.0,
-            ff_dropout=0.0,
-            rel_pos_bias=False,
-            ff_glu=True,
-            ff_swish=True,
-            # Noise conditioning stuff
-            use_adaptive_rmsnorm=cfg.prompt_generator_noise,
-            use_adaptive_layerscale=cfg.prompt_generator_noise,
-            dim_condition=(
-                self.decoder.latent_dim if cfg.prompt_generator_noise else None
-            ),
-            adaptive_condition_mlp_expansion=4 if cfg.prompt_generator_noise else None,
-            adaptive_condition_mlp=cfg.prompt_generator_noise,
-        )
-        if cfg.prompt_generator_noise:
-            self.soft_thought_noise_emb = ScaledSinusoidalEmbedding(
-                self.decoder.latent_dim
-            )
 
         self.cfg = cfg
         # Important for checkpoints
@@ -233,7 +268,8 @@ class GaussianDiffusionTask(L.LightningModule):
     def train(self, mode: bool = True):
         super().train(mode)
         # Make sure encoder is always in eval mode
-        self.encoder.eval()
+        if self.encoder is not None:
+            self.encoder.eval()
         if self.cfg.use_ema:
             self.ema_model[0].eval()
 
@@ -257,9 +293,12 @@ class GaussianDiffusionTask(L.LightningModule):
         return x_start * (self.latent_scale.clamp(min=eps)) + self.latent_mean
 
     def configure_optimizers(self):
-        trainable_params = chain(
-            self.model.named_parameters(), self.decoder.named_parameters()
-        )
+        if self.model is not None:
+            trainable_params = chain(
+                self.model.named_parameters(), self.decoder.named_parameters()
+            )
+        else:
+            trainable_params = self.decoder.named_parameters()
         no_decay = ["bias", "norm"]
         optimizer_grouped_parameters = [
             {
@@ -326,13 +365,17 @@ class GaussianDiffusionTask(L.LightningModule):
     def on_fit_start(self):
 
         # Compute latent mean and scale if needed (on 10000 samples, per rank)
-        if self.cfg.normalize_latent:
+        if self.cfg.normalize_latent and (self.model is not None):
             if rank_zero_only.rank == 0:
                 print("Computing latent mean and scale...")
 
                 dl_iter = iter(self.train_dataloader())
                 latent_samples = []
-                for _ in tqdm(range(self.cfg.num_latent_for_precomputed_stats // self.cfg.batch_size)):
+                for _ in tqdm(
+                    range(
+                        self.cfg.num_latent_for_precomputed_stats // self.cfg.batch_size
+                    )
+                ):
                     batch = next(dl_iter)
                     latent_samples.append(
                         self.encoder(
@@ -432,34 +475,34 @@ class GaussianDiffusionTask(L.LightningModule):
 
     def training_step(self, batch, batch_idx=None):
 
-        # Compute continuous latent
-        with torch.no_grad():
-            z = self.encoder(
-                batch["input_ids_enc"],
-                attention_mask=batch["attention_mask_enc"],
-                only_backbone=True,
+        # Decoder pass
+        if self.encoder is not None:
+            with torch.no_grad():
+                z = self.encoder(
+                    batch["input_ids_enc"],
+                    attention_mask=batch["attention_mask_enc"],
+                    only_backbone=True,
+                )
+                if self.cfg.normalize_latent:
+                    z = self.normalize_latent(z)
+
+            if self.cfg.prompt_generator_noise:
+                t = torch.zeros((z.size(0),), device=z.device).float().uniform_(0, 1.0)
+                alpha = time_to_alpha(t=t, alpha_schedule=cosine_schedule, scale=3.0)
+                alpha = right_pad_dims_to(z, alpha)
+                z_noised = alpha.sqrt() * z + (1 - alpha).sqrt() * torch.randn_like(z)
+
+                input_embeds = self.get_input_embeds(batch, z_noised, alpha)
+            else:
+                input_embeds = self.get_input_embeds(batch, z)
+
+            logits, hidden_states = self.decoder(
+                input_embeds=input_embeds, return_hidden_states=True
             )
-            if self.cfg.normalize_latent:
-                z = self.normalize_latent(z)
-
-        # Run the decoder on prefix <think> soft thought <think> suffix
-        # NOTE:
-        # 1) We apply noise to z if noise_delta > 0;
-        # 2) The prefix embeds are used condition the DiT
-        # 3) The decoder is only trained on the suffix
-        if self.cfg.prompt_generator_noise:
-            t = torch.zeros((z.size(0),), device=z.device).float().uniform_(0, 1.0)
-            alpha = time_to_alpha(t=t, alpha_schedule=cosine_schedule, scale=3.0)
-            alpha = right_pad_dims_to(z, alpha)
-            z_noised = alpha.sqrt() * z + (1 - alpha).sqrt() * torch.randn_like(z)
-
-            input_embeds = self.get_input_embeds(batch, z_noised, alpha)
         else:
-            input_embeds = self.get_input_embeds(batch, z)
+            logits = self.decoder(input_ids=batch["input_ids_dec"])
 
-        logits, hidden_states = self.decoder(
-            input_embeds=input_embeds, return_hidden_states=True
-        )
+        # Compute decoder loss
         info_mask_dec = batch["info_mask_dec"][:, 1:]
         targets = batch["input_ids_dec"][:, 1:].contiguous()
         logits = logits[:, :-1].contiguous()
@@ -478,32 +521,34 @@ class GaussianDiffusionTask(L.LightningModule):
             sync_dist=True,
         )
 
-        # Compute diffusion loss (conditionned on prefix hidden states)
-        # NOTE: The latent here is not noised
-        diffusion_loss = compute_diffusion_loss(
-            self.model,
-            z,
-            cond=hidden_states[:, : self.cfg.prefix_length],
-            schedule=self.train_schedule,
-            diffusion_objective=self.cfg.diffusion_objective,
-            loss_name=self.cfg.loss,
-        )
-        self.log(
-            "train/diffusion_loss",
-            diffusion_loss,
-            on_epoch=False,
-            on_step=True,
-            sync_dist=True,
-        )
+        # Diffusion pass
+        if self.model is not None:
+            diffusion_loss = compute_diffusion_loss(
+                self.model,
+                z,
+                cond=hidden_states[:, : self.cfg.prefix_length],
+                schedule=self.train_schedule,
+                diffusion_objective=self.cfg.diffusion_objective,
+                loss_name=self.cfg.loss,
+            )
+            self.log(
+                "train/diffusion_loss",
+                diffusion_loss,
+                on_epoch=False,
+                on_step=True,
+                sync_dist=True,
+            )
 
-        full_loss = suffix_loss + self.cfg.diffusion_beta * diffusion_loss
+            full_loss = suffix_loss + self.cfg.diffusion_beta * diffusion_loss
+        else:
+            full_loss = suffix_loss
 
         self.log(
             "train/loss",
             full_loss,
             prog_bar=True,
             add_dataloader_idx=False,
-            batch_size=z.shape[0],
+            batch_size=batch["input_ids_dec"].shape[0],
             on_step=True,
             on_epoch=False,
             sync_dist=True,
@@ -514,34 +559,33 @@ class GaussianDiffusionTask(L.LightningModule):
     @torch.no_grad()
     def validation_step(self, batch, batch_idx=None):
 
-        val_model = self.ema_model[0].module if self.cfg.use_ema else self.model
+        # Decoder pass
+        if self.encoder is not None:
+            z = self.encoder(
+                batch["input_ids_enc"],
+                attention_mask=batch["attention_mask_enc"],
+                only_backbone=True,
+            )
+            if self.cfg.normalize_latent:
+                z = self.normalize_latent(z)
 
-        # Compute continuous latent
-        z = self.encoder(
-            batch["input_ids_enc"],
-            attention_mask=batch["attention_mask_enc"],
-            only_backbone=True,
-        )
-        if self.cfg.normalize_latent:
-            z = self.normalize_latent(z)
+            input_embeds = self.get_input_embeds(
+                batch,
+                z,
+                alpha=(
+                    torch.full((z.size(0), 1), 0.05, device=z.device)
+                    if self.cfg.prompt_generator_noise
+                    else None
+                ),
+            )
 
-        # Run the decoder on prefix <think> soft thought <think> suffix
-        # NOTE:
-        # 1) We apply noise to z if noise_delta > 0;
-        # 2) The prefix embeds are used condition the DiT
-        # 3) The decoder is only trained on the suffix
-        input_embeds = self.get_input_embeds(
-            batch,
-            z,
-            alpha=(
-                torch.full((z.size(0),1), 0.05, device=z.device)
-                if self.cfg.prompt_generator_noise
-                else None
-            ),
-        )
-        logits, hidden_states = self.decoder(
-            input_embeds=input_embeds, return_hidden_states=True
-        )
+            logits, hidden_states = self.decoder(
+                input_embeds=input_embeds, return_hidden_states=True
+            )
+        else:
+            logits = self.decoder(input_ids=batch["input_ids_dec"])
+
+        # Decoder loss
         info_mask_dec = batch["info_mask_dec"][:, 1:]
         targets = batch["input_ids_dec"][:, 1:].contiguous()
         logits = logits[:, :-1].contiguous()
@@ -560,111 +604,134 @@ class GaussianDiffusionTask(L.LightningModule):
             sync_dist=True,
         )
 
-        # Compute diffusion loss (conditionned on prefix hidden states)
-        diffusion_loss = compute_diffusion_loss(
-            val_model,
-            z,
-            cond=hidden_states[:, : self.cfg.prefix_length],
-            schedule=self.train_schedule,
-            diffusion_objective=self.cfg.diffusion_objective,
-            loss_name=self.cfg.loss,
-        )
-        self.log(
-            "val/diffusion_loss",
-            diffusion_loss,
-            on_epoch=True,
-            on_step=False,
-            sync_dist=True,
-        )
+        # Diffusion loss
+        if self.model is not None:
+            val_model = self.ema_model[0].module if self.cfg.use_ema else self.model
 
-        full_loss = suffix_loss + self.cfg.diffusion_beta * diffusion_loss
+            diffusion_loss = compute_diffusion_loss(
+                val_model,
+                z,
+                cond=hidden_states[:, : self.cfg.prefix_length],
+                schedule=self.train_schedule,
+                diffusion_objective=self.cfg.diffusion_objective,
+                loss_name=self.cfg.loss,
+            )
+            self.log(
+                "val/diffusion_loss",
+                diffusion_loss,
+                on_epoch=True,
+                on_step=False,
+                sync_dist=True,
+            )
+
+            full_loss = suffix_loss + self.cfg.diffusion_beta * diffusion_loss
+        else:
+            full_loss = suffix_loss
 
         self.log(
             "val/loss",
             full_loss,
             add_dataloader_idx=False,
-            batch_size=z.shape[0],
+            batch_size=batch["input_ids_dec"].shape[0],
             on_step=False,
             on_epoch=True,
             sync_dist=True,
         )
 
-        # Generate samples and compute perplexity with LLaMA 3B
-        if self.cfg.eval_gen_ppl and batch_idx <= 2:
+        # Generate samples and compute metrics (PPL and/or MAUVE)
+        if self.cfg.eval_gen_ppl or self.cfg.eval_mauve:
 
-            z_samples = sample(
-                val_model,
-                schedule=self.sampling_schedule,
-                batch_size=z.shape[0],
-                sampling_timesteps=self.cfg.sampling_timesteps,
-                sampler=self.cfg.sampler,
-                diffusion_objective=self.cfg.diffusion_objective,
-                cond=hidden_states[:, : self.cfg.prefix_length],
-            )
-
-            input_embeds_samples = self.get_input_embeds(
-                batch,
-                z_samples,
-                alpha=(
-                    torch.full((z_samples.size(0),), 0.05, device=z_samples.device)
-                    if self.cfg.prompt_generator_noise
-                    else None
-                ),
-            )
-
-            suffix_sample_str = self.decoder.tokenizer.batch_decode(
-                self.decoder.generate(
-                    prefix_embeds=input_embeds_samples[:, : -self.cfg.suffix_length],
-                    max_length=self.cfg.suffix_length,
-                ),
-                skip_special_tokens=True,
-            )
-
-            ppl_samples = self.eval_ppl(
-                batch["prefix_str"],
-                suffix_sample_str,
-                device=batch["input_ids_dec"].device,
-            )
-            self.log(
-                "val/gen_ppl",
-                ppl_samples,
-                on_epoch=True,
-                on_step=False,
-                sync_dist=True,
-            )
-
-            suffix_sample_str_recon = self.decoder.tokenizer.batch_decode(
-                self.decoder.generate(
-                    prefix_embeds=input_embeds[:, : -self.cfg.suffix_length],
-                    max_length=self.cfg.suffix_length,
-                ),
-                skip_special_tokens=True,
-            )
-
-            ppl_samples_recon = self.eval_ppl(
-                batch["prefix_str"],
-                suffix_sample_str_recon,
-                device=batch["input_ids_dec"].device,
-            )
-            self.log(
-                "val/gen_ppl_true",
-                ppl_samples_recon,
-                on_epoch=True,
-                on_step=False,
-                sync_dist=True,
-            )
-            if (rank_zero_only.rank == 0) and (wandb.run is not None):
-                table = wandb.Table(
-                    columns=["Prefix", "True Suffix", "Generated Suffix"]
+            if self.model is not None:
+                z_samples = sample(
+                    val_model,
+                    schedule=self.sampling_schedule,
+                    batch_size=batch["input_ids_dec"].shape[0],
+                    sampling_timesteps=self.cfg.sampling_timesteps,
+                    sampler=self.cfg.sampler,
+                    diffusion_objective=self.cfg.diffusion_objective,
+                    cond=hidden_states[:, : self.cfg.prefix_length],
                 )
-                for i in range(5):
-                    table.add_data(
-                        batch["prefix_str"][i],
-                        batch["suffix_str"][i],
-                        suffix_sample_str_recon[i],
+
+                input_embeds_samples = self.get_input_embeds(
+                    batch,
+                    z_samples,
+                    alpha=(
+                        torch.full((z_samples.size(0),), 0.05, device=z_samples.device)
+                        if self.cfg.prompt_generator_noise
+                        else None
+                    ),
+                )
+
+                suffix_sample_str = self.decoder.tokenizer.batch_decode(
+                    self.decoder.generate(
+                        prefix_embeds=input_embeds_samples[
+                            :, : -self.cfg.suffix_length
+                        ],
+                        max_length=self.cfg.suffix_length,
+                    ),
+                    skip_special_tokens=True,
+                )
+            else:
+                suffix_sample_str = self.decoder.tokenizer.batch_decode(
+                    self.decoder.generate(
+                        prefix=batch["input_ids_dec"][:, : self.cfg.prefix_length],
+                        max_length=self.cfg.suffix_length,
+                    ),
+                    skip_special_tokens=True,
+                )
+
+            # Accumulate generated texts for MAUVE computation
+            if self.cfg.eval_mauve:
+                for prefix_str, suffix_str in zip(batch["prefix_str"], suffix_sample_str):
+                    self.val_generated_texts.append(prefix_str + suffix_str)
+
+            if self.cfg.eval_gen_ppl:
+                ppl_samples = self.eval_ppl(
+                    batch["prefix_str"],
+                    suffix_sample_str,
+                    device=batch["input_ids_dec"].device,
+                )
+                self.log(
+                    "val/gen_ppl",
+                    ppl_samples,
+                    on_epoch=True,
+                    on_step=False,
+                    sync_dist=True,
+                )
+
+            if self.cfg.eval_gen_ppl and self.model is not None:
+                suffix_sample_str_recon = self.decoder.tokenizer.batch_decode(
+                    self.decoder.generate(
+                        prefix_embeds=input_embeds[:, : -self.cfg.suffix_length],
+                        max_length=self.cfg.suffix_length,
+                    ),
+                    skip_special_tokens=True,
+                )
+
+                ppl_samples_recon = self.eval_ppl(
+                    batch["prefix_str"],
+                    suffix_sample_str_recon,
+                    device=batch["input_ids_dec"].device,
+                )
+                self.log(
+                    "val/gen_ppl_true",
+                    ppl_samples_recon,
+                    on_epoch=True,
+                    on_step=False,
+                    sync_dist=True,
+                )
+                if (rank_zero_only.rank == 0) and (wandb.run is not None) and (batch_idx == 0):
+                    table = wandb.Table(
+                        columns=["Prefix", "True Suffix", "Generated Suffix"]
                     )
-                wandb.log({"val/samples": table})
-                del table
+                    for i in range(5):
+                        table.add_data(
+                            batch["prefix_str"][i],
+                            batch["suffix_str"][i],
+                            suffix_sample_str_recon[i],
+                        )
+                    wandb.log({"val/samples": table})
+                    del table
 
     def on_train_batch_end(self, outputs, batch, batch_idx):
         # Update EMA model every step
@@ -690,9 +757,76 @@ class GaussianDiffusionTask(L.LightningModule):
             self.ema_model[0] = self.ema_model[0].to(self.device)
 
         self.ppl_model[0] = self.ppl_model[0].to(self.device)
+
+        # Reset accumulated texts for MAUVE computation
+        if self.cfg.eval_mauve:
+            self.val_generated_texts = []
+
         torch.cuda.empty_cache()
 
     def on_validation_epoch_end(self):
+        # Compute MAUVE score if enabled
+        if self.cfg.eval_mauve and len(self.val_generated_texts) > 0:
+            # Gather generated texts from all ranks to rank 0
+            if self.trainer.num_devices > 1:
+                import torch.distributed as dist
+                if dist.is_initialized():
+                    # Gather texts from all ranks using all_gather_object
+                    gathered_texts = [None] * self.trainer.world_size
+                    dist.all_gather_object(gathered_texts, self.val_generated_texts)
+
+                    if rank_zero_only.rank == 0:
+                        # Flatten the list of lists
+                        all_generated_texts = [text for rank_texts in gathered_texts for text in rank_texts]
+                        self.val_generated_texts = all_generated_texts
+                        print(f"Gathered {len(self.val_generated_texts)} texts from {self.trainer.world_size} ranks")
+
+            if rank_zero_only.rank == 0:
+                print(f"Computing MAUVE score with {len(self.val_generated_texts)} generated samples...")
+
+                # Use only the first n reference features where n = number of generated samples
+                n_samples = len(self.val_generated_texts)
+                reference_features_subset = self.mauve_reference_features[:n_samples]
+
+                # Featurize generated texts
+                generated_features = get_features_from_input(
+                    features=None,
+                    tokenized_texts=None,
+                    texts=self.val_generated_texts,
+                    featurize_model_name=self.cfg.mauve_model_name,
+                    max_len=self.cfg.mauve_max_len,
+                    device_id=self.cfg.mauve_device_id,
+                    name="generated text",
+                    batch_size=self.cfg.mauve_batch_size,
+                    verbose=False,
+                )
+
+                # Compute MAUVE score
+                mauve_result = compute_mauve(
+                    p_features=reference_features_subset,
+                    q_features=generated_features,
+                    verbose=False,
+                )
+
+                # Log MAUVE score
+                self.log(
+                    "val/mauve",
+                    mauve_result.mauve,
+                    on_epoch=True,
+                    rank_zero_only=True,
+                    sync_dist=False,
+                )
+                self.log(
+                    "val/mauve_frontier_integral",
+                    mauve_result.frontier_integral,
+                    on_epoch=True,
+                    rank_zero_only=True,
+                    sync_dist=False,
+                )
+
+                print(f"MAUVE score: {mauve_result.mauve:.4f}")
+                print(f"Frontier integral: {mauve_result.frontier_integral:.4f}")
+
         # Move EMA model back to CPU after validation to save GPU memory
         if self.cfg.use_ema:
             self.ema_model[0] = self.ema_model[0].cpu()

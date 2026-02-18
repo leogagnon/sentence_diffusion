@@ -387,9 +387,7 @@ class PrefixSuffixIterable(IterableDataset):
 
                 # Maybe extract the context
                 if self.encoder_mode == "context":
-                    context_ids_dec = input_ids_dec[
-                        : self.context_length + self.prefix_length
-                    ]
+                    context_ids_dec = input_ids_dec
                     input_ids_dec = input_ids_dec[self.context_length :]
                 prefix_ids_dec = input_ids_dec[: self.prefix_length]
                 suffix_ids_dec = input_ids_dec[-self.suffix_length :]

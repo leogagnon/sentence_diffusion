@@ -1,0 +1,44 @@
+lr: 1e-4
+lr_warmup_steps: 2000
+batch_size: 128
+
+dataset:
+  name: fineweb
+  val_size: 16384
+  seed: 42
+
+encoder:
+  model_name: sentence-transformers/sentence-t5-large
+  no_out_proj: true
+
+decoder:
+  name: gpt2-medium # 1.5B params
+  cross_attention: false
+  attn_implem: sdpa
+
+model:
+  n_layers: 12
+  n_heads: 12
+  n_embd: 768
+  seq_len: 64
+  dropout: 0.0
+  cond_modulation: false
+
+eval_gen_ppl: true
+
+prefix_length: 16
+suffix_length: 64
+context_length: 112
+
+use_ema: true
+prompt_generator_noise: true
+loss: l2
+sampling_timesteps: 100
+train_schedule: cosine
+diffusion_objective: pred_v
+schedule_scale: 1.0
+sampler: ddpm
+normalize_latent: true
+num_latent_for_precomputed_stats: 30000
+
+name: ddpm_base

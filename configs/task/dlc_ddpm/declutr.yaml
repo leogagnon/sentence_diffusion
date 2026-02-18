@@ -17,7 +17,7 @@ model:
 
 eval_gen_ppl: true
 
-pretrained_declutr_id: v6jqgrwj
+pretrained_declutr_id: 8q8o8xff
 
 prefix_length: 16
 suffix_length: 64
