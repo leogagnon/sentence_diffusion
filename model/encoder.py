@@ -350,6 +350,7 @@ class EncoderModel(nn.Module):
         temp: Optional[float] = None,
         return_logits: bool = False,
         only_backbone: bool = False,
+        skip_out_proj: bool = False,
     ):
 
         outputs = self.transformer(
@@ -373,7 +374,8 @@ class EncoderModel(nn.Module):
         # Run through SEM / output projection
         if self.cfg.sem is None:
             out["latent"] = z.clone()
-            z = self.out_proj(z)
+            if not skip_out_proj:
+                z = self.out_proj(z)
         else:
             out.update(
                 self.sem(
@@ -384,15 +386,20 @@ class EncoderModel(nn.Module):
                     temp=temp,
                 )
             )
-            z = self.out_proj(out.pop("z"))
+            sem_z = out.pop("z")
+            if skip_out_proj:
+                z = sem_z
+            else:
+                z = self.out_proj(sem_z)
 
-        # Reshape latent
-        z = einx.rearrange(
-            "b (l d) -> b l d", z, l=self.cfg.latent_length, d=self.cfg.latent_dim
-        )
+        if not skip_out_proj:
+            # Reshape latent
+            z = einx.rearrange(
+                "b (l d) -> b l d", z, l=self.cfg.latent_length, d=self.cfg.latent_dim
+            )
 
-        # Maybe squeeze if latent_length == 1
-        z = torch.squeeze(z, dim=1) if self.cfg.latent_length == 1 else z
+            # Maybe squeeze if latent_length == 1
+            z = torch.squeeze(z, dim=1) if self.cfg.latent_length == 1 else z
 
         return z, out
 

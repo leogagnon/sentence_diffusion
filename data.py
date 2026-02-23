@@ -3,7 +3,7 @@ import os
 import random
 from dataclasses import dataclass
 from enum import Enum
-from typing import Any, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 import ftfy
 import torch
@@ -458,6 +458,96 @@ class PrefixSuffixIterable(IterableDataset):
                 yield out_dict
 
 
+class SimCSEIterable(IterableDataset):
+    """
+    Samples contiguous text spans for SimCSE-style training.
+    Each yielded item is a single tokenized span; the SimCSE loss encodes the same
+    span twice using different dropout masks to form positive pairs.
+    """
+
+    def __init__(
+        self,
+        dataset,
+        tokenizer,
+        span_length: int,
+        seed: Optional[int] = None,
+    ):
+        assert hasattr(dataset, "__len__") and hasattr(dataset, "__getitem__")
+        self.ds = dataset
+        self.N = len(dataset)
+        assert self.N > 0
+        self.span_length = span_length
+        self.seed = seed
+        self.tok = tokenizer
+
+    def _make_generator(self) -> random.Random:
+        if torch.distributed.is_available() and torch.distributed.is_initialized():
+            rank = torch.distributed.get_rank()
+        else:
+            rank = 0
+        wi = get_worker_info()
+        wid = wi.id if wi is not None else 0
+        base = self.seed
+        if base is None:
+            base = int.from_bytes(os.urandom(8), "little", signed=False)
+        mixed = (
+            int(base)
+            ^ (0x9E3779B97F4A7C15 * (rank + 1))
+            ^ (0xBF58476D1CE4E5B9 * (wid + 1))
+        ) & ((1 << 63) - 1)
+        return random.Random(mixed)
+
+    @classmethod
+    def get_dataloader(
+        cls,
+        dataset,
+        tokenizer: PreTrainedTokenizerFast,
+        batch_size: int,
+        span_length: int,
+        seed: int = 32,
+    ) -> DataLoader:
+        def collate_fn(batch):
+            return tokenizer.pad(
+                {"input_ids": batch},
+                padding=True,
+                return_tensors="pt",
+                return_attention_mask=True,
+            )
+
+        iterable = cls(dataset, tokenizer=tokenizer, span_length=span_length, seed=seed)
+        num_workers = int(os.environ.get("TORCH_NUM_WORKERS", 0))
+        return DataLoader(
+            iterable,
+            batch_size=batch_size,
+            collate_fn=collate_fn,
+            num_workers=num_workers,
+            persistent_workers=False,
+            prefetch_factor=8 if num_workers > 0 else None,
+            pin_memory=True,
+        )
+
+    def __iter__(self):
+        generator = self._make_generator()
+
+        while True:
+            indices = generator.choices(range(self.N), k=1024)
+            item_batch = self.ds.dataset.dataset[indices]
+            input_ids_batch = self.tok.batch_encode_plus(
+                item_batch["text"],
+                add_special_tokens=False,
+                return_attention_mask=False,
+            )["input_ids"]
+
+            for i in range(1024):
+                input_ids = input_ids_batch[i]
+                seq_length = len(input_ids)
+                if seq_length < self.span_length:
+                    continue
+                window_start = generator.randint(0, seq_length - self.span_length)
+                span = input_ids[window_start : window_start + self.span_length]
+                yield torch.LongTensor(span)
+
+
 class DeCLUTRIterable(IterableDataset):
     """
     Samples WITH REPLACEMENT DeCLUTR-style training examples from a text dataset (https://github.com/JohnGiorgi/DeCLUTR/)
@@ -626,8 +716,8 @@ class DeCLUTRIterable(IterableDataset):
             batch_size=batch_size,
             collate_fn=collate_fn,
             num_workers=num_workers,
-            persistent_workers=False,
-            prefetch_factor=8 if num_workers > 0 else None,
+            persistent_workers=True,
+            prefetch_factor=4 if num_workers > 0 else None,
             pin_memory=True,
         )
 
@@ -636,7 +726,7 @@ class DeCLUTRIterable(IterableDataset):
 
         while True:
             # Sample a batch of 1024 random documents for I/O efficiency
-            indices = generator.choices(range(self.N), k=1024)
+            indices = generator.choices(range(self.N), k=512)
             item_batch = self.ds.dataset.dataset[indices]
             input_ids_batch = self.tok.batch_encode_plus(
                 item_batch["text"],
@@ -644,7 +734,7 @@ class DeCLUTRIterable(IterableDataset):
                 return_attention_mask=False,
             )["input_ids"]
 
-            for i in range(1024):
+            for i in range(512):
 
                 input_ids = input_ids_batch[i]
                 seq_length = len(input_ids)
@@ -736,9 +826,11 @@ class DeCLUTRIterable(IterableDataset):
                         positive_end = positive_start + positive_len
                         positives.append(input_ids[positive_start:positive_end])
 
+                bos = self.tok.bos_token_id
+                eos = self.tok.eos_token_id
                 out_dict = {
-                    "anchor_ids": [torch.LongTensor(a) for a in anchors],
-                    "positive_ids": [torch.LongTensor(p) for p in positives],
+                    "anchor_ids": [torch.LongTensor([bos] + a + [eos]) for a in anchors],
+                    "positive_ids": [torch.LongTensor([bos] + p + [eos]) for p in positives],
                 }
 
                 if self.masked_anchors:
@@ -748,9 +840,382 @@ class DeCLUTRIterable(IterableDataset):
                         masked_ids, mlm_labels = self._apply_anchor_mlm(
                             anchor, generator
                         )
-                        masked_anchors.append(torch.LongTensor(masked_ids))
-                        anchor_labels.append(torch.LongTensor(mlm_labels))
+                        masked_anchors.append(torch.LongTensor([bos] + masked_ids + [eos]))
+                        anchor_labels.append(torch.LongTensor([-100] + mlm_labels + [-100]))
                     out_dict["anchor_ids"] = masked_anchors
                     out_dict["anchor_labels"] = anchor_labels
 
                 yield out_dict
+
+
+# ---------------------------------------------------------------------------
+# Dataset loading helpers for E5-style mixture training
+# ---------------------------------------------------------------------------
+
+
+def load_vitaminc_pairs() -> Tuple[List[str], List[str]]:
+    """Load VitaminC SUPPORTS pairs as (claim, evidence)."""
+    ds = load_dataset("tals/vitaminc", split="train")
+    anchors, positives = [], []
+    for row in ds:
+        if row["label"] == "SUPPORTS":
+            anchors.append(row["claim"])
+            positives.append(row["evidence"])
+    return anchors, positives
+
+
+def load_anli_pairs() -> Tuple[List[str], List[str]]:
+    """Load ANLI entailment pairs (all rounds) as (premise, hypothesis)."""
+    anchors, positives = [], []
+    for round_name in ("r1", "r2", "r3"):
+        ds = load_dataset("facebook/anli", split=f"train_{round_name}")
+        for row in ds:
+            if row["label"] == 0:  # entailment
+                anchors.append(row["premise"])
+                positives.append(row["hypothesis"])
+    return anchors, positives
+
+
+def load_paws_pairs() -> Tuple[List[str], List[str]]:
+    """Load PAWS paraphrase pairs (label=1)."""
+    ds = load_dataset("google-research-datasets/paws", "labeled_final", split="train")
+    anchors, positives = [], []
+    for row in ds:
+        if row["label"] == 1:
+            anchors.append(row["sentence1"])
+            positives.append(row["sentence2"])
+    return anchors, positives
+
+
+def load_yelp_polarity_groups() -> Dict[int, List[str]]:
+    """Load Yelp Polarity reviews grouped by sentiment label (0=neg, 1=pos)."""
+    ds = load_dataset("fancyzhx/yelp_polarity", split="train")
+    groups: Dict[int, List[str]] = {0: [], 1: []}
+    for row in ds:
+        groups[row["label"]].append(row["text"])
+    return groups
+
+
+def load_ibm_argq_groups() -> Dict[str, List[str]]:
+    """Load IBM ArgQ arguments grouped by topic."""
+    ds = load_dataset("ibm-research/argument_quality_ranking_30k", "argument_quality_ranking", split="train")
+    groups: Dict[str, List[str]] = {}
+    for row in ds:
+        topic = row["topic"]
+        if topic not in groups:
+            groups[topic] = []
+        groups[topic].append(row["argument"])
+    # Drop topics with fewer than 2 arguments
+    return {k: v for k, v in groups.items() if len(v) >= 2}
+
+
+# ---------------------------------------------------------------------------
+# PairDatasetIterable — for explicit (anchor, positive) text pairs
+# ---------------------------------------------------------------------------
+
+
+class PairDatasetIterable(IterableDataset):
+    """
+    Iterable for datasets that provide explicit (anchor, positive) text pairs
+    (e.g. VitaminC, ANLI, PAWS). Samples WITH REPLACEMENT.
+
+    Yields DeCLUTR-format dicts compatible with the standard collate_fn:
+        {"anchor_ids": [LongTensor], "positive_ids": [LongTensor]}
+    """
+
+    def __init__(
+        self,
+        anchors: List[str],
+        positives: List[str],
+        tokenizer,
+        max_length: int = 128,
+        seed: Optional[int] = None,
+    ):
+        assert len(anchors) == len(positives) and len(anchors) > 0
+        self.anchors = anchors
+        self.positives = positives
+        self.N = len(anchors)
+        self.tok = tokenizer
+        self.max_length = max_length
+        self.seed = seed
+
+    def _make_generator(self) -> random.Random:
+        if torch.distributed.is_available() and torch.distributed.is_initialized():
+            rank = torch.distributed.get_rank()
+        else:
+            rank = 0
+        wi = get_worker_info()
+        wid = wi.id if wi is not None else 0
+        base = self.seed
+        if base is None:
+            base = int.from_bytes(os.urandom(8), "little", signed=False)
+        mixed = (
+            int(base)
+            ^ (0x9E3779B97F4A7C15 * (rank + 1))
+            ^ (0xBF58476D1CE4E5B9 * (wid + 1))
+        ) & ((1 << 63) - 1)
+        return random.Random(mixed)
+
+    def __iter__(self):
+        rng = self._make_generator()
+        while True:
+            indices = rng.choices(range(self.N), k=256)
+            for idx in indices:
+                anchor_ids = self.tok.encode(
+                    self.anchors[idx],
+                    add_special_tokens=True,
+                    max_length=self.max_length,
+                    truncation=True,
+                )
+                positive_ids = self.tok.encode(
+                    self.positives[idx],
+                    add_special_tokens=True,
+                    max_length=self.max_length,
+                    truncation=True,
+                )
+                yield {
+                    "anchor_ids": [torch.LongTensor(anchor_ids)],
+                    "positive_ids": [torch.LongTensor(positive_ids)],
+                }
+
+
+# ---------------------------------------------------------------------------
+# SameLabelPairIterable — for datasets without explicit pairs (same-label)
+# ---------------------------------------------------------------------------
+
+
+class SameLabelPairIterable(IterableDataset):
+    """
+    Iterable for datasets without explicit positive pairs. Texts are pre-grouped
+    by label/topic; the iterable samples two texts from the same group as the
+    anchor/positive pair.
+
+    groups: Dict[label, List[str]]  — e.g. {0: ["neg text", ...], 1: ["pos text", ...]}
+    """
+
+    def __init__(
+        self,
+        groups: Dict,
+        tokenizer,
+        max_length: int = 128,
+        seed: Optional[int] = None,
+    ):
+        # Filter out singleton groups
+        self.groups = {k: v for k, v in groups.items() if len(v) >= 2}
+        assert len(self.groups) > 0
+        self.group_keys = list(self.groups.keys())
+        self.tok = tokenizer
+        self.max_length = max_length
+        self.seed = seed
+
+    def _make_generator(self) -> random.Random:
+        if torch.distributed.is_available() and torch.distributed.is_initialized():
+            rank = torch.distributed.get_rank()
+        else:
+            rank = 0
+        wi = get_worker_info()
+        wid = wi.id if wi is not None else 0
+        base = self.seed
+        if base is None:
+            base = int.from_bytes(os.urandom(8), "little", signed=False)
+        mixed = (
+            int(base)
+            ^ (0x9E3779B97F4A7C15 * (rank + 1))
+            ^ (0xBF58476D1CE4E5B9 * (wid + 1))
+        ) & ((1 << 63) - 1)
+        return random.Random(mixed)
+
+    def __iter__(self):
+        rng = self._make_generator()
+        while True:
+            # Pick a random group, then sample 2 distinct texts from it
+            key = rng.choice(self.group_keys)
+            group = self.groups[key]
+            anchor_text, positive_text = rng.sample(group, k=2)
+            anchor_ids = self.tok.encode(
+                anchor_text,
+                add_special_tokens=True,
+                max_length=self.max_length,
+                truncation=True,
+            )
+            positive_ids = self.tok.encode(
+                positive_text,
+                add_special_tokens=True,
+                max_length=self.max_length,
+                truncation=True,
+            )
+            yield {
+                "anchor_ids": [torch.LongTensor(anchor_ids)],
+                "positive_ids": [torch.LongTensor(positive_ids)],
+            }
+
+
+# ---------------------------------------------------------------------------
+# ContrastiveMixtureIterable — uniform mixture over per-dataset iterables
+# ---------------------------------------------------------------------------
+
+
+class ContrastiveMixtureIterable(IterableDataset):
+    """
+    Uniformly samples from a list of contrastive iterables, one dataset per batch.
+
+    DDP correctness: the selector RNG uses `seed` only — NOT mixed with rank or
+    worker id. This means all ranks/workers advance the same selector sequence
+    independently and always agree on which dataset to sample from. The per-dataset
+    child iterables use rank+worker-mixed seeds so each rank draws different items.
+
+    The `batch_size` argument must match the DataLoader batch_size so that this
+    iterable yields exactly `batch_size` items from one dataset before switching,
+    keeping every DataLoader batch homogeneous.
+    """
+
+    def __init__(
+        self,
+        iterables: List[IterableDataset],
+        batch_size: int,
+        seed: int = 0,
+    ):
+        assert len(iterables) > 0
+        self.iterables = iterables
+        self.batch_size = batch_size
+        self.seed = seed  # NOT rank-mixed — shared across all ranks/workers
+
+    def __iter__(self):
+        # Selector: same seed on all ranks/workers for agreement on dataset choice
+        selector_rng = random.Random(self.seed)
+        item_iters = [iter(it) for it in self.iterables]
+
+        while True:
+            task_idx = selector_rng.randrange(len(self.iterables))
+            it = item_iters[task_idx]
+            for _ in range(self.batch_size):
+                yield next(it)
+
+    @classmethod
+    def get_dataloader(
+        cls,
+        iterables: List[IterableDataset],
+        batch_size: int,
+        tokenizer: PreTrainedTokenizerFast,
+        seed: int = 0,
+    ) -> DataLoader:
+        def collate_fn(batch):
+            concat_batch: Dict[str, List] = {}
+            for key in batch[0].keys():
+                concat_batch[key] = []
+                for item in batch:
+                    concat_batch[key].extend(item[key])
+
+            concat_batch["anchor_ids"] = pad_sequence(
+                concat_batch["anchor_ids"],
+                batch_first=True,
+                padding_value=tokenizer.pad_token_id,
+            )
+            concat_batch["positive_ids"] = pad_sequence(
+                concat_batch["positive_ids"],
+                batch_first=True,
+                padding_value=tokenizer.pad_token_id,
+            )
+            return {
+                "anchor_ids": concat_batch["anchor_ids"],
+                "positive_ids": concat_batch["positive_ids"],
+            }
+
+        iterable = cls(iterables, batch_size=batch_size, seed=seed)
+        num_workers = int(os.environ.get("TORCH_NUM_WORKERS", 0))
+        return DataLoader(
+            iterable,
+            batch_size=batch_size,
+            collate_fn=collate_fn,
+            num_workers=num_workers,
+            persistent_workers=True,
+            prefetch_factor=4 if num_workers > 0 else None,
+            pin_memory=True,
+        )
+
+
+# ---------------------------------------------------------------------------
+# MixedItemIterable — item-level mixture, safe for pairwise losses (DINO)
+# ---------------------------------------------------------------------------
+
+
+class MixedItemIterable(IterableDataset):
+    """
+    Item-level uniform mixture over a list of contrastive iterables.
+
+    Unlike ContrastiveMixtureIterable, the dataset selector is chosen per item
+    and the selector RNG IS mixed with rank+worker id. This means DDP ranks
+    independently sample different datasets — safe because DINO's loss is
+    pairwise and does not require batch-level dataset homogeneity.
+    """
+
+    def __init__(
+        self,
+        iterables: List[IterableDataset],
+        seed: int = 0,
+    ):
+        assert len(iterables) > 0
+        self.iterables = iterables
+        self.seed = seed  # rank+worker-mixed for DDP independence
+
+    def _make_selector(self) -> random.Random:
+        if torch.distributed.is_available() and torch.distributed.is_initialized():
+            rank = torch.distributed.get_rank()
+        else:
+            rank = 0
+        wi = get_worker_info()
+        wid = wi.id if wi is not None else 0
+        mixed = (
+            int(self.seed)
+            ^ (0x9E3779B97F4A7C15 * (rank + 1))
+            ^ (0xBF58476D1CE4E5B9 * (wid + 1))
+        ) & ((1 << 63) - 1)
+        return random.Random(mixed)
+
+    def __iter__(self):
+        rng = self._make_selector()
+        item_iters = [iter(it) for it in self.iterables]
+        while True:
+            yield next(item_iters[rng.randrange(len(self.iterables))])
+
+    @classmethod
+    def get_dataloader(
+        cls,
+        iterables: List[IterableDataset],
+        batch_size: int,
+        tokenizer: PreTrainedTokenizerFast,
+        seed: int = 0,
+    ) -> DataLoader:
+        def collate_fn(batch):
+            concat_batch: Dict[str, List] = {}
+            for key in batch[0].keys():
+                concat_batch[key] = []
+                for item in batch:
+                    concat_batch[key].extend(item[key])
+
+            concat_batch["anchor_ids"] = pad_sequence(
+                concat_batch["anchor_ids"],
+                batch_first=True,
+                padding_value=tokenizer.pad_token_id,
+            )
+            concat_batch["positive_ids"] = pad_sequence(
+                concat_batch["positive_ids"],
+                batch_first=True,
+                padding_value=tokenizer.pad_token_id,
+            )
+            return {
+                "anchor_ids": concat_batch["anchor_ids"],
+                "positive_ids": concat_batch["positive_ids"],
+            }
+
+        iterable = cls(iterables, seed=seed)
+        num_workers = int(os.environ.get("TORCH_NUM_WORKERS", 0))
+        return DataLoader(
+            iterable,
+            batch_size=batch_size,
+            collate_fn=collate_fn,
+            num_workers=num_workers,
+            persistent_workers=True,
+            prefetch_factor=4 if num_workers > 0 else None,
+            pin_memory=True,
+        )

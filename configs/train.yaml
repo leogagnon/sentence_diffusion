@@ -7,6 +7,9 @@ defaults:
   - task/dlc_ar: null
   - task/dlc_md: null
   - task/declutr: null
+  - task/dino_mixture: null
+  - task/e5_mixture: null
+  - task/simcse: null
   - task/dlc_ddpm: null
   - model_checkpoint: null
   - early_stopping: null

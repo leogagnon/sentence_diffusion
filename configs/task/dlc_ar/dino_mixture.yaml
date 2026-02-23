@@ -2,13 +2,13 @@ lr: 2e-4
 lr_warmup_steps: 2000
 batch_size: 32
 decoder:
-  name: gpt2-medium # 1.5B params
+  name: gpt2-medium
   cross_attention: false
   attn_implem: sdpa
 
 eval_gen_ppl: true
 
-pretrained_declutr_id: 5rg719g4
+pretrained_dino_id: q241xotm
 
 DLC_dropout: 0.0
 
@@ -16,4 +16,4 @@ prefix_length: 16
 suffix_length: 64
 context_length: 112
 
-name: dlc_ar/declutr
+name: dlc_ar/dino_mixture

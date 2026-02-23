@@ -4,8 +4,10 @@ from dataclasses import dataclass
 from typing import Optional
 
 import lightning as L
+import numpy as np
 import torch
 import wandb
+from mauve import get_features_from_input, compute_mauve
 from lightning.pytorch.utilities.rank_zero import rank_zero_only
 from omegaconf import OmegaConf
 from torch.utils.data.dataset import Subset
@@ -16,6 +18,7 @@ from data import InfoLabel, LanguageDataset, LanguageDatasetConfig, PrefixSuffix
 from model.diffusion import DiTConfig, DiTModel
 from tasks.declutr import DeCLUTRTask
 from tasks.autoencoder import AETask
+from tasks.dino_mixture import DINOMixtureTask
 from tasks.utils import *
 
 
@@ -30,9 +33,17 @@ class DLCMDTaskConfig:
     ancestral: bool = False
     val_batch_size: Optional[int] = None
 
+    eval_mauve: bool = True
+    mauve_reference_features_path: Optional[str] =  "mauve_reference_features.npy"
+    mauve_model_name: str = "gpt2-large"
+    mauve_max_len: int = 150
+    mauve_device_id: int = 0
+    mauve_batch_size: int = 64
+
     dataset: Optional[LanguageDatasetConfig] = None
     pretrained_declutr_id: Optional[str] = None
     pretrained_ae_id: Optional[str] = None
+    pretrained_dino_id: Optional[str] = None
 
     prefix_length: Optional[int] = None
     suffix_length: Optional[int] = None
@@ -108,6 +119,31 @@ class DLCMDTask(L.LightningModule):
 
             cfg.dit.dlc_vocab_size = self.encoder.sem.cfg.V
             cfg.dit.dlc_len = self.encoder.sem.dlc_len
+
+        elif cfg.pretrained_dino_id is not None:
+
+            task = DINOMixtureTask.load_from_checkpoint(
+                os.path.join(
+                    os.environ["LOG_DIR"],
+                    "checkpoints/",
+                    cfg.pretrained_dino_id,
+                    "last.ckpt",
+                ),
+                strict=False,
+                map_location=torch.device("cpu"),
+            )
+
+            # Sync dataset config (DINO uses declutr_dataset, not dataset)
+            cfg.dataset = task.cfg.declutr_dataset
+            assert cfg.prefix_length is not None
+            assert cfg.suffix_length is not None
+            assert cfg.context_length is not None
+
+            self.encoder = task.encoder.eval().requires_grad_(False)
+
+            cfg.dit.dlc_vocab_size = self.encoder.sem.cfg.V
+            cfg.dit.dlc_len = self.encoder.sem.dlc_len
+
         else:
             assert cfg.prefix_length is not None
             assert cfg.suffix_length is not None
@@ -135,6 +171,15 @@ class DLCMDTask(L.LightningModule):
                 self.encoder_mode = "context"
             else:
                 self.encoder_mode = "suffix"
+
+        # Load MAUVE reference features if needed
+        self.val_generated_texts = []
+        if cfg.eval_mauve:
+            assert cfg.mauve_reference_features_path is not None, \
+                "mauve_reference_features_path must be provided when eval_mauve=True"
+            print(f"Loading MAUVE reference features from {cfg.mauve_reference_features_path}")
+            self.mauve_reference_features = np.load(cfg.mauve_reference_features_path)
+            print(f"Loaded {self.mauve_reference_features.shape[0]} reference features")
 
         self.cfg = cfg
 
@@ -435,10 +480,83 @@ class DLCMDTask(L.LightningModule):
                         wandb.log({"val/samples": table})
                         del table
 
+        # MAUVE: accumulate joint samples p(DLC, suffix | prefix) across all batches
+        if self.cfg.eval_mauve and not self.cfg.ancestral:
+            prior = batch["input_ids_dec"].clone()
+            prior[
+                (batch["info_mask_dec"] == InfoLabel.SUFFIX.value)
+                + (batch["info_mask_dec"] == InfoLabel.DLC.value)
+            ] = self.dit.tokenizer.mask_token_id
+            gen_suffix_str = self.dit.tokenizer.batch_decode(
+                self.dit.sample(prior=prior)[:, -self.cfg.suffix_length :]
+            )
+            for prefix_str, suffix_str in zip(batch["prefix_str"], gen_suffix_str):
+                self.val_generated_texts.append(prefix_str + suffix_str)
+
     def on_validation_epoch_start(self):
-        self.ppl_model[0] = self.ppl_model[0].to(self.device)
+        if self.cfg.eval_gen_ppl:
+            self.ppl_model[0] = self.ppl_model[0].to(self.device)
+        if self.cfg.eval_mauve:
+            self.val_generated_texts = []
         torch.cuda.empty_cache()
 
     def on_validation_epoch_end(self):
-        self.ppl_model[0] = self.ppl_model[0].cpu()
+        # Compute MAUVE score if enabled
+        if self.cfg.eval_mauve and len(self.val_generated_texts) > 0:
+            # Gather generated texts from all ranks to rank 0
+            if self.trainer.num_devices > 1:
+                import torch.distributed as dist
+                if dist.is_initialized():
+                    gathered_texts = [None] * self.trainer.world_size
+                    dist.all_gather_object(gathered_texts, self.val_generated_texts)
+                    if rank_zero_only.rank == 0:
+                        self.val_generated_texts = [
+                            text for rank_texts in gathered_texts for text in rank_texts
+                        ]
+                        print(f"Gathered {len(self.val_generated_texts)} texts from {self.trainer.world_size} ranks")
+
+            if rank_zero_only.rank == 0:
+                print(f"Computing MAUVE score with {len(self.val_generated_texts)} generated samples...")
+
+                n_samples = len(self.val_generated_texts)
+                reference_features_subset = self.mauve_reference_features[:n_samples]
+
+                generated_features = get_features_from_input(
+                    features=None,
+                    tokenized_texts=None,
+                    texts=self.val_generated_texts,
+                    featurize_model_name=self.cfg.mauve_model_name,
+                    max_len=self.cfg.mauve_max_len,
+                    device_id=self.cfg.mauve_device_id,
+                    name="generated text",
+                    batch_size=self.cfg.mauve_batch_size,
+                    verbose=False,
+                )
+
+                mauve_result = compute_mauve(
+                    p_features=reference_features_subset,
+                    q_features=generated_features,
+                    verbose=False,
+                )
+
+                self.log(
+                    "val/mauve",
+                    mauve_result.mauve,
+                    on_epoch=True,
+                    rank_zero_only=True,
+                    sync_dist=False,
+                )
+                self.log(
+                    "val/mauve_frontier_integral",
+                    mauve_result.frontier_integral,
+                    on_epoch=True,
+                    rank_zero_only=True,
+                    sync_dist=False,
+                )
+
+                print(f"MAUVE score: {mauve_result.mauve:.4f}")
+                print(f"Frontier integral: {mauve_result.frontier_integral:.4f}")
+
+        if self.cfg.eval_gen_ppl:
+            self.ppl_model[0] = self.ppl_model[0].cpu()
         torch.cuda.empty_cache()

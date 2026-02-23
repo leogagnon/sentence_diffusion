@@ -10,5 +10,5 @@ limit_val_batches: 4
 val_check_interval: 512
 strategy: ddp_find_unused_parameters_true
 
-sweep_id: dlc_ddpm/ae_noise_cond
+sweep_id: dlc_ddpm/ae
 

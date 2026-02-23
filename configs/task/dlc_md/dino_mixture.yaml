@@ -6,17 +6,17 @@ val_batch_size: 32
 dit:
   name: kuleshov-group/mdlm-owt
   sampling_steps: 512
-  sampling_mode: remdm-cap  # mdlm, remdm-cap, remdm-loop  
-  nucleus_p: 0.9  
-  sampling_eps: 1e-3 
+  sampling_mode: remdm-cap  # mdlm, remdm-cap, remdm-loop
+  nucleus_p: 0.9
+  sampling_eps: 1e-3
 
 ancestral: false
 eval_gen_ppl: true
-pretrained_declutr_id: 5rg719g4
+pretrained_dino_id: q241xotm
 eval_mauve: true
 
 prefix_length: 16
 suffix_length: 64
 context_length: 112
 
-name: dlc_md/declutr
+name: dlc_md/dino_mixture

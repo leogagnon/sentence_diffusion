@@ -1,6 +1,6 @@
 batch_size: 64
 lr: 5e-4
-lr_warmup_steps: 1000
+lr_warmup_steps: 2000
 sem_noise: 0.3
 sem_noise_warmup_steps: 0
 prefix_length: 16
@@ -23,7 +23,7 @@ dataset:
   seed: 42
 
 encoder:
-  model_name: SONAR
+  model_name: FacebookAI/roberta-large
   train_backbone: true
   latent_length: 32
   sem: 
@@ -37,4 +37,4 @@ decoder:
   cross_attention: True
   attn_implem: sdpa
 
-name: base_ae
+name: ae/sem

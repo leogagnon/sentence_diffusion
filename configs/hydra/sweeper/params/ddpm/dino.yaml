@@ -1,0 +1,16 @@
+task/dlc_ddpm: dino
+model_checkpoint: base
+
+task.dlc_ddpm.context_length: 112
+
+task.dlc_ddpm.model.n_layers: 16
+task.dlc_ddpm.model.n_embd: 1024
+
+max_steps: 20000
+
+limit_val_batches: 6
+val_check_interval: 512
+strategy: ddp_find_unused_parameters_true
+
+sweep_id: dlc_ddpm/dino_big
+

@@ -20,7 +20,10 @@ from tasks.autoencoder import AETask, AETaskConfig
 from tasks.declutr import DeCLUTRTask, DeCLUTRTaskConfig
 from tasks.dlc_ar import DLCARTask, DLCARTaskConfig
 from tasks.dlc_md import DLCMDTask, DLCMDTaskConfig
-from tasks.dlc_ddpm import GaussianDiffusionTask, GaussianDiffusionTaskConfig
+from tasks.ddpm import GaussianDiffusionTask, GaussianDiffusionTaskConfig
+from tasks.dino_mixture import DINOMixtureTask, DINOMixtureTaskConfig
+from tasks.e5_mixture import E5MixtureTask, E5MixtureTaskConfig
+from tasks.simcse import SimCSETask, SimCSETaskConfig
 
 logging.set_verbosity_error()
 torch.set_float32_matmul_precision("medium")
@@ -36,6 +39,20 @@ os.environ["TORCH_NCCL_ASYNC_ERROR_HANDLING"] = "1"
 os.environ["TORCH_DISABLE_ADDR2LINE"] = "1"
 os.environ["TORCH_FR_BUFFER_SIZE"] = "1024"
 
+def infer_num_nodes(default=1):
+    # torchrun / Lightning envs
+    world_size = int(os.getenv("WORLD_SIZE", "0"))
+    local_world_size = int(os.getenv("LOCAL_WORLD_SIZE", "0"))
+    if world_size > 0 and local_world_size > 0:
+        return max(1, world_size // local_world_size)
+
+    # Slurm fallback
+    if os.getenv("SLURM_NNODES"):
+        return int(os.environ["SLURM_NNODES"])
+    if os.getenv("SLURM_JOB_NUM_NODES"):
+        return int(os.environ["SLURM_JOB_NUM_NODES"])
+
+    return default
 
 @dataclass
 class TaskConfig:
@@ -44,6 +61,9 @@ class TaskConfig:
     dlc_ar: Optional[DLCARTaskConfig] = None
     dlc_md: Optional[DLCMDTaskConfig] = None
     dlc_ddpm: Optional[GaussianDiffusionTaskConfig] = None
+    dino_mixture: Optional[DINOMixtureTaskConfig] = None
+    e5_mixture: Optional[E5MixtureTaskConfig] = None
+    simcse: Optional[SimCSETaskConfig] = None
 
 
 @dataclass
@@ -82,7 +102,7 @@ def main(cfg: Optional[TrainConfig] = None, run_id: Optional[str] = None):
         wandb_id = run_id
         api = wandb.Api()
         entity = "guillaume-lajoie"
-        project = "dlc_lm_3"
+        project = "dlc_lm_4"
         run = api.run(f"{entity}/{project}/{run_id}")
         cfg = OmegaConf.merge(OmegaConf.structured(TrainConfig), run.config)
 
@@ -143,14 +163,14 @@ def main(cfg: Optional[TrainConfig] = None, run_id: Optional[str] = None):
         # Add the autoencoder config to cfg
         if cfg.task.dlc_ar.pretrained_ae_id is not None:
             run = wandb.Api().run(
-                f"guillaume-lajoie/dlc_lm_3/{cfg.task.dlc_ar.pretrained_ae_id}"
+                f"guillaume-lajoie/dlc_lm_4/{cfg.task.dlc_ar.pretrained_ae_id}"
             )
             cfg.task.ae = OmegaConf.merge(
                 OmegaConf.structured(AETaskConfig), run.config["task"]["ae"]
             )
         elif cfg.task.dlc_ar.pretrained_declutr_id is not None:
             run = wandb.Api().run(
-                f"guillaume-lajoie/dlc_lm_3/{cfg.task.dlc_ar.pretrained_declutr_id}"
+                f"guillaume-lajoie/dlc_lm_4/{cfg.task.dlc_ar.pretrained_declutr_id}"
             )
             cfg.task.declutr = OmegaConf.merge(
                 OmegaConf.structured(DeCLUTRTaskConfig), run.config["task"]["declutr"]
@@ -163,14 +183,14 @@ def main(cfg: Optional[TrainConfig] = None, run_id: Optional[str] = None):
         # Add the autoencoder config to cfg
         if cfg.task.dlc_md.pretrained_ae_id is not None:
             run = wandb.Api().run(
-                f"guillaume-lajoie/dlc_lm_3/{cfg.task.dlc_md.pretrained_ae_id}"
+                f"guillaume-lajoie/dlc_lm_4/{cfg.task.dlc_md.pretrained_ae_id}"
             )
             cfg.task.ae = OmegaConf.merge(
                 OmegaConf.structured(AETaskConfig), run.config["task"]["ae"]
             )
         elif cfg.task.dlc_md.pretrained_declutr_id is not None:
             run = wandb.Api().run(
-                f"guillaume-lajoie/dlc_lm_3/{cfg.task.dlc_md.pretrained_declutr_id}"
+                f"guillaume-lajoie/dlc_lm_4/{cfg.task.dlc_md.pretrained_declutr_id}"
             )
             cfg.task.declutr = OmegaConf.merge(
                 OmegaConf.structured(DeCLUTRTaskConfig), run.config["task"]["declutr"]
@@ -181,14 +201,14 @@ def main(cfg: Optional[TrainConfig] = None, run_id: Optional[str] = None):
 
         if cfg.task.dlc_ddpm.pretrained_ae_id is not None:
             run = wandb.Api().run(
-                f"guillaume-lajoie/dlc_lm_3/{cfg.task.dlc_ddpm.pretrained_ae_id}"
+                f"guillaume-lajoie/dlc_lm_4/{cfg.task.dlc_ddpm.pretrained_ae_id}"
             )
             cfg.task.ae = OmegaConf.merge(
                 OmegaConf.structured(AETaskConfig), run.config["task"]["ae"]
             )
         elif cfg.task.dlc_ddpm.pretrained_declutr_id is not None:
             run = wandb.Api().run(
-                f"guillaume-lajoie/dlc_lm_3/{cfg.task.dlc_ddpm.pretrained_declutr_id}"
+                f"guillaume-lajoie/dlc_lm_4/{cfg.task.dlc_ddpm.pretrained_declutr_id}"
             )
             cfg.task.declutr = OmegaConf.merge(
                 OmegaConf.structured(DeCLUTRTaskConfig), run.config["task"]["declutr"]
@@ -199,6 +219,15 @@ def main(cfg: Optional[TrainConfig] = None, run_id: Optional[str] = None):
     elif cfg.task.declutr != None:
         task = DeCLUTRTask(cfg.task.declutr)
         cfg.task.declutr = task.cfg
+    elif cfg.task.dino_mixture != None:
+        task = DINOMixtureTask(cfg.task.dino_mixture)
+        cfg.task.dino_mixture = task.cfg
+    elif cfg.task.e5_mixture != None:
+        task = E5MixtureTask(cfg.task.e5_mixture)
+        cfg.task.e5_mixture = task.cfg
+    elif cfg.task.simcse != None:
+        task = SimCSETask(cfg.task.simcse)
+        cfg.task.simcse = task.cfg
     else:
         raise ValueError("No task specified in config!")
 
@@ -216,7 +245,9 @@ def main(cfg: Optional[TrainConfig] = None, run_id: Optional[str] = None):
         cfg.num_devices if cfg.num_devices != None else torch.cuda.device_count()
     )
 
-    ddp_batch_size = task.cfg.batch_size * num_devices
+    num_nodes = infer_num_nodes()
+
+    ddp_batch_size = task.cfg.batch_size * num_devices * num_nodes
 
     if cfg.effective_batch_size is None:
         accumulate_grad_batches = 1
@@ -229,11 +260,11 @@ def main(cfg: Optional[TrainConfig] = None, run_id: Optional[str] = None):
 
         # just makin sure
         assert (
-            accumulate_grad_batches * task.cfg.batch_size * num_devices
+            accumulate_grad_batches * task.cfg.batch_size * num_devices * num_nodes
             == cfg.effective_batch_size
         )
     rank_zero_info(
-        f"Running with {num_devices} devices, batch size {task.cfg.batch_size} per device, accumulating {accumulate_grad_batches} steps to reach effective batch size {cfg.effective_batch_size}"
+        f"Running with {num_devices} devices per node, {num_nodes} nodes, batch size {task.cfg.batch_size} per device, accumulating {accumulate_grad_batches} steps to reach effective batch size {cfg.effective_batch_size}"
     )
 
     # Instantiate the trainer
@@ -254,7 +285,7 @@ def main(cfg: Optional[TrainConfig] = None, run_id: Optional[str] = None):
         limit_val_batches=cfg.limit_val_batches if cfg.limit_val_batches else 1.0,
         devices=num_devices,
         strategy=cfg.strategy,
-        num_nodes=1,
+        num_nodes=num_nodes,
         use_distributed_sampler=False
     )
     trainer.fit(

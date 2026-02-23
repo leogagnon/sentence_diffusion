@@ -4,9 +4,9 @@ defaults:
 mem_gb: 300
 gres: gpu:h100:4
 array_parallelism: 32
-nodes: 1
+nodes: 2
 tasks_per_node: 4
-cpus_per_task: 12
+cpus_per_task: 8
 timeout_min: 719
 account: rrg-bengioy-ad
 additional_parameters:

@@ -1,0 +1,11 @@
+task/dino_mixture: sem
+model_checkpoint: base
+
+max_steps: 20000
+
+limit_val_batches: 4
+val_check_interval: 512
+strategy: ddp_find_unused_parameters_true
+
+sweep_id: dino_mixture/dlc
+

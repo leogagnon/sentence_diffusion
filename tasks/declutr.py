@@ -63,11 +63,11 @@ class DeCLUTRTask(L.LightningModule):
                     OmegaConf.create(DeCLUTRTaskConfig),
                     OmegaConf.create(kwargs),
                 )
-            )       
+            )
 
         self.encoder = EncoderModel(cfg.encoder)
 
-        if cfg.encoder.sem is not None:   
+        if cfg.encoder.sem is not None:
             self.sem_usage_ema = SEMUsageTracker()
 
         self.loss_fn = NTXentLoss(temperature=cfg.loss_temp)
@@ -85,17 +85,18 @@ class DeCLUTRTask(L.LightningModule):
             anchors.size(0), device=anchors.device, dtype=torch.long
         ).repeat(2)
 
-        # Compute NTXent loss
-        loss = self.loss_fn(embeddings, labels)
+        with torch.autocast(device_type="cuda", enabled=False):
+            loss = self.loss_fn(embeddings.float(), labels)
 
         return loss
 
     def compute_mlm_loss(self, anchor_logits, anchor_labels):
-        return F.cross_entropy(
-            anchor_logits.view(-1, anchor_logits.size(-1)),
+        loss = F.cross_entropy(
+            anchor_logits.float().view(-1, anchor_logits.size(-1)),
             anchor_labels.view(-1),
             ignore_index=-100,
         )
+        return loss
 
     def compile(self):
         if self.encoder is not None:
@@ -131,7 +132,9 @@ class DeCLUTRTask(L.LightningModule):
         optimizer = torch.optim.AdamW(optimizer_grouped_parameters, lr=self.cfg.lr)
         if self.cfg.lr_warmup_steps > 0:
             scheduler = get_cosine_schedule_with_warmup(
-                optimizer, num_warmup_steps=self.cfg.lr_warmup_steps, num_training_steps=20000
+                optimizer,
+                num_warmup_steps=self.cfg.lr_warmup_steps,
+                num_training_steps=20000,
             )
             scheduler = {"scheduler": scheduler, "interval": "step", "frequency": 1}
 
@@ -185,7 +188,7 @@ class DeCLUTRTask(L.LightningModule):
             attention_mask=(
                 batch["positive_ids"] != self.encoder.tokenizer.pad_token_id
             ).long(),
-            noise=self.cfg.sem_noise
+            noise=self.cfg.sem_noise,
         )
         # Group positives from the same anchor together and average their embeddings
         z_positives = einx.rearrange(
@@ -193,7 +196,7 @@ class DeCLUTRTask(L.LightningModule):
         ).mean(dim=1)
 
         # If distributed, gather all representations
-        if self.trainer.num_devices > 1:
+        if self.trainer.world_size > 1:
             z_anchors = einx.rearrange(
                 "w b d -> (w b) d", self.all_gather(z_anchors, sync_grads=True)
             )
@@ -203,12 +206,12 @@ class DeCLUTRTask(L.LightningModule):
 
         contrastive_loss = self.compute_loss(z_anchors, z_positives)
         self.log(
-                "train/contrastive_loss",
-                contrastive_loss,
-                on_step=True,
-                on_epoch=False,
-                sync_dist=True,
-            )
+            "train/contrastive_loss",
+            contrastive_loss,
+            on_step=True,
+            on_epoch=False,
+            sync_dist=True,
+        )
         if self.cfg.mlm_loss:
             mlm_loss = self.compute_mlm_loss(
                 sem_out["logits"],
@@ -227,7 +230,9 @@ class DeCLUTRTask(L.LightningModule):
         self.log("train/loss", loss, on_step=True, on_epoch=False, sync_dist=True)
 
         if self.cfg.encoder.sem is not None:
-            self.sem_usage_ema.update(sem_out["usage_count"], batch_size=z_anchors.shape[0])
+            self.sem_usage_ema.update(
+                sem_out["usage_count"], batch_size=batch["positive_ids"].shape[0]
+            )
 
         return loss
 
@@ -252,7 +257,7 @@ class DeCLUTRTask(L.LightningModule):
                     batch["anchor_labels"],
                 )
                 self.log(
-                    "val/mlm_loss",
+                    f"val/mlm_loss_{label}",
                     mlm_loss,
                     on_step=False,
                     on_epoch=True,
@@ -284,7 +289,7 @@ class DeCLUTRTask(L.LightningModule):
                 "(b p) d -> b p d", z_positives, p=self.cfg.num_positives
             ).mean(dim=1)
 
-            if self.trainer.num_devices > 1:
+            if self.trainer.world_size > 1:
                 z_anchors = einx.rearrange(
                     "w b d -> (w b) d", self.all_gather(z_anchors, sync_grads=False)
                 )
@@ -294,6 +299,13 @@ class DeCLUTRTask(L.LightningModule):
 
             # NTXent loss
             loss = self.compute_loss(z_anchors, z_positives)
+            self.log(
+                f"val/contrastive_loss_{label}",
+                loss,
+                on_step=False,
+                on_epoch=True,
+                sync_dist=True,
+            )
             if mlm_loss is not None:
                 loss = loss + mlm_loss * self.cfg.mlm_loss_weight
             self.log(

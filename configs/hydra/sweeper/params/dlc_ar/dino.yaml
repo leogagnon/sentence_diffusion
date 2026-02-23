@@ -1,4 +1,4 @@
-task/dlc_ar: declutr
+task/dlc_ar: dino_mixture
 model_checkpoint: base
 
 effective_batch_size: 512
@@ -8,5 +8,5 @@ max_steps: 20000
 limit_val_batches: 4
 val_check_interval: 256
 
-sweep_id: dlc_ar/declutr
+sweep_id: dlc_ar/dino_mixture
 

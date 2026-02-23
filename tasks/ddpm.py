@@ -20,6 +20,7 @@ from mauve import get_features_from_input, compute_mauve
 from data import InfoLabel, LanguageDataset, LanguageDatasetConfig, PrefixSuffixIterable
 from tasks.declutr import DeCLUTRTask
 from tasks.autoencoder import AETask
+from tasks.dino_mixture import DINOMixtureTask
 from tasks.utils import *
 from model.decoder import DecoderModel, DecoderConfig
 from model.encoder import EncoderModel, EncoderConfig
@@ -49,6 +50,7 @@ class GaussianDiffusionTaskConfig:
 
     pretrained_declutr_id: Optional[str] = None
     pretrained_ae_id: Optional[str] = None
+    pretrained_dino_id: Optional[str] = None
 
     dataset: Optional[LanguageDatasetConfig] = None
     prefix_length: Optional[int] = None
@@ -148,6 +150,30 @@ class GaussianDiffusionTask(L.LightningModule):
             # Init encoder (and remove out proj; no longer needed)
             self.encoder = task.encoder.eval().requires_grad_(False)
             self.encoder.out_proj = nn.Identity()
+
+        elif cfg.pretrained_dino_id is not None:
+            assert cfg.encoder is None, "Cannot specify both pretrained_dino_id and encoder in config"
+
+            task = DINOMixtureTask.load_from_checkpoint(
+                os.path.join(
+                    os.environ["LOG_DIR"],
+                    "checkpoints/",
+                    cfg.pretrained_dino_id,
+                    "last.ckpt",
+                ),
+                strict=False,
+                map_location=torch.device("cpu"),
+            )
+
+            # Sync configs (DINO uses declutr_dataset, not dataset)
+            cfg.dataset = task.cfg.declutr_dataset
+            assert cfg.prefix_length is not None
+            assert cfg.suffix_length is not None
+            assert cfg.context_length is not None
+
+            self.encoder = task.encoder.eval().requires_grad_(False)
+            self.encoder.out_proj = nn.Identity()
+
         elif cfg.encoder is not None:
 
             assert cfg.prefix_length is not None
@@ -299,6 +325,9 @@ class GaussianDiffusionTask(L.LightningModule):
             )
         else:
             trainable_params = self.decoder.named_parameters()
+
+        trainable_params = list(trainable_params)
+        
         no_decay = ["bias", "norm"]
         optimizer_grouped_parameters = [
             {

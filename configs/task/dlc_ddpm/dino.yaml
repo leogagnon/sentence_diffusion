@@ -17,7 +17,7 @@ model:
 
 eval_gen_ppl: true
 
-pretrained_declutr_id: tf9xzuoa
+pretrained_dino_id: kc43sypx
 
 prefix_length: 16
 suffix_length: 64
