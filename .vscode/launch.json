@@ -13,7 +13,7 @@
             "justMyCode": false,
             "args": [
                 //"--wandb_id=vjf7103x"
-                "task/dino_mixture=continuous",
+                "task/dlc_ddpm=jina_cls",
                 "num_devices=1",
                 "workers=4",
                 "val_check_interval=2",

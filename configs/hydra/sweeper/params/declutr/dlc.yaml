@@ -1,12 +1,13 @@
 task/declutr: sem
 model_checkpoint: base
 
-task.declutr.encoder.sem.L: 512
+task.declutr.encoder.sem.L: 16
+task.declutr.encoder.sem.V: 32
 
 max_steps: 20000
 
 limit_val_batches: 4
 val_check_interval: 512
 
-sweep_id: declutr/dlc
+sweep_id: declutr/dlc_small
 

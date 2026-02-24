@@ -1,7 +1,7 @@
 import os
 import random
 from dataclasses import dataclass
-from typing import Optional
+from typing import List, Optional
 
 import lightning as L
 import numpy as np
@@ -173,7 +173,9 @@ class DLCMDTask(L.LightningModule):
                 self.encoder_mode = "suffix"
 
         # Load MAUVE reference features if needed
-        self.val_generated_texts = []
+        self.val_generated_texts_sample = []
+        self.val_generated_texts_true = []
+        self.val_generated_texts_random = []
         if cfg.eval_mauve:
             assert cfg.mauve_reference_features_path is not None, \
                 "mauve_reference_features_path must be provided when eval_mauve=True"
@@ -289,18 +291,9 @@ class DLCMDTask(L.LightningModule):
         )
         return batch
 
-    def training_step(self, batch, batch_idx):
-
-        # Fill DLCs in the batch
-        if self.encoder is not None:
-            batch = self._fill_DLCs_in_batch(batch)
-
-        # Everything is conditional on the prefix and special tokens (never mask those)
-        cond_mask = (batch["info_mask_dec"] == InfoLabel.PREFIX.value) + (
-            batch["info_mask_dec"] == InfoLabel.SPECIAL.value
-        )
-
-        # Compute loss on suffix + DLC, condition on everthing else
+    def compute_loss(self, batch) -> torch.Tensor:
+        """Compute masked diffusion loss. Handles ancestral training mode."""
+        # Compute loss on suffix + DLC, condition on everything else
         attention_mask = (batch["info_mask_dec"] == InfoLabel.SUFFIX.value) + (
             batch["info_mask_dec"] == InfoLabel.DLC.value
         )
@@ -327,38 +320,74 @@ class DLCMDTask(L.LightningModule):
             )
             loss = 0.5 * loss + 0.5 * dlc_loss
 
+        return loss
+
+    @torch.no_grad()
+    def generate_suffix(self, batch, latent_generation_mode: str = "sample") -> List[str]:
+        """
+        Generate suffixes for the given batch.
+
+        Args:
+            latent_generation_mode: How to generate the DLC latent:
+                - "sample": Joint masked diffusion p(DLC, suffix | prefix)
+                - "true": True DLC from encoder, then sample suffix (requires encoder)
+                - "random": Random DLC token IDs, then sample suffix (requires encoder)
+        """
+        if latent_generation_mode == "sample":
+            prior = batch["input_ids_dec"].clone()
+            prior[
+                (batch["info_mask_dec"] == InfoLabel.SUFFIX.value)
+                + (batch["info_mask_dec"] == InfoLabel.DLC.value)
+            ] = self.dit.tokenizer.mask_token_id
+            return self.dit.tokenizer.batch_decode(
+                self.dit.sample(prior=prior)[:, -self.cfg.suffix_length:]
+            )
+
+        elif latent_generation_mode == "true":
+            # DLC positions already filled with true values by _fill_DLCs_in_batch
+            prior = batch["input_ids_dec"].clone()
+            prior[(batch["info_mask_dec"] == InfoLabel.SUFFIX.value)] = (
+                self.dit.tokenizer.mask_token_id
+            )
+            return self.dit.tokenizer.batch_decode(
+                self.dit.sample(prior=prior)[:, -self.cfg.suffix_length:]
+            )
+
+        elif latent_generation_mode == "random":
+            prior = batch["input_ids_dec"].clone()
+            prior[(batch["info_mask_dec"] == InfoLabel.SUFFIX.value)] = (
+                self.dit.tokenizer.mask_token_id
+            )
+            # Fill DLC positions with random tokens from DLC vocabulary
+            dlc_vocab_size = self.encoder.sem.cfg.V
+            tok_offset = len(self.dit.tokenizer)
+            bs = prior.shape[0]
+            dlc_len = self.encoder.sem.dlc_len
+            random_dlc = (
+                torch.randint(0, dlc_vocab_size, (bs, dlc_len), device=prior.device)
+                + tok_offset
+            )
+            prior[batch["info_mask_dec"] == InfoLabel.DLC.value] = random_dlc.view(-1)
+            # Freeze everything except suffix (DLC + prefix are fixed)
+            frozen_mask = batch["info_mask_dec"] != InfoLabel.SUFFIX.value
+            return self.dit.tokenizer.batch_decode(
+                self.dit.sample(prior=prior, frozen_mask=frozen_mask)[:, -self.cfg.suffix_length:]
+            )
+
+        else:
+            raise ValueError(f"Unknown latent_generation_mode: {latent_generation_mode}")
+
+    def training_step(self, batch, batch_idx):
+
+        # Fill DLCs in the batch
+        if self.encoder is not None:
+            batch = self._fill_DLCs_in_batch(batch)
+
+        loss = self.compute_loss(batch)
+
         self.log("train/loss", loss, on_step=True, on_epoch=False, sync_dist=True)
 
         return loss
-
-    def eval_ppl(self, prefix_str, suffix_str, device):
-        ppl_batch = self.ppl_tok.batch_encode_plus(
-            [p + c for p, c in zip(prefix_str, suffix_str)],
-            padding=True,
-            return_tensors="pt",
-            return_offsets_mapping=True,
-            add_special_tokens=False,
-            return_attention_mask=False,
-        ).to(device)
-
-        # Compute token index where continuation starts in the new indices
-        split_idx = split_index_from_offsets(
-            ppl_batch["offset_mapping"],
-            [len(p) for p in prefix_str],
-        )
-
-        # Compute conditional perplexity of suffix given prefix
-        # I.e. ignore prompt and padding tokens in loss (set to -100)
-        # Move generative PPL eval model to GPU
-        ppl_model = self.ppl_model[0]
-
-        labels = ppl_batch["input_ids"].clone()
-        labels[labels == self.ppl_tok.pad_token_id] = -100
-        for i in range(len(labels)):
-            labels[i, : split_idx[i]] = -100
-        ppl = torch.exp(ppl_model(input_ids=ppl_batch["input_ids"], labels=labels).loss)
-
-        return ppl.item()
 
     @torch.amp.autocast("cuda", enabled=False)
     def validation_step(self, batch, batch_idx):
@@ -367,31 +396,17 @@ class DLCMDTask(L.LightningModule):
         if self.encoder is not None:
             batch = self._fill_DLCs_in_batch(batch)
 
+        loss = self.compute_loss(batch)
+        self.log("val/loss", loss, on_epoch=True, on_step=False, sync_dist=True)
+
         if batch_idx <= 1:
-            # Evaluate generative perplexity
             if self.cfg.eval_gen_ppl:
 
                 if not self.cfg.ancestral:
-
-                    # p(DLC, suffix | prefix)
-                    prior = batch["input_ids_dec"].clone()
-                    prior[
-                        (batch["info_mask_dec"] == InfoLabel.SUFFIX.value)
-                        + (batch["info_mask_dec"] == InfoLabel.DLC.value)
-                    ] = self.dit.tokenizer.mask_token_id
-                    gen_suffix_str_joint = self.dit.tokenizer.batch_decode(
-                        self.dit.sample(
-                            prior=prior,
-                        )[:, -self.cfg.suffix_length :]
-                    )
-                    ppl_joint = self.eval_ppl(
-                        batch["prefix_str"],
-                        gen_suffix_str_joint,
-                        device=batch["input_ids_dec"].device,
-                    )
+                    gen_suffix_sample = self.generate_suffix(batch, "sample")
                     self.log(
-                        "val/gen_ppl",
-                        ppl_joint,
+                        "val/gen_ppl_sample",
+                        eval_ppl(self.ppl_model[0], self.ppl_tok, batch["prefix_str"], gen_suffix_sample, batch["input_ids_dec"].device),
                         on_epoch=True,
                         on_step=False,
                         sync_dist=True,
@@ -399,30 +414,25 @@ class DLCMDTask(L.LightningModule):
 
                 if self.encoder is not None:
 
-                    # p(suffix | prefix, true_DLC)
-                    prior = batch["input_ids_dec"].clone()
-                    prior[(batch["info_mask_dec"] == InfoLabel.SUFFIX.value)] = (
-                        self.dit.tokenizer.mask_token_id
-                    )
-                    gen_suffix_str_recon = self.dit.tokenizer.batch_decode(
-                        self.dit.sample(
-                            prior=prior,
-                        )[:, -self.cfg.suffix_length :]
-                    )
-                    ppl_recon = self.eval_ppl(
-                        batch["prefix_str"],
-                        gen_suffix_str_recon,
-                        device=batch["input_ids_dec"].device,
-                    )
+                    gen_suffix_true = self.generate_suffix(batch, "true")
                     self.log(
-                        "val/gen_ppl_recon",
-                        ppl_recon,
+                        "val/gen_ppl_true",
+                        eval_ppl(self.ppl_model[0], self.ppl_tok, batch["prefix_str"], gen_suffix_true, batch["input_ids_dec"].device),
                         on_epoch=True,
                         on_step=False,
                         sync_dist=True,
                     )
 
-                    # p(DLC | prefix) * p(suffix | prefix, DLC)
+                    gen_suffix_random = self.generate_suffix(batch, "random")
+                    self.log(
+                        "val/gen_ppl_random",
+                        eval_ppl(self.ppl_model[0], self.ppl_tok, batch["prefix_str"], gen_suffix_random, batch["input_ids_dec"].device),
+                        on_epoch=True,
+                        on_step=False,
+                        sync_dist=True,
+                    )
+
+                    # p(DLC | prefix) * p(suffix | prefix, DLC) via ancestral 2-stage sampling
                     prior = batch["input_ids_dec"].clone()
                     prior[
                         (batch["info_mask_dec"] == InfoLabel.SUFFIX.value)
@@ -440,16 +450,11 @@ class DLCMDTask(L.LightningModule):
                                 + (batch["info_mask_dec"] == InfoLabel.SUFFIX.value)
                             ),
                             num_steps=self.dit.cfg.sampling_steps // 2,
-                        )[:, -self.cfg.suffix_length :]
-                    )
-                    ppl_ancestral = self.eval_ppl(
-                        batch["prefix_str"],
-                        gen_suffix_str_ancestral,
-                        device=batch["input_ids_dec"].device,
+                        )[:, -self.cfg.suffix_length:]
                     )
                     self.log(
                         "val/gen_ppl_ancestral",
-                        ppl_ancestral,
+                        eval_ppl(self.ppl_model[0], self.ppl_tok, batch["prefix_str"], gen_suffix_str_ancestral, batch["input_ids_dec"].device),
                         on_epoch=True,
                         on_step=False,
                         sync_dist=True,
@@ -458,7 +463,6 @@ class DLCMDTask(L.LightningModule):
                     if (rank_zero_only.rank == 0) and (wandb.run is not None):
 
                         prefix_str = batch["prefix_str"][:5]
-
                         true_suffix_str = batch["suffix_str"][:5]
 
                         # Generate conditional on the prefix AND the DLCs
@@ -467,7 +471,7 @@ class DLCMDTask(L.LightningModule):
                             (batch["info_mask_dec"][:5] == InfoLabel.SUFFIX.value)
                         ] = self.dit.tokenizer.mask_token_id
                         gen_suffix_str = self.dit.tokenizer.batch_decode(
-                            self.dit.sample(prior=prior)[:, -self.cfg.suffix_length :]
+                            self.dit.sample(prior=prior)[:, -self.cfg.suffix_length:]
                         )
 
                         table = wandb.Table(
@@ -480,82 +484,94 @@ class DLCMDTask(L.LightningModule):
                         wandb.log({"val/samples": table})
                         del table
 
-        # MAUVE: accumulate joint samples p(DLC, suffix | prefix) across all batches
+        # MAUVE: accumulate samples across all batches (only when not in ancestral mode)
         if self.cfg.eval_mauve and not self.cfg.ancestral:
-            prior = batch["input_ids_dec"].clone()
-            prior[
-                (batch["info_mask_dec"] == InfoLabel.SUFFIX.value)
-                + (batch["info_mask_dec"] == InfoLabel.DLC.value)
-            ] = self.dit.tokenizer.mask_token_id
-            gen_suffix_str = self.dit.tokenizer.batch_decode(
-                self.dit.sample(prior=prior)[:, -self.cfg.suffix_length :]
+            gen_suffix_sample = self.generate_suffix(batch, "sample")
+            for prefix_str, suffix_str in zip(batch["prefix_str"], gen_suffix_sample):
+                self.val_generated_texts_sample.append(prefix_str + suffix_str)
+
+            if self.encoder is not None:
+                gen_suffix_true = self.generate_suffix(batch, "true")
+                for prefix_str, suffix_str in zip(batch["prefix_str"], gen_suffix_true):
+                    self.val_generated_texts_true.append(prefix_str + suffix_str)
+
+                gen_suffix_random = self.generate_suffix(batch, "random")
+                for prefix_str, suffix_str in zip(batch["prefix_str"], gen_suffix_random):
+                    self.val_generated_texts_random.append(prefix_str + suffix_str)
+
+    def _compute_and_log_mauve(self, generated_texts, mode):
+        """Gather generated texts across ranks and compute MAUVE score for a given mode."""
+        if len(generated_texts) == 0:
+            return
+
+        if self.trainer.num_devices > 1:
+            import torch.distributed as dist
+            if dist.is_initialized():
+                gathered_texts = [None] * self.trainer.world_size
+                dist.all_gather_object(gathered_texts, generated_texts)
+                if rank_zero_only.rank == 0:
+                    generated_texts = [
+                        text for rank_texts in gathered_texts for text in rank_texts
+                    ]
+                    print(f"Gathered {len(generated_texts)} texts from {self.trainer.world_size} ranks")
+
+        if rank_zero_only.rank == 0:
+            print(f"Computing MAUVE ({mode}) with {len(generated_texts)} generated samples...")
+
+            n_samples = len(generated_texts)
+            reference_features_subset = self.mauve_reference_features[:n_samples]
+
+            generated_features = get_features_from_input(
+                features=None,
+                tokenized_texts=None,
+                texts=generated_texts,
+                featurize_model_name=self.cfg.mauve_model_name,
+                max_len=self.cfg.mauve_max_len,
+                device_id=self.cfg.mauve_device_id,
+                name="generated text",
+                batch_size=self.cfg.mauve_batch_size,
+                verbose=False,
             )
-            for prefix_str, suffix_str in zip(batch["prefix_str"], gen_suffix_str):
-                self.val_generated_texts.append(prefix_str + suffix_str)
+
+            mauve_result = compute_mauve(
+                p_features=reference_features_subset,
+                q_features=generated_features,
+                verbose=False,
+            )
+
+            self.log(
+                f"val/mauve_{mode}",
+                mauve_result.mauve,
+                on_epoch=True,
+                rank_zero_only=True,
+                sync_dist=False,
+            )
+            self.log(
+                f"val/mauve_frontier_integral_{mode}",
+                mauve_result.frontier_integral,
+                on_epoch=True,
+                rank_zero_only=True,
+                sync_dist=False,
+            )
+
+            print(f"MAUVE ({mode}) score: {mauve_result.mauve:.4f}")
+            print(f"Frontier integral ({mode}): {mauve_result.frontier_integral:.4f}")
 
     def on_validation_epoch_start(self):
         if self.cfg.eval_gen_ppl:
             self.ppl_model[0] = self.ppl_model[0].to(self.device)
         if self.cfg.eval_mauve:
-            self.val_generated_texts = []
+            self.val_generated_texts_sample = []
+            self.val_generated_texts_true = []
+            self.val_generated_texts_random = []
         torch.cuda.empty_cache()
 
     def on_validation_epoch_end(self):
-        # Compute MAUVE score if enabled
-        if self.cfg.eval_mauve and len(self.val_generated_texts) > 0:
-            # Gather generated texts from all ranks to rank 0
-            if self.trainer.num_devices > 1:
-                import torch.distributed as dist
-                if dist.is_initialized():
-                    gathered_texts = [None] * self.trainer.world_size
-                    dist.all_gather_object(gathered_texts, self.val_generated_texts)
-                    if rank_zero_only.rank == 0:
-                        self.val_generated_texts = [
-                            text for rank_texts in gathered_texts for text in rank_texts
-                        ]
-                        print(f"Gathered {len(self.val_generated_texts)} texts from {self.trainer.world_size} ranks")
-
-            if rank_zero_only.rank == 0:
-                print(f"Computing MAUVE score with {len(self.val_generated_texts)} generated samples...")
-
-                n_samples = len(self.val_generated_texts)
-                reference_features_subset = self.mauve_reference_features[:n_samples]
-
-                generated_features = get_features_from_input(
-                    features=None,
-                    tokenized_texts=None,
-                    texts=self.val_generated_texts,
-                    featurize_model_name=self.cfg.mauve_model_name,
-                    max_len=self.cfg.mauve_max_len,
-                    device_id=self.cfg.mauve_device_id,
-                    name="generated text",
-                    batch_size=self.cfg.mauve_batch_size,
-                    verbose=False,
-                )
-
-                mauve_result = compute_mauve(
-                    p_features=reference_features_subset,
-                    q_features=generated_features,
-                    verbose=False,
-                )
-
-                self.log(
-                    "val/mauve",
-                    mauve_result.mauve,
-                    on_epoch=True,
-                    rank_zero_only=True,
-                    sync_dist=False,
-                )
-                self.log(
-                    "val/mauve_frontier_integral",
-                    mauve_result.frontier_integral,
-                    on_epoch=True,
-                    rank_zero_only=True,
-                    sync_dist=False,
-                )
-
-                print(f"MAUVE score: {mauve_result.mauve:.4f}")
-                print(f"Frontier integral: {mauve_result.frontier_integral:.4f}")
+        if self.cfg.eval_mauve:
+            self._compute_and_log_mauve(self.val_generated_texts_sample, "sample")
+            if self.encoder is not None:
+                self._compute_and_log_mauve(self.val_generated_texts_true, "true")
+                self._compute_and_log_mauve(self.val_generated_texts_random, "random")
 
         if self.cfg.eval_gen_ppl:
             self.ppl_model[0] = self.ppl_model[0].cpu()

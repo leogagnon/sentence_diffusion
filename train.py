@@ -22,8 +22,6 @@ from tasks.dlc_ar import DLCARTask, DLCARTaskConfig
 from tasks.dlc_md import DLCMDTask, DLCMDTaskConfig
 from tasks.ddpm import GaussianDiffusionTask, GaussianDiffusionTaskConfig
 from tasks.dino_mixture import DINOMixtureTask, DINOMixtureTaskConfig
-from tasks.e5_mixture import E5MixtureTask, E5MixtureTaskConfig
-from tasks.simcse import SimCSETask, SimCSETaskConfig
 
 logging.set_verbosity_error()
 torch.set_float32_matmul_precision("medium")
@@ -62,8 +60,6 @@ class TaskConfig:
     dlc_md: Optional[DLCMDTaskConfig] = None
     dlc_ddpm: Optional[GaussianDiffusionTaskConfig] = None
     dino_mixture: Optional[DINOMixtureTaskConfig] = None
-    e5_mixture: Optional[E5MixtureTaskConfig] = None
-    simcse: Optional[SimCSETaskConfig] = None
 
 
 @dataclass
@@ -222,12 +218,6 @@ def main(cfg: Optional[TrainConfig] = None, run_id: Optional[str] = None):
     elif cfg.task.dino_mixture != None:
         task = DINOMixtureTask(cfg.task.dino_mixture)
         cfg.task.dino_mixture = task.cfg
-    elif cfg.task.e5_mixture != None:
-        task = E5MixtureTask(cfg.task.e5_mixture)
-        cfg.task.e5_mixture = task.cfg
-    elif cfg.task.simcse != None:
-        task = SimCSETask(cfg.task.simcse)
-        cfg.task.simcse = task.cfg
     else:
         raise ValueError("No task specified in config!")
 

@@ -240,6 +240,7 @@ class EncoderConfig:
     train_backbone: bool = False
     mlp_proj: bool = False
     no_out_proj: bool = False
+    last_token_pooling: bool = False
 
 
 class EncoderModel(nn.Module):
@@ -285,6 +286,9 @@ class EncoderModel(nn.Module):
                 trust_remote_code=True,
             )
             backbone_dim = self.transformer.config.hidden_size
+
+        if cfg.last_token_pooling:
+            self.tokenizer.add_eos_token = True
 
         # Maybe freeze backbone
         self.transformer = self.transformer.train(cfg.train_backbone).requires_grad_(
@@ -361,7 +365,10 @@ class EncoderModel(nn.Module):
         )
         token_embeddings = outputs.hidden_states[-1]
 
-        z = self._mean_pool(token_embeddings, attention_mask)
+        if self.cfg.last_token_pooling:
+            z = self._last_token_pool(token_embeddings, attention_mask)
+        else:
+            z = self._mean_pool(token_embeddings, attention_mask)
 
         if only_backbone:
             return z
@@ -409,3 +416,8 @@ class EncoderModel(nn.Module):
         summed = (token_embeddings * mask).sum(dim=1)
         denom = mask.sum(dim=1).clamp(min=1)
         return summed / denom
+
+    @staticmethod
+    def _last_token_pool(token_embeddings: torch.Tensor, attention_mask: torch.Tensor):
+        last_token_idx = attention_mask.sum(dim=1) - 1
+        return token_embeddings[torch.arange(token_embeddings.shape[0]), last_token_idx]

@@ -11,7 +11,7 @@ from datasets.load import load_dataset
 from torch.nn.utils.rnn import pad_sequence
 from torch.utils.data import DataLoader, IterableDataset, get_worker_info
 from torch.utils.data.dataset import Dataset
-from transformers import PreTrainedTokenizerFast
+from transformers import PreTrainedTokenizerFast, GPT2Tokenizer
 
 
 class InfoLabel(Enum):
@@ -361,11 +361,13 @@ class PrefixSuffixIterable(IterableDataset):
     def __iter__(self):
         generator = self._make_generator()
 
+        self.dec_tok : GPT2Tokenizer
+
         while True:
             # Sample a random document
             indices = generator.choices(range(self.N), k=1024)
             item_batch = self.ds.dataset.dataset[indices]
-            input_ids_batch = self.dec_tok.batch_encode_plus(
+            input_ids_batch = self.dec_tok(
                 item_batch["text"],
                 add_special_tokens=False,
                 return_attention_mask=False,
@@ -532,7 +534,7 @@ class SimCSEIterable(IterableDataset):
         while True:
             indices = generator.choices(range(self.N), k=1024)
             item_batch = self.ds.dataset.dataset[indices]
-            input_ids_batch = self.tok.batch_encode_plus(
+            input_ids_batch = self.tok(
                 item_batch["text"],
                 add_special_tokens=False,
                 return_attention_mask=False,
@@ -728,7 +730,7 @@ class DeCLUTRIterable(IterableDataset):
             # Sample a batch of 1024 random documents for I/O efficiency
             indices = generator.choices(range(self.N), k=512)
             item_batch = self.ds.dataset.dataset[indices]
-            input_ids_batch = self.tok.batch_encode_plus(
+            input_ids_batch = self.tok(
                 item_batch["text"],
                 add_special_tokens=False,
                 return_attention_mask=False,

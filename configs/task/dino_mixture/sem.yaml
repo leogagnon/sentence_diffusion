@@ -3,13 +3,14 @@ lr: 5e-5
 lr_warmup_steps: 2000
 max_length: 256
 dataset_seed: 42
-num_prototypes: 65536
-head_nlayers: 3
+num_prototypes: 256
+head_nlayers: 1
 student_temp: 0.1
 teacher_temp: 0.04
 center_momentum: 0.9
 teacher_momentum: 0.996
 sem_noise: 0.00
+declutr_only: true
 
 encoder:
   model_name: FacebookAI/roberta-large
@@ -20,7 +21,7 @@ encoder:
   sem:
     _target_: model.encoder.SEMHead
     L: 512
-    V: 16
+    V: 32
     temp: 0.5
 
 declutr_dataset:

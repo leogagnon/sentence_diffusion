@@ -96,6 +96,8 @@ class DINOMixtureTaskConfig:
 
     sem_noise: float = 0.0
 
+    declutr_only: bool = False  # if True, skip all pair datasets and use only DeCLUTR
+
     dataset_seed: int = 42
     name: Optional[str] = None
 
@@ -203,52 +205,56 @@ class DINOMixtureTask(L.LightningModule):
         self.train_fineweb = Subset(fineweb, indices=fineweb.train_indices)
         self.val_fineweb = Subset(fineweb, indices=fineweb.val_indices)
 
-        vitaminc_anchors, vitaminc_positives = load_vitaminc_pairs()
-        anli_anchors, anli_positives = load_anli_pairs()
-        paws_anchors, paws_positives = load_paws_pairs()
-        yelp_groups = load_yelp_polarity_groups()
-        ibm_groups = load_ibm_argq_groups()
-
         tok = self.encoder.tokenizer
         seed = self.cfg.dataset_seed
 
-        self.train_iterables = [
-            # 1. DeCLUTR on FineWeb (1 anchor, 1 positive per item)
-            DeCLUTRIterable(
-                self.train_fineweb,
-                tokenizer=tok,
-                min_span_length=self.cfg.declutr_min_span_length,
-                max_span_length=self.cfg.declutr_max_span_length,
-                num_anchors=1,
-                num_positives=1,
-                adjacent_positives=True,
-                masked_anchors=False,
-                seed=seed,
-            ),
-            # 2. VitaminC
-            PairDatasetIterable(
-                vitaminc_anchors, vitaminc_positives,
-                tokenizer=tok, max_length=self.cfg.max_length, seed=seed + 1,
-            ),
-            # 3. ANLI
-            PairDatasetIterable(
-                anli_anchors, anli_positives,
-                tokenizer=tok, max_length=self.cfg.max_length, seed=seed + 2,
-            ),
-            # 4. PAWS
-            PairDatasetIterable(
-                paws_anchors, paws_positives,
-                tokenizer=tok, max_length=self.cfg.max_length, seed=seed + 3,
-            ),
-            # 5. Yelp Polarity
-            SameLabelPairIterable(
-                yelp_groups, tokenizer=tok, max_length=self.cfg.max_length, seed=seed + 4,
-            ),
-            # 6. IBM ArgQ
-            SameLabelPairIterable(
-                ibm_groups, tokenizer=tok, max_length=self.cfg.max_length, seed=seed + 5,
-            ),
-        ]
+        declutr_iterable = DeCLUTRIterable(
+            self.train_fineweb,
+            tokenizer=tok,
+            min_span_length=self.cfg.declutr_min_span_length,
+            max_span_length=self.cfg.declutr_max_span_length,
+            num_anchors=1,
+            num_positives=1,
+            adjacent_positives=True,
+            masked_anchors=False,
+            seed=seed,
+        )
+
+        if self.cfg.declutr_only:
+            self.train_iterables = [declutr_iterable]
+        else:
+            vitaminc_anchors, vitaminc_positives = load_vitaminc_pairs()
+            anli_anchors, anli_positives = load_anli_pairs()
+            paws_anchors, paws_positives = load_paws_pairs()
+            yelp_groups = load_yelp_polarity_groups()
+            ibm_groups = load_ibm_argq_groups()
+
+            self.train_iterables = [
+                declutr_iterable,
+                # 2. VitaminC
+                PairDatasetIterable(
+                    vitaminc_anchors, vitaminc_positives,
+                    tokenizer=tok, max_length=self.cfg.max_length, seed=seed + 1,
+                ),
+                # 3. ANLI
+                PairDatasetIterable(
+                    anli_anchors, anli_positives,
+                    tokenizer=tok, max_length=self.cfg.max_length, seed=seed + 2,
+                ),
+                # 4. PAWS
+                PairDatasetIterable(
+                    paws_anchors, paws_positives,
+                    tokenizer=tok, max_length=self.cfg.max_length, seed=seed + 3,
+                ),
+                # 5. Yelp Polarity
+                SameLabelPairIterable(
+                    yelp_groups, tokenizer=tok, max_length=self.cfg.max_length, seed=seed + 4,
+                ),
+                # 6. IBM ArgQ
+                SameLabelPairIterable(
+                    ibm_groups, tokenizer=tok, max_length=self.cfg.max_length, seed=seed + 5,
+                ),
+            ]
 
     def configure_optimizers(self):
         no_decay = ["bias", "norm"]

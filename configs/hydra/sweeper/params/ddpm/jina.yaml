@@ -1,13 +1,14 @@
-task/dlc_ddpm: declutr
+task/dlc_ddpm: jina_cls, jina_cluster
 model_checkpoint: base
-
-task.dlc_ddpm.context_length: 112, 0
 
 max_steps: 20000
 
+task.dlc_ddpm.context_length: 0, 112
+
 limit_val_batches: 8
 val_check_interval: 512
+
 strategy: ddp_find_unused_parameters_true
 
-sweep_id: dlc_ddpm/declutr
+sweep_id: dlc_ddpm/jina
 

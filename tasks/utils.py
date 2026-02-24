@@ -4,6 +4,31 @@ import einx
 import torch
 
 
+def eval_ppl(ppl_model, ppl_tok, prefix_str, suffix_str, device) -> float:
+    """Compute conditional perplexity of suffix given prefix using a frozen LM."""
+    ppl_batch = ppl_tok(
+        [p + c for p, c in zip(prefix_str, suffix_str)],
+        padding=True,
+        return_tensors="pt",
+        return_offsets_mapping=True,
+        add_special_tokens=False,
+        return_attention_mask=False,
+    ).to(device)
+
+    split_idx = split_index_from_offsets(
+        ppl_batch["offset_mapping"],
+        [len(p) for p in prefix_str],
+    )
+
+    labels = ppl_batch["input_ids"].clone()
+    labels[labels == ppl_tok.pad_token_id] = -100
+    for i in range(len(labels)):
+        labels[i, : split_idx[i]] = -100
+    ppl = torch.exp(ppl_model(input_ids=ppl_batch["input_ids"], labels=labels).loss)
+
+    return ppl.item()
+
+
 def sem_entropy(dlc_probs) -> tuple[torch.Tensor, torch.Tensor]:
     if isinstance(dlc_probs, list):
         # Flatten levels l1 = p(x_0), l2 = p(x_0, x_1), ...
