@@ -20,3 +20,5 @@ entmax
 flash-attn
 triton
 ftfy
+pytorch_metric_learning
+mteb

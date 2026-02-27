@@ -3,7 +3,7 @@ import logging as py_logging
 
 # Must be set before importing huggingface_hub, transformers, or datasets,
 # as they read these at module import time.
-os.environ["HF_HUB_OFFLINE"] = "1"
+os.environ["HF_HUB_OFFLINE"] = "0"
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
 
 import torch
@@ -113,7 +113,7 @@ def main(cfg: Optional[TrainConfig] = None, run_id: Optional[str] = None):
         wandb_id = run_id
         api = wandb.Api()
         entity = "guillaume-lajoie"
-        project = "dlc_lm_4"
+        project = "sem_emb"
         run = api.run(f"{entity}/{project}/{run_id}")
         cfg = OmegaConf.merge(OmegaConf.structured(TrainConfig), run.config)
 
@@ -174,14 +174,14 @@ def main(cfg: Optional[TrainConfig] = None, run_id: Optional[str] = None):
         # Add the autoencoder config to cfg
         if cfg.task.dlc_ar.pretrained_ae_id is not None:
             run = wandb.Api().run(
-                f"guillaume-lajoie/dlc_lm_4/{cfg.task.dlc_ar.pretrained_ae_id}"
+                f"guillaume-lajoie/sem_emb/{cfg.task.dlc_ar.pretrained_ae_id}"
             )
             cfg.task.ae = OmegaConf.merge(
                 OmegaConf.structured(AETaskConfig), run.config["task"]["ae"]
             )
         elif cfg.task.dlc_ar.pretrained_declutr_id is not None:
             run = wandb.Api().run(
-                f"guillaume-lajoie/dlc_lm_4/{cfg.task.dlc_ar.pretrained_declutr_id}"
+                f"guillaume-lajoie/sem_emb/{cfg.task.dlc_ar.pretrained_declutr_id}"
             )
             cfg.task.declutr = OmegaConf.merge(
                 OmegaConf.structured(DeCLUTRTaskConfig), run.config["task"]["declutr"]
@@ -194,14 +194,14 @@ def main(cfg: Optional[TrainConfig] = None, run_id: Optional[str] = None):
         # Add the autoencoder config to cfg
         if cfg.task.dlc_md.pretrained_ae_id is not None:
             run = wandb.Api().run(
-                f"guillaume-lajoie/dlc_lm_4/{cfg.task.dlc_md.pretrained_ae_id}"
+                f"guillaume-lajoie/sem_emb/{cfg.task.dlc_md.pretrained_ae_id}"
             )
             cfg.task.ae = OmegaConf.merge(
                 OmegaConf.structured(AETaskConfig), run.config["task"]["ae"]
             )
         elif cfg.task.dlc_md.pretrained_declutr_id is not None:
             run = wandb.Api().run(
-                f"guillaume-lajoie/dlc_lm_4/{cfg.task.dlc_md.pretrained_declutr_id}"
+                f"guillaume-lajoie/sem_emb/{cfg.task.dlc_md.pretrained_declutr_id}"
             )
             cfg.task.declutr = OmegaConf.merge(
                 OmegaConf.structured(DeCLUTRTaskConfig), run.config["task"]["declutr"]
@@ -212,14 +212,14 @@ def main(cfg: Optional[TrainConfig] = None, run_id: Optional[str] = None):
 
         if cfg.task.dlc_ddpm.pretrained_ae_id is not None:
             run = wandb.Api().run(
-                f"guillaume-lajoie/dlc_lm_4/{cfg.task.dlc_ddpm.pretrained_ae_id}"
+                f"guillaume-lajoie/sem_emb/{cfg.task.dlc_ddpm.pretrained_ae_id}"
             )
             cfg.task.ae = OmegaConf.merge(
                 OmegaConf.structured(AETaskConfig), run.config["task"]["ae"]
             )
         elif cfg.task.dlc_ddpm.pretrained_declutr_id is not None:
             run = wandb.Api().run(
-                f"guillaume-lajoie/dlc_lm_4/{cfg.task.dlc_ddpm.pretrained_declutr_id}"
+                f"guillaume-lajoie/sem_emb/{cfg.task.dlc_ddpm.pretrained_declutr_id}"
             )
             cfg.task.declutr = OmegaConf.merge(
                 OmegaConf.structured(DeCLUTRTaskConfig), run.config["task"]["declutr"]
