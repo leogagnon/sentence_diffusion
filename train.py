@@ -1,4 +1,5 @@
 import os
+import logging as py_logging
 
 # Must be set before importing huggingface_hub, transformers, or datasets,
 # as they read these at module import time.
@@ -31,6 +32,13 @@ from tasks.dino_mixture import DINOMixtureTask, DINOMixtureTaskConfig
 from tasks.simcse import SimCSETask, SimCSETaskConfig
 
 logging.set_verbosity_error()
+for datasets_logger_name in [
+    "datasets",
+    "datasets.load",
+    "datasets.packaged_modules.cache.cache",
+]:
+    py_logging.getLogger(datasets_logger_name).setLevel(py_logging.ERROR)
+
 torch.set_float32_matmul_precision("medium")
 os.environ["PYTORCH_ALLOC_CONF"] = "expandable_segments:True"
 os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"

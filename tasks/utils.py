@@ -1,7 +1,13 @@
 import math
+from copy import deepcopy
+from typing import TYPE_CHECKING, Optional
 
 import einx
 import torch
+from tqdm import tqdm
+
+if TYPE_CHECKING:
+    from model.encoder import EncoderModel
 
 
 def eval_ppl(ppl_model, ppl_tok, prefix_str, suffix_str, device) -> float:
@@ -124,3 +130,65 @@ class SEMUsageTracker:
             self.usage = (
                 self.ema_decay * self.usage + (1 - self.ema_decay) * batch_freq.cpu()
             )
+
+
+def eval_mteb(
+    encoder: "EncoderModel",
+    tasks: list[str],
+    batch_size: int = 256,
+    limit: Optional[int] = None,
+    device: Optional[str] = None,
+) -> dict[str, float]:
+    """
+    Run MTEB evaluation on an EncoderModel.
+
+    Uses "hard" mode (near-zero temperature) when the encoder has a SEM head,
+    and "soft" mode otherwise.
+
+    Returns a flat dict mapping "mteb/{task_name}/{mode}" -> main_score.
+    """
+    import logging
+    import mteb
+    from mteb_wrapper import MTEBEncoderWrapper
+
+    if not tasks:
+        return {}
+
+    if device is None:
+        device = str(next(encoder.parameters()).device)
+
+    mteb_tasks = mteb.get_tasks(tasks=tasks, languages=["eng"])
+    mode = "hard" if encoder.cfg.sem is not None else "soft"
+
+    scores: dict[str, float] = {}
+    was_training = encoder.training
+    encoder.eval()
+
+    mteb_logger = logging.getLogger("mteb")
+    prev_mteb_level = mteb_logger.level
+    mteb_logger.setLevel(logging.ERROR)
+
+    try:
+        wrapper = MTEBEncoderWrapper(
+            encoder=encoder,
+            mode=mode,
+            batch_size=batch_size,
+            device=device,
+        )
+        eval_kwargs = {"limit": limit} if limit is not None else {}
+        results = mteb.evaluate(model=wrapper, tasks=deepcopy(mteb_tasks), **eval_kwargs)
+
+        for task_result in results:
+            task_name = task_result.task_name
+            for split in ["test", "dev", "validation"]:
+                if split in task_result.scores and task_result.scores[split]:
+                    main_score = task_result.scores[split][0].get("main_score")
+                    if main_score is not None:
+                        scores[f"mteb/{task_name}/{mode}"] = main_score
+                    break
+    finally:
+        mteb_logger.setLevel(prev_mteb_level)
+        if was_training:
+            encoder.train()
+
+    return scores

@@ -1,6 +1,6 @@
 import random
 from dataclasses import dataclass, field
-from typing import Optional
+from typing import List, Optional
 
 import einx
 import lightning as L
@@ -13,7 +13,7 @@ from omegaconf import OmegaConf
 
 from data import SimCSEIterable, LanguageDataset, LanguageDatasetConfig
 from model.encoder import EncoderConfig, EncoderModel
-from tasks.utils import sem_entropy, SEMUsageTracker
+from tasks.utils import eval_mteb, sem_entropy, SEMUsageTracker
 from pytorch_metric_learning.losses import NTXentLoss
 
 
@@ -29,6 +29,9 @@ class SimCSETaskConfig:
     loss_temp: float = 0.05
     sem_noise: float = 0.0
     dropout: float = 0.15
+    mteb_tasks: Optional[List[str]] = None
+    mteb_batch_size: int = 256
+    mteb_limit: Optional[int] = None
 
     name: Optional[str] = None
 
@@ -196,7 +199,24 @@ class SimCSETask(L.LightningModule):
             loss = self._compute_loss(z1, z2)
             self.log(f"val/loss_{label}", loss, on_step=False, on_epoch=True, sync_dist=True)
 
-        if (batch_idx == 0) and (rank_zero_only.rank == 0) and self.cfg.encoder.sem is not None:
-            is_dead = self.sem_usage_ema.usage < 1e-4
-            self.log("val/dead_words_ratio", torch.sum(is_dead).item() / is_dead.numel(),
-                     on_epoch=True, sync_dist=False, rank_zero_only=True)
+        if (batch_idx == 0) and (rank_zero_only.rank == 0):
+            if self.cfg.encoder.sem is not None:
+                is_dead = self.sem_usage_ema.usage < 1e-4
+                self.log("val/dead_words_ratio", torch.sum(is_dead).item() / is_dead.numel(),
+                         on_epoch=True, sync_dist=False, rank_zero_only=True)
+
+            if self.cfg.mteb_tasks:
+                mteb_scores = eval_mteb(
+                    encoder=self.encoder,
+                    tasks=self.cfg.mteb_tasks,
+                    batch_size=self.cfg.mteb_batch_size,
+                    limit=self.cfg.mteb_limit,
+                    device=str(self.device),
+                )
+                by_mode: dict[str, list[float]] = {}
+                for key, score in mteb_scores.items():
+                    mode = key.split("/")[-1]
+                    by_mode.setdefault(mode, []).append(score)
+                for mode, scores in by_mode.items():
+                    self.log(f"mteb/mean/{mode}", sum(scores) / len(scores),
+                             on_epoch=True, sync_dist=False, rank_zero_only=True)

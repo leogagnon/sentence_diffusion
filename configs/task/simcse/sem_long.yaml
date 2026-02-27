@@ -26,4 +26,10 @@ max_span_length: 384
 loss_temp: 0.05
 sem_noise: 0.05
 
+mteb_tasks:
+  - STSBenchmark
+  - Banking77Classification.v2
+  - ArXivHierarchicalClusteringS2S
+  - SciFact
+
 name: simcse/sem

@@ -29,4 +29,10 @@ sem_noise: 0.2
 mlm_loss: false
 mlm_loss_weight: 0.1 
 
+mteb_tasks:
+  - STSBenchmark
+  - Banking77Classification.v2
+  - ArXivHierarchicalClusteringS2S
+  - SciFact
+
 name: declutr/sem

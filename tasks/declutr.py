@@ -1,6 +1,6 @@
 import random
 from dataclasses import dataclass, field
-from typing import Optional
+from typing import List, Optional
 
 import einx
 import lightning as L
@@ -45,6 +45,9 @@ class DeCLUTRTaskConfig:
     mlm_loss: bool = False
     mlm_loss_weight: float = 1.0
     sem_reset_config: SEMResetConfig = field(default_factory=SEMResetConfig)
+    mteb_tasks: Optional[List[str]] = None
+    mteb_batch_size: int = 256
+    mteb_limit: Optional[int] = None
 
     name: Optional[str] = None
 
@@ -342,3 +345,19 @@ class DeCLUTRTask(L.LightningModule):
                     sync_dist=False,
                     rank_zero_only=True,
                 )
+
+            if self.cfg.mteb_tasks:
+                mteb_scores = eval_mteb(
+                    encoder=self.encoder,
+                    tasks=self.cfg.mteb_tasks,
+                    batch_size=self.cfg.mteb_batch_size,
+                    limit=self.cfg.mteb_limit,
+                    device=str(self.device),
+                )
+                by_mode: dict[str, list[float]] = {}
+                for key, score in mteb_scores.items():
+                    mode = key.split("/")[-1]
+                    by_mode.setdefault(mode, []).append(score)
+                for mode, scores in by_mode.items():
+                    self.log(f"mteb/mean/{mode}", sum(scores) / len(scores),
+                             on_epoch=True, sync_dist=False, rank_zero_only=True)
