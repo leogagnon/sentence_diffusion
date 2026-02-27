@@ -1,0 +1,14 @@
+task/simcse: sem_long
+model_checkpoint: base
+
+task.simcse.batch_size: 64
+task.simcse.sem_noise: 0.0, 0.05, 0.2
+
+max_steps: 20000
+strategy: ddp_find_unused_parameters_true
+
+limit_val_batches: 4
+val_check_interval: 512
+
+sweep_id: simcse/dlc_clean
+

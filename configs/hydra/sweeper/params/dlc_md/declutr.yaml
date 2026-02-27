@@ -2,10 +2,11 @@ task/dlc_md: declutr
 model_checkpoint: base
 
 effective_batch_size: 512
+task.dlc_md.pretrained_declutr_id: 5rg719g4
 
 max_steps: 20000
 
-limit_val_batches: 4
+limit_val_batches: 8
 val_check_interval: 512
 
 sweep_id: dlc_md/declutr

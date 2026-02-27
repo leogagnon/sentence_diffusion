@@ -1,7 +1,7 @@
 lr: 2e-4
 lr_warmup_steps: 2000
 batch_size: 64
-val_batch_size: 32
+val_batch_size: 64
 
 dit:
   name: kuleshov-group/mdlm-owt
@@ -12,7 +12,7 @@ dit:
 
 ancestral: false
 eval_gen_ppl: true
-pretrained_dino_id: q241xotm
+pretrained_dino_id: u8q48ndp
 eval_mauve: true
 
 prefix_length: 16

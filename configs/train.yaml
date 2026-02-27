@@ -9,6 +9,7 @@ defaults:
   - task/declutr: null
   - task/dino_mixture: null
   - task/dlc_ddpm: null
+  - task/simcse: null
   - model_checkpoint: null
   - early_stopping: null
   - hydra/sweeper/params : null

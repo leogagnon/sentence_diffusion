@@ -1,7 +1,8 @@
 task/dlc_ddpm: declutr
 model_checkpoint: base
 
-task.dlc_ddpm.context_length: 112, 0
+task.dlc_ddpm.suffix_length: 256, 64
+effective_batch_size: 512
 
 max_steps: 20000
 

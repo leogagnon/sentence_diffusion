@@ -5,8 +5,11 @@ max_steps: 20000
 
 limit_val_batches: 6
 val_check_interval: 512
+effective_batch_size: 512
+task.dlc_ddpm.suffix_length: 256, 64
+task.dlc_ddpm.context_length: 64
 
 strategy: ddp_find_unused_parameters_true
 
-sweep_id: dlc_ddpm/baseline
+sweep_id: dlc_ddpm/baseline_0
 

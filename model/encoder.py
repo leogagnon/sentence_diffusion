@@ -16,6 +16,7 @@ class SEMHeadConfig:
     V: int
     temp: float
     input_dim: Optional[int] = None
+    new_norm: bool = False
 
 
 class SEMHead(nn.Module):
@@ -27,7 +28,10 @@ class SEMHead(nn.Module):
 
         assert cfg.input_dim is not None, "input_dim has to be set"
         self.proj_in = nn.Linear(cfg.input_dim, cfg.L * cfg.V, bias=False)
-        self.norm = nn.LayerNorm((cfg.L, cfg.V))
+        if cfg.new_norm:
+            self.norm = nn.LayerNorm(cfg.V, elementwise_affine=False)
+        else:
+            self.norm = nn.LayerNorm((cfg.L, cfg.V))
 
         self.cfg = cfg
 
@@ -308,6 +312,7 @@ class EncoderModel(nn.Module):
         
         if cfg.no_out_proj:
             self.out_proj = nn.Identity()
+            cfg.latent_dim = dim_0
             assert cfg.latent_length == 1, "latent_length has to be 1 if no_out_proj is True"
         else:
             assert cfg.latent_dim is not None, "latent_dim has to be set if no_out_proj is False"

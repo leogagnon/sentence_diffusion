@@ -1,4 +1,4 @@
-batch_size: 16
+batch_size: 64
 lr: 5e-5
 lr_warmup_steps: 2000
 
@@ -8,20 +8,22 @@ encoder:
   latent_length: 1
   latent_dim: 1024
   mlp_proj: false
-    
+  sem:
+    _target_: model.encoder.SEMHead
+    L: 2048
+    V: 16
+    temp: 1.0
+    new_norm: true
+
 dataset:
   name: fineweb
   val_size: 16384
   seed: 42
 
-adjacent_positives: false
+dropout: 0.15
 min_span_length: 32
 max_span_length: 384
-num_anchors: 2
-num_positives: 2
 loss_temp: 0.05
-sem_noise: 0.0
-mlm_loss: true
-mlm_loss_weight: 0.1
+sem_noise: 0.05
 
-name: declutr/cont
+name: simcse/sem

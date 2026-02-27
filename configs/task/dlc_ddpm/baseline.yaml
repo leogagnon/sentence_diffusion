@@ -1,6 +1,6 @@
 lr: 1e-4
 lr_warmup_steps: 2000
-batch_size: 128
+batch_size: 64
 
 dataset:
   name: fineweb

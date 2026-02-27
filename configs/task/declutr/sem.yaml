@@ -7,12 +7,12 @@ encoder:
   train_backbone: true
   latent_length: 1
   latent_dim: 1024
-  mlp_proj: true
+  mlp_proj: false
   sem: 
     _target_: model.encoder.SEMHead
     L: 512
-    V: 16
-    temp: 0.5
+    V: 64
+    temp: 1.0
     
 dataset:
   name: fineweb
@@ -21,12 +21,12 @@ dataset:
 
 adjacent_positives: false
 min_span_length: 32
-max_span_length: 412
+max_span_length: 384
 num_anchors: 2
 num_positives: 2
 loss_temp: 0.05
 sem_noise: 0.05
-mlm_loss: true
+mlm_loss: false
 mlm_loss_weight: 0.1 
 
 name: declutr/sem

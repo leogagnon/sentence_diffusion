@@ -4,7 +4,7 @@ from typing import Optional
 
 import numpy as np
 import torch
-from mteb.models.model_meta import ModelMeta
+from mteb.models.model_meta import ModelMeta, ScoringFunction
 from mteb.similarity_functions import cos_sim, pairwise_cos_sim
 
 from model.encoder import EncoderModel
@@ -41,9 +41,12 @@ class MTEBEncoderWrapper:
         self.encoder.to(self.device)
 
         sem = encoder.cfg.sem
+        self._sem_dims = (sem["L"], sem["V"]) if sem is not None else None
+
         name = encoder.cfg.model_name
         if sem is not None:
             name = f"{name}-sem-L{sem['L']}-V{sem['V']}-{mode}"
+        similarity_fn_name = ScoringFunction.CUSTOM if self._sem_dims is not None else "cosine"
         self.mteb_model_meta = ModelMeta(
             loader=None,
             name=name,
@@ -58,7 +61,7 @@ class MTEBEncoderWrapper:
             public_training_data=None,
             use_instructions=None,
             training_datasets=None,
-            similarity_fn_name="cosine",
+            similarity_fn_name=similarity_fn_name,
             memory_usage_mb=None,
             max_tokens=None,
             framework=[],
@@ -89,7 +92,7 @@ class MTEBEncoderWrapper:
                 z, _ = self.encoder(
                     input_ids=encoded["input_ids"],
                     attention_mask=encoded["attention_mask"],
-                    skip_out_proj=False,
+                    skip_out_proj=True,
                     temp=temp,
                 )
 
@@ -98,10 +101,43 @@ class MTEBEncoderWrapper:
         return np.concatenate(all_embeddings, axis=0)
 
     def similarity(self, embeddings1, embeddings2):
-        return cos_sim(embeddings1, embeddings2)
+        if self._sem_dims is None:
+            return cos_sim(embeddings1, embeddings2)
+        return self._kl_sim(embeddings1, embeddings2, pairwise=False)
 
     def similarity_pairwise(self, embeddings1, embeddings2):
-        return pairwise_cos_sim(embeddings1, embeddings2)
+        if self._sem_dims is None:
+            return pairwise_cos_sim(embeddings1, embeddings2)
+        return self._kl_sim(embeddings1, embeddings2, pairwise=True)
+
+    def _kl_sim(self, e1, e2, pairwise: bool = False):
+        """Negative symmetric KL divergence between L concatenated simplices."""
+        L, V = self._sem_dims
+        eps = 1e-10
+
+        p = torch.as_tensor(np.asarray(e1), dtype=torch.float32).clamp(min=eps)
+        q = torch.as_tensor(np.asarray(e2), dtype=torch.float32).clamp(min=eps)
+        p = p.reshape(-1, L, V)  # (N, L, V)
+        q = q.reshape(-1, L, V)  # (M, L, V)
+
+        if pairwise:
+            # Elementwise: KL(p_i || q_i) and KL(q_i || p_i), both summed over L and V
+            kl_pq = (p * (p.log() - q.log())).sum(dim=(-2, -1))  # (N,)
+            kl_qp = (q * (q.log() - p.log())).sum(dim=(-2, -1))  # (N,)
+            return -(kl_pq + kl_qp) / 2
+
+        # All-pairs: (N, M)
+        log_p = p.log()   # (N, L, V)
+        log_q = q.log()   # (M, L, V)
+
+        p_log_p = (p * log_p).sum(dim=(-2, -1))          # (N,)
+        q_log_q = (q * log_q).sum(dim=(-2, -1))          # (M,)
+        p_log_q = torch.einsum("nlv, mlv -> nm", p, log_q)  # (N, M)
+        q_log_p = torch.einsum("mlv, nlv -> mn", q, log_p)  # (M, N)
+
+        kl_pq = p_log_p[:, None] - p_log_q              # (N, M)
+        kl_qp = q_log_q[None, :] - q_log_p.T            # (N, M)
+        return -(kl_pq + kl_qp) / 2
 
 
 WANDB_PROJECT = "guillaume-lajoie/dlc_lm_4"
@@ -123,6 +159,7 @@ def load_encoder_from_checkpoint(
     from tasks.autoencoder import AETask
     from tasks.declutr import DeCLUTRTask
     from tasks.dino_mixture import DINOMixtureTask
+    from tasks.simcse import SimCSETask
 
     # Auto-detect task type from wandb config
     run = wandb_lib.Api().run(f"{WANDB_PROJECT}/{wandb_id}")
@@ -133,10 +170,12 @@ def load_encoder_from_checkpoint(
         task_type = "declutr"
     elif "task" in config and config["task"]["dino_mixture"] is not None:
         task_type = "dino_mixture"
+    elif "task" in config and config["task"]["simcse"] is not None:
+        task_type = "simcse"
     else:
         raise ValueError(
             f"Could not detect task type from wandb config for run {wandb_id}. "
-            f"Expected 'task.ae' or 'task.declutr' or 'task.dino_mixture' in config."
+            f"Expected 'task.ae' or 'task.declutr' or 'task.dino_mixture' or 'task.simcse' in config."
         )
 
     print(f"Detected task type: {task_type}")
@@ -157,6 +196,10 @@ def load_encoder_from_checkpoint(
             ckpt_path, strict=False, map_location=torch.device(device)
         )
         return task.teacher_encoder.eval().requires_grad_(False)
+    elif task_type == "simcse":
+        task = SimCSETask.load_from_checkpoint(
+            ckpt_path, strict=False, map_location=torch.device(device)
+        )
     else:
         task = DeCLUTRTask.load_from_checkpoint(
             ckpt_path, strict=False, map_location=torch.device(device)

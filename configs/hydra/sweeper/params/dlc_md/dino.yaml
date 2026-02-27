@@ -2,11 +2,12 @@ task/dlc_md: dino_mixture
 model_checkpoint: base
 
 effective_batch_size: 512
+task.dlc_md.pretrained_dino_id: u8q48ndp, 1gf6dq6i
 
 max_steps: 20000
 
-limit_val_batches: 4
+limit_val_batches: 8
 val_check_interval: 512
 
-sweep_id: dlc_md/dino
+sweep_id: dlc_md/dino_0
 

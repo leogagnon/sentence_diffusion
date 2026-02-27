@@ -1,13 +1,12 @@
-task/declutr: continuous
+task/simcse: continuous
 model_checkpoint: base
 
-task.declutr.batch_size: 16
+task.simcse.batch_size: 64
 max_steps: 20000
 
 limit_val_batches: 4
 val_check_interval: 512
 strategy: ddp_find_unused_parameters_true
 
-
-sweep_id: declutr/continuous_clean
+sweep_id: simcse/continuous_clean
 

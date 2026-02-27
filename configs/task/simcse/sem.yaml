@@ -1,5 +1,5 @@
 batch_size: 64
-lr: 5e-4
+lr: 5e-5
 lr_warmup_steps: 2000
 
 encoder:
@@ -7,19 +7,20 @@ encoder:
   train_backbone: true
   latent_length: 1
   latent_dim: 1024
-  mlp_proj: true
+  mlp_proj: false
   sem:
     _target_: model.encoder.SEMHead
     L: 512
-    V: 16
-    temp: 0.5
+    V: 64
+    temp: 1.0
 
 dataset:
   name: fineweb
   val_size: 16384
   seed: 42
 
-span_length: 64
+min_span_length: 32
+max_span_length: 384
 loss_temp: 0.05
 sem_noise: 0.05
 

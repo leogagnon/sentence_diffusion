@@ -1,6 +1,6 @@
 lr: 1e-4
 lr_warmup_steps: 2000
-batch_size: 128
+batch_size: 64
 
 dataset:
   name: fineweb
@@ -28,8 +28,8 @@ model:
 eval_gen_ppl: true
 
 prefix_length: 16
-suffix_length: 64
-context_length: 112
+suffix_length: 256
+context_length: 64
 
 use_ema: true
 prompt_generator_noise: true

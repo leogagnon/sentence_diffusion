@@ -353,7 +353,7 @@ class PrefixSuffixIterable(IterableDataset):
             batch_size=batch_size,
             collate_fn=collate_fn,
             num_workers=num_workers,
-            persistent_workers=False,
+            persistent_workers=True,
             prefetch_factor=4 if num_workers > 0 else None,
             pin_memory=True,
         )
@@ -471,14 +471,16 @@ class SimCSEIterable(IterableDataset):
         self,
         dataset,
         tokenizer,
-        span_length: int,
+        min_span_length: int,
+        max_span_length: int,
         seed: Optional[int] = None,
     ):
         assert hasattr(dataset, "__len__") and hasattr(dataset, "__getitem__")
         self.ds = dataset
         self.N = len(dataset)
         assert self.N > 0
-        self.span_length = span_length
+        self.min_span_length = min_span_length
+        self.max_span_length = max_span_length
         self.seed = seed
         self.tok = tokenizer
 
@@ -505,7 +507,8 @@ class SimCSEIterable(IterableDataset):
         dataset,
         tokenizer: PreTrainedTokenizerFast,
         batch_size: int,
-        span_length: int,
+        min_span_length: int,
+        max_span_length: int,
         seed: int = 32,
     ) -> DataLoader:
         def collate_fn(batch):
@@ -516,7 +519,7 @@ class SimCSEIterable(IterableDataset):
                 return_attention_mask=True,
             )
 
-        iterable = cls(dataset, tokenizer=tokenizer, span_length=span_length, seed=seed)
+        iterable = cls(dataset, tokenizer=tokenizer, min_span_length=min_span_length, max_span_length=max_span_length, seed=seed)
         num_workers = int(os.environ.get("TORCH_NUM_WORKERS", 0))
         return DataLoader(
             iterable,
@@ -543,10 +546,11 @@ class SimCSEIterable(IterableDataset):
             for i in range(1024):
                 input_ids = input_ids_batch[i]
                 seq_length = len(input_ids)
-                if seq_length < self.span_length:
+                if seq_length < self.min_span_length:
                     continue
-                window_start = generator.randint(0, seq_length - self.span_length)
-                span = input_ids[window_start : window_start + self.span_length]
+                span_length = generator.randint(self.min_span_length, min(self.max_span_length, seq_length))
+                window_start = generator.randint(0, seq_length - span_length)
+                span = input_ids[window_start : window_start + span_length]
                 yield torch.LongTensor(span)
 
 

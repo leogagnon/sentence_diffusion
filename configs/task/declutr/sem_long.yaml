@@ -8,6 +8,11 @@ encoder:
   latent_length: 1
   latent_dim: 1024
   mlp_proj: false
+  sem: 
+    _target_: model.encoder.SEMHead
+    L: 2048
+    V: 16
+    temp: 1.0
     
 dataset:
   name: fineweb
@@ -20,8 +25,8 @@ max_span_length: 384
 num_anchors: 2
 num_positives: 2
 loss_temp: 0.05
-sem_noise: 0.0
-mlm_loss: true
-mlm_loss_weight: 0.1
+sem_noise: 0.2
+mlm_loss: false
+mlm_loss_weight: 0.1 
 
-name: declutr/cont
+name: declutr/sem

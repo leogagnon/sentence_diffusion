@@ -480,7 +480,7 @@ class GaussianDiffusionTask(L.LightningModule):
 
         Uses self.training to determine:
           - Training: applies prompt_generator_noise and uses self.model for diffusion loss
-          - Validation: uses alpha=0.05, uses EMA model (if use_ema) for diffusion loss
+          - Validation: uses alpha=0.95, uses EMA model (if use_ema) for diffusion loss
 
         Returns dict with full_loss, suffix_loss, diffusion_loss (None if no diffusion model).
         """
@@ -505,7 +505,7 @@ class GaussianDiffusionTask(L.LightningModule):
                     batch,
                     z,
                     alpha=(
-                        torch.full((z.size(0), 1), 0.05, device=z.device)
+                        torch.full((z.size(0), 1), 0.95, device=z.device)
                         if self.cfg.prompt_generator_noise
                         else None
                     ),
@@ -593,7 +593,7 @@ class GaussianDiffusionTask(L.LightningModule):
             batch,
             z_true,
             alpha=(
-                torch.full((z_true.size(0), 1), 0.05, device=z_true.device)
+                torch.full((z_true.size(0), 1), 0.95, device=z_true.device)
                 if self.cfg.prompt_generator_noise
                 else None
             ),
@@ -626,7 +626,7 @@ class GaussianDiffusionTask(L.LightningModule):
             batch,
             z,
             alpha=(
-                torch.full((z.size(0),), 0.05, device=z.device)
+                torch.full((z.size(0),), 0.95, device=z.device)
                 if self.cfg.prompt_generator_noise
                 else None
             ),
