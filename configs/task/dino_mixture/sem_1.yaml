@@ -9,8 +9,8 @@ mteb_tasks:
   - Banking77Classification.v2
   - ArXivHierarchicalClusteringS2S
   - SciFact
-student_temp: 0.7
-teacher_temp: 0.3
+student_temp: 0.1
+teacher_temp: 0.04
 center_momentum: 0.9
 teacher_momentum: 0.996
 sem_noise: 0.00

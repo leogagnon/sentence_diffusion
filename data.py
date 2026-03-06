@@ -893,6 +893,28 @@ def load_paws_pairs() -> Tuple[List[str], List[str]]:
     return anchors, positives
 
 
+def load_snli_pairs(split: str = "train") -> Tuple[List[str], List[str]]:
+    """Load SNLI entailment pairs (premise, hypothesis). Skips label=-1 rows."""
+    ds = load_dataset("stanfordnlp/snli", split=split)
+    anchors, positives = [], []
+    for row in ds:
+        if row["label"] == 0:  # entailment; -1 means no majority label
+            anchors.append(row["premise"])
+            positives.append(row["hypothesis"])
+    return anchors, positives
+
+
+def load_mnli_pairs(split: str = "train") -> Tuple[List[str], List[str]]:
+    """Load MNLI entailment pairs. Use 'validation_matched' for validation."""
+    ds = load_dataset("nyu-mll/multi_nli", split=split)
+    anchors, positives = [], []
+    for row in ds:
+        if row["label"] == 0:  # entailment
+            anchors.append(row["premise"])
+            positives.append(row["hypothesis"])
+    return anchors, positives
+
+
 def load_yelp_polarity_groups() -> Dict[int, List[str]]:
     """Load Yelp Polarity reviews grouped by sentiment label (0=neg, 1=pos)."""
     ds = load_dataset("fancyzhx/yelp_polarity", split="train")
@@ -923,7 +945,12 @@ def load_ibm_argq_groups() -> Dict[str, List[str]]:
 class PairDatasetIterable(IterableDataset):
     """
     Iterable for datasets that provide explicit (anchor, positive) text pairs
-    (e.g. VitaminC, ANLI, PAWS). Samples WITH REPLACEMENT.
+    (e.g. VitaminC, ANLI, PAWS).
+
+    When replacement=True (default): samples with replacement indefinitely.
+    When replacement=False: shuffles all indices and yields each exactly once
+    per epoch. Lightning restarts the iterator each epoch, and _epoch_counter
+    advances the shuffle seed so each epoch sees a different ordering.
 
     Yields DeCLUTR-format dicts compatible with the standard collate_fn:
         {"anchor_ids": [LongTensor], "positive_ids": [LongTensor]}
@@ -936,6 +963,7 @@ class PairDatasetIterable(IterableDataset):
         tokenizer,
         max_length: int = 128,
         seed: Optional[int] = None,
+        replacement: bool = True,
     ):
         assert len(anchors) == len(positives) and len(anchors) > 0
         self.anchors = anchors
@@ -943,6 +971,169 @@ class PairDatasetIterable(IterableDataset):
         self.N = len(anchors)
         self.tok = tokenizer
         self.max_length = max_length
+        self.seed = seed
+        self.replacement = replacement
+        self._epoch_counter = 0
+
+    def _make_generator(self) -> random.Random:
+        if torch.distributed.is_available() and torch.distributed.is_initialized():
+            rank = torch.distributed.get_rank()
+        else:
+            rank = 0
+        wi = get_worker_info()
+        wid = wi.id if wi is not None else 0
+        base = self.seed
+        if base is None:
+            base = int.from_bytes(os.urandom(8), "little", signed=False)
+        mixed = (
+            int(base)
+            ^ (0x9E3779B97F4A7C15 * (rank + 1))
+            ^ (0xBF58476D1CE4E5B9 * (wid + 1))
+        ) & ((1 << 63) - 1)
+        return random.Random(mixed)
+
+    def __iter__(self):
+        if self.replacement:
+            rng = self._make_generator()
+            while True:
+                indices = rng.choices(range(self.N), k=256)
+                for idx in indices:
+                    anchor_ids = self.tok.encode(
+                        self.anchors[idx],
+                        add_special_tokens=True,
+                        max_length=self.max_length,
+                        truncation=True,
+                    )
+                    positive_ids = self.tok.encode(
+                        self.positives[idx],
+                        add_special_tokens=True,
+                        max_length=self.max_length,
+                        truncation=True,
+                    )
+                    yield {
+                        "anchor_ids": [torch.LongTensor(anchor_ids)],
+                        "positive_ids": [torch.LongTensor(positive_ids)],
+                    }
+        else:
+            # No replacement: shuffle all indices and yield each exactly once.
+            # Use epoch counter to vary shuffle order across epochs.
+            if torch.distributed.is_available() and torch.distributed.is_initialized():
+                rank = torch.distributed.get_rank()
+            else:
+                rank = 0
+            wi = get_worker_info()
+            wid = wi.id if wi is not None else 0
+            num_workers = wi.num_workers if wi is not None else 1
+
+            base = self.seed if self.seed is not None else 0
+            # Same shuffle order for all workers on this rank; epoch counter varies per epoch.
+            shuffle_seed = (
+                int(base)
+                ^ (0x9E3779B97F4A7C15 * (rank + 1))
+                ^ (0xBF58476D1CE4E5B9 * (self._epoch_counter + 1))
+            ) & ((1 << 63) - 1)
+            rng = random.Random(shuffle_seed)
+            indices = list(range(self.N))
+            rng.shuffle(indices)
+            self._epoch_counter += 1
+
+            # Interleave across workers so each sees a disjoint subset.
+            for i, idx in enumerate(indices):
+                if i % num_workers != wid:
+                    continue
+                anchor_ids = self.tok.encode(
+                    self.anchors[idx],
+                    add_special_tokens=True,
+                    max_length=self.max_length,
+                    truncation=True,
+                )
+                positive_ids = self.tok.encode(
+                    self.positives[idx],
+                    add_special_tokens=True,
+                    max_length=self.max_length,
+                    truncation=True,
+                )
+                yield {
+                    "anchor_ids": [torch.LongTensor(anchor_ids)],
+                    "positive_ids": [torch.LongTensor(positive_ids)],
+                }
+
+    @classmethod
+    def get_dataloader(
+        cls,
+        anchors: List[str],
+        positives: List[str],
+        tokenizer,
+        batch_size: int,
+        max_length: int = 128,
+        seed: int = 32,
+        replacement: bool = True,
+    ) -> DataLoader:
+        def collate_fn(batch):
+            concat_batch: Dict[str, List] = {key: [] for key in batch[0].keys()}
+            for item in batch:
+                for key in concat_batch:
+                    concat_batch[key].extend(item[key])
+            concat_batch["anchor_ids"] = pad_sequence(
+                concat_batch["anchor_ids"], batch_first=True,
+                padding_value=tokenizer.pad_token_id,
+            )
+            concat_batch["positive_ids"] = pad_sequence(
+                concat_batch["positive_ids"], batch_first=True,
+                padding_value=tokenizer.pad_token_id,
+            )
+            return concat_batch
+
+        iterable = cls(anchors=anchors, positives=positives,
+                       tokenizer=tokenizer, max_length=max_length, seed=seed,
+                       replacement=replacement)
+        num_workers = int(os.environ.get("TORCH_NUM_WORKERS", 0))
+        return DataLoader(
+            iterable,
+            batch_size=batch_size,
+            collate_fn=collate_fn,
+            num_workers=num_workers,
+            persistent_workers=num_workers > 0,
+            prefetch_factor=4 if num_workers > 0 else None,
+            pin_memory=True,
+        )
+
+
+# ---------------------------------------------------------------------------
+# DistillPairDatasetIterable — dual-tokenizer variant for distillation tasks
+# ---------------------------------------------------------------------------
+
+
+class DistillPairDatasetIterable(IterableDataset):
+    """
+    Iterable for distillation tasks: yields both student and teacher tokenizations
+    for the same (anchor, positive) text pair.
+
+    Batch keys:
+        anchor_ids            [B, S_s]  student tokenization of anchor
+        positive_ids          [B, S_s]  student tokenization of positive
+        teacher_anchor_ids    [B, S_t]  teacher tokenization of anchor
+        teacher_positive_ids  [B, S_t]  teacher tokenization of positive
+    """
+
+    def __init__(
+        self,
+        anchors: List[str],
+        positives: List[str],
+        student_tokenizer,
+        teacher_tokenizer,
+        student_max_length: int = 128,
+        teacher_max_length: int = 128,
+        seed: Optional[int] = None,
+    ):
+        assert len(anchors) == len(positives) and len(anchors) > 0
+        self.anchors = anchors
+        self.positives = positives
+        self.N = len(anchors)
+        self.s_tok = student_tokenizer
+        self.t_tok = teacher_tokenizer
+        self.s_max = student_max_length
+        self.t_max = teacher_max_length
         self.seed = seed
 
     def _make_generator(self) -> random.Random:
@@ -967,22 +1158,75 @@ class PairDatasetIterable(IterableDataset):
         while True:
             indices = rng.choices(range(self.N), k=256)
             for idx in indices:
-                anchor_ids = self.tok.encode(
-                    self.anchors[idx],
-                    add_special_tokens=True,
-                    max_length=self.max_length,
-                    truncation=True,
-                )
-                positive_ids = self.tok.encode(
-                    self.positives[idx],
-                    add_special_tokens=True,
-                    max_length=self.max_length,
-                    truncation=True,
-                )
+                a, p = self.anchors[idx], self.positives[idx]
                 yield {
-                    "anchor_ids": [torch.LongTensor(anchor_ids)],
-                    "positive_ids": [torch.LongTensor(positive_ids)],
+                    "anchor_ids": [torch.LongTensor(self.s_tok.encode(
+                        a, add_special_tokens=True, max_length=self.s_max, truncation=True,
+                    ))],
+                    "positive_ids": [torch.LongTensor(self.s_tok.encode(
+                        p, add_special_tokens=True, max_length=self.s_max, truncation=True,
+                    ))],
+                    "teacher_anchor_ids": [torch.LongTensor(self.t_tok.encode(
+                        a, add_special_tokens=True, max_length=self.t_max, truncation=True,
+                    ))],
+                    "teacher_positive_ids": [torch.LongTensor(self.t_tok.encode(
+                        p, add_special_tokens=True, max_length=self.t_max, truncation=True,
+                    ))],
                 }
+
+    @classmethod
+    def get_dataloader(
+        cls,
+        anchors: List[str],
+        positives: List[str],
+        student_tokenizer,
+        teacher_tokenizer,
+        batch_size: int,
+        student_max_length: int = 128,
+        teacher_max_length: int = 128,
+        seed: int = 32,
+    ) -> DataLoader:
+        s_pad = student_tokenizer.pad_token_id
+        t_pad = teacher_tokenizer.pad_token_id
+
+        def collate_fn(batch):
+            concat_batch: Dict[str, List] = {key: [] for key in batch[0].keys()}
+            for item in batch:
+                for key in concat_batch:
+                    concat_batch[key].extend(item[key])
+            concat_batch["anchor_ids"] = pad_sequence(
+                concat_batch["anchor_ids"], batch_first=True, padding_value=s_pad,
+            )
+            concat_batch["positive_ids"] = pad_sequence(
+                concat_batch["positive_ids"], batch_first=True, padding_value=s_pad,
+            )
+            concat_batch["teacher_anchor_ids"] = pad_sequence(
+                concat_batch["teacher_anchor_ids"], batch_first=True, padding_value=t_pad,
+            )
+            concat_batch["teacher_positive_ids"] = pad_sequence(
+                concat_batch["teacher_positive_ids"], batch_first=True, padding_value=t_pad,
+            )
+            return concat_batch
+
+        iterable = cls(
+            anchors=anchors,
+            positives=positives,
+            student_tokenizer=student_tokenizer,
+            teacher_tokenizer=teacher_tokenizer,
+            student_max_length=student_max_length,
+            teacher_max_length=teacher_max_length,
+            seed=seed,
+        )
+        num_workers = int(os.environ.get("TORCH_NUM_WORKERS", 0))
+        return DataLoader(
+            iterable,
+            batch_size=batch_size,
+            collate_fn=collate_fn,
+            num_workers=num_workers,
+            persistent_workers=True,
+            prefetch_factor=4 if num_workers > 0 else None,
+            pin_memory=True,
+        )
 
 
 # ---------------------------------------------------------------------------

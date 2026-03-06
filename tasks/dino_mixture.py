@@ -1,5 +1,5 @@
 from dataclasses import dataclass
-from typing import Optional
+from typing import List, Optional
 
 import einx
 import lightning as L
@@ -11,7 +11,7 @@ from torch.utils.data.dataset import Subset
 from transformers import get_cosine_schedule_with_warmup
 from omegaconf import OmegaConf
 
-from tasks.utils import SEMUsageTracker, sem_entropy
+from tasks.utils import eval_mteb, SEMUsageTracker, sem_entropy
 
 
 # ---------------------------------------------------------------------------
@@ -88,13 +88,20 @@ class DINOMixtureTaskConfig:
     num_prototypes: int = 4096
     head_hidden_dim: int = 2048
     head_bottleneck_dim: int = 256
-    head_nlayers: int = 3
+    head_nlayers: int = 1
     student_temp: float = 0.1
     teacher_temp: float = 0.04
     center_momentum: float = 0.9
     teacher_momentum: float = 0.996
 
     sem_noise: float = 0.0
+
+    dino_on_sem: bool = False  # if True, skip DINOHead and compute DINO loss on SEM simplices
+
+    # MTEB evaluation
+    mteb_tasks: Optional[List[str]] = None
+    mteb_batch_size: int = 256
+    mteb_limit: Optional[int] = None
 
     declutr_only: bool = False  # if True, skip all pair datasets and use only DeCLUTR
 
@@ -134,30 +141,39 @@ class DINOMixtureTask(L.LightningModule):
 
         # Student
         self.encoder = EncoderModel(cfg.encoder)
-        self.proto_head = DINOHead(
-            in_dim=cfg.encoder.latent_dim,
-            out_dim=cfg.num_prototypes,
-            hidden_dim=cfg.head_hidden_dim,
-            bottleneck_dim=cfg.head_bottleneck_dim,
-            nlayers=cfg.head_nlayers,
-        )
 
         # Teacher (EMA of student — weights copied in on_fit_start)
         self.teacher_encoder = EncoderModel(cfg.encoder)
-        self.teacher_proto_head = DINOHead(
-            in_dim=cfg.encoder.latent_dim,
-            out_dim=cfg.num_prototypes,
-            hidden_dim=cfg.head_hidden_dim,
-            bottleneck_dim=cfg.head_bottleneck_dim,
-            nlayers=cfg.head_nlayers,
-        )
         for p in self.teacher_encoder.parameters():
             p.requires_grad = False
-        for p in self.teacher_proto_head.parameters():
-            p.requires_grad = False
 
-        # Centering buffer (EMA of teacher batch means, prevents collapse)
-        self.register_buffer("center", torch.zeros(cfg.num_prototypes))
+        if cfg.dino_on_sem:
+            # No DINOHead — DINO loss computed directly on SEM simplex logits.
+            # Centering buffer has per-simplex shape [L, V].
+            assert cfg.encoder.sem is not None, "dino_on_sem requires encoder.sem"
+            assert cfg.encoder.no_out_proj, "dino_on_sem requires no_out_proj=True (out_proj receives no gradient)"
+            sem_L = cfg.encoder.sem["L"]
+            sem_V = cfg.encoder.sem["V"]
+            self.register_buffer("center", torch.zeros(sem_L, sem_V))
+        else:
+            self.proto_head = DINOHead(
+                in_dim=cfg.encoder.latent_dim,
+                out_dim=cfg.num_prototypes,
+                hidden_dim=cfg.head_hidden_dim,
+                bottleneck_dim=cfg.head_bottleneck_dim,
+                nlayers=cfg.head_nlayers,
+            )
+            self.teacher_proto_head = DINOHead(
+                in_dim=cfg.encoder.latent_dim,
+                out_dim=cfg.num_prototypes,
+                hidden_dim=cfg.head_hidden_dim,
+                bottleneck_dim=cfg.head_bottleneck_dim,
+                nlayers=cfg.head_nlayers,
+            )
+            for p in self.teacher_proto_head.parameters():
+                p.requires_grad = False
+            # Centering buffer (EMA of teacher batch means, prevents collapse)
+            self.register_buffer("center", torch.zeros(cfg.num_prototypes))
 
         self.save_hyperparameters(
             OmegaConf.to_container(OmegaConf.structured(cfg)), logger=False
@@ -173,8 +189,9 @@ class DINOMixtureTask(L.LightningModule):
         with torch.no_grad():
             for p_s, p_t in zip(self.encoder.parameters(), self.teacher_encoder.parameters()):
                 p_t.data.copy_(p_s.data)
-            for p_s, p_t in zip(self.proto_head.parameters(), self.teacher_proto_head.parameters()):
-                p_t.data.copy_(p_s.data)
+            if not self.cfg.dino_on_sem:
+                for p_s, p_t in zip(self.proto_head.parameters(), self.teacher_proto_head.parameters()):
+                    p_t.data.copy_(p_s.data)
 
     def on_train_batch_end(self, outputs, batch, batch_idx):
         # EMA: teacher ← m * teacher + (1 - m) * student
@@ -182,8 +199,9 @@ class DINOMixtureTask(L.LightningModule):
         with torch.no_grad():
             for p_s, p_t in zip(self.encoder.parameters(), self.teacher_encoder.parameters()):
                 p_t.data.mul_(m).add_(p_s.data * (1 - m))
-            for p_s, p_t in zip(self.proto_head.parameters(), self.teacher_proto_head.parameters()):
-                p_t.data.mul_(m).add_(p_s.data * (1 - m))
+            if not self.cfg.dino_on_sem:
+                for p_s, p_t in zip(self.proto_head.parameters(), self.teacher_proto_head.parameters()):
+                    p_t.data.mul_(m).add_(p_s.data * (1 - m))
 
     # ------------------------------------------------------------------
     # Loss
@@ -195,6 +213,29 @@ class DINOMixtureTask(L.LightningModule):
             (teacher_logits - self.center) / self.cfg.teacher_temp, dim=-1
         )
         return -torch.sum(teacher_probs * student_log_probs, dim=-1).mean()
+
+    def sem_dino_loss(self, student_logits, teacher_logits):
+        """DINO loss computed directly on SEM simplex logits.
+
+        Args:
+            student_logits: [B, L, V] post-LayerNorm, pre-softmax SEM logits (student)
+            teacher_logits: [B, L, V] post-LayerNorm, pre-softmax SEM logits (teacher)
+
+        self.center has shape [L, V] — per-simplex centering buffer.
+
+        For each of the L simplices independently, we compute:
+            p_t[b,l] = softmax((x_t[b,l] - c[l]) / T_t)   # sharpened, centered teacher
+            p_s[b,l] = log_softmax(x_s[b,l] / T_s)         # student
+            H_l = -sum_v p_t[b,l,v] * log p_s[b,l,v]
+
+        The total loss is the mean over batch samples and simplices.
+        """
+        log_p_s = F.log_softmax(student_logits / self.cfg.student_temp, dim=-1)
+        p_t = F.softmax(
+            (teacher_logits - self.center) / self.cfg.teacher_temp, dim=-1
+        )
+        # Sum over V, mean over B and L
+        return -torch.sum(p_t * log_p_s, dim=-1).mean()
 
     # ------------------------------------------------------------------
     # Data
@@ -258,10 +299,9 @@ class DINOMixtureTask(L.LightningModule):
 
     def configure_optimizers(self):
         no_decay = ["bias", "norm"]
-        all_params = (
-            list(self.encoder.named_parameters())
-            + list(self.proto_head.named_parameters())
-        )
+        all_params = list(self.encoder.named_parameters())
+        if not self.cfg.dino_on_sem:
+            all_params += list(self.proto_head.named_parameters())
         optimizer_grouped_parameters = [
             {
                 "params": [p for n, p in all_params if not any(nd in n.lower() for nd in no_decay)],
@@ -316,54 +356,115 @@ class DINOMixtureTask(L.LightningModule):
         anchor_mask = (anchor_ids != self.encoder.tokenizer.pad_token_id).long()
         positive_mask = (positive_ids != self.encoder.tokenizer.pad_token_id).long()
 
-        # Student sees BOTH views
-        z_s_anc, sem_out = self.encoder(
-            input_ids=anchor_ids,
-            attention_mask=anchor_mask,
-            return_count=True,
-            noise=self.cfg.sem_noise,
-        )
-        z_s_pos, _ = self.encoder(
-            input_ids=positive_ids,
-            attention_mask=positive_mask,
-            noise=self.cfg.sem_noise,
-        )
-        s_logits_anc = self.proto_head(z_s_anc)
-        s_logits_pos = self.proto_head(z_s_pos)
-
-        # Teacher sees BOTH views (no gradient)
-        with torch.no_grad():
-            z_t_anc, _ = self.teacher_encoder(
-                input_ids=anchor_ids, attention_mask=anchor_mask
+        if self.cfg.dino_on_sem:
+            # ----------------------------------------------------------
+            # SEM-DINO: compute loss directly on SEM simplex logits [B,L,V]
+            # ----------------------------------------------------------
+            z_s_anc, sem_out = self.encoder(
+                input_ids=anchor_ids,
+                attention_mask=anchor_mask,
+                return_count=True,
+                noise=self.cfg.sem_noise,
+                return_sem_logits=True,
             )
-            z_t_pos, _ = self.teacher_encoder(
-                input_ids=positive_ids, attention_mask=positive_mask
+            z_s_pos, sem_out_pos = self.encoder(
+                input_ids=positive_ids,
+                attention_mask=positive_mask,
+                noise=self.cfg.sem_noise,
+                return_sem_logits=True,
             )
-            t_logits_anc = self.teacher_proto_head(z_t_anc)
-            t_logits_pos = self.teacher_proto_head(z_t_pos)
+            s_logits_anc = sem_out["sem_logits"]      # [B, L, V]
+            s_logits_pos = sem_out_pos["sem_logits"]  # [B, L, V]
 
-        # Cross-view loss only (exclude same-view to avoid trivial solution)
-        loss = (self.dino_loss(s_logits_anc, t_logits_pos) + self.dino_loss(s_logits_pos, t_logits_anc)) / 2
-        self.log("train/loss", loss, on_step=True, on_epoch=False, sync_dist=True)
-
-        if self.cfg.encoder.sem is not None:
-            self.sem_usage_ema.update(
-                sem_out["usage_count"], batch_size=anchor_ids.shape[0]
-            )
-
-        # Update centering buffer with ALL teacher logits
-        with torch.no_grad():
-            all_teacher_logits = torch.cat([t_logits_anc, t_logits_pos], dim=0)
-            if self.trainer.world_size > 1:
-                all_teacher = einx.rearrange(
-                    "w b k -> (w b) k", self.all_gather(all_teacher_logits)
+            with torch.no_grad():
+                _, t_sem_out_anc = self.teacher_encoder(
+                    input_ids=anchor_ids, attention_mask=anchor_mask,
+                    return_sem_logits=True,
                 )
-                batch_center = all_teacher.mean(0)
-            else:
-                batch_center = all_teacher_logits.mean(0)
-            self.center.mul_(self.cfg.center_momentum).add_(
-                batch_center * (1 - self.cfg.center_momentum)
+                _, t_sem_out_pos = self.teacher_encoder(
+                    input_ids=positive_ids, attention_mask=positive_mask,
+                    return_sem_logits=True,
+                )
+                t_logits_anc = t_sem_out_anc["sem_logits"]  # [B, L, V]
+                t_logits_pos = t_sem_out_pos["sem_logits"]  # [B, L, V]
+
+            # Cross-view loss
+            loss = (
+                self.sem_dino_loss(s_logits_anc, t_logits_pos)
+                + self.sem_dino_loss(s_logits_pos, t_logits_anc)
+            ) / 2
+            self.log("train/loss", loss, on_step=True, on_epoch=False, sync_dist=True)
+
+            if self.cfg.encoder.sem is not None:
+                self.sem_usage_ema.update(
+                    sem_out["usage_count"], batch_size=anchor_ids.shape[0]
+                )
+
+            # Update per-simplex centering buffer [L, V]
+            with torch.no_grad():
+                all_teacher_logits = torch.cat([t_logits_anc, t_logits_pos], dim=0)  # [2B, L, V]
+                if self.trainer.world_size > 1:
+                    all_teacher = einx.rearrange(
+                        "w b l v -> (w b) l v", self.all_gather(all_teacher_logits)
+                    )
+                    batch_center = all_teacher.mean(0)   # [L, V]
+                else:
+                    batch_center = all_teacher_logits.mean(0)
+                self.center.mul_(self.cfg.center_momentum).add_(
+                    batch_center * (1 - self.cfg.center_momentum)
+                )
+        else:
+            # ----------------------------------------------------------
+            # Standard DINO: loss on DINOHead prototype logits [B, K]
+            # ----------------------------------------------------------
+            z_s_anc, sem_out = self.encoder(
+                input_ids=anchor_ids,
+                attention_mask=anchor_mask,
+                return_count=True,
+                noise=self.cfg.sem_noise,
             )
+            z_s_pos, _ = self.encoder(
+                input_ids=positive_ids,
+                attention_mask=positive_mask,
+                noise=self.cfg.sem_noise,
+            )
+            s_logits_anc = self.proto_head(z_s_anc)
+            s_logits_pos = self.proto_head(z_s_pos)
+
+            with torch.no_grad():
+                z_t_anc, _ = self.teacher_encoder(
+                    input_ids=anchor_ids, attention_mask=anchor_mask
+                )
+                z_t_pos, _ = self.teacher_encoder(
+                    input_ids=positive_ids, attention_mask=positive_mask
+                )
+                t_logits_anc = self.teacher_proto_head(z_t_anc)
+                t_logits_pos = self.teacher_proto_head(z_t_pos)
+
+            loss = (
+                self.dino_loss(s_logits_anc, t_logits_pos)
+                + self.dino_loss(s_logits_pos, t_logits_anc)
+            ) / 2
+            self.log("train/loss", loss, on_step=True, on_epoch=False, sync_dist=True)
+
+            if self.cfg.encoder.sem is not None:
+                self.sem_usage_ema.update(
+                    sem_out["usage_count"], batch_size=anchor_ids.shape[0]
+                )
+
+            # Update centering buffer [K]
+            with torch.no_grad():
+                all_teacher_logits = torch.cat([t_logits_anc, t_logits_pos], dim=0)
+                if self.trainer.world_size > 1:
+                    all_teacher = einx.rearrange(
+                        "w b k -> (w b) k", self.all_gather(all_teacher_logits)
+                    )
+                    batch_center = all_teacher.mean(0)
+                else:
+                    batch_center = all_teacher_logits.mean(0)
+                self.center.mul_(self.cfg.center_momentum).add_(
+                    batch_center * (1 - self.cfg.center_momentum)
+                )
 
         return loss
 
@@ -373,32 +474,63 @@ class DINOMixtureTask(L.LightningModule):
         anchor_mask = (anchor_ids != self.encoder.tokenizer.pad_token_id).long()
         positive_mask = (positive_ids != self.encoder.tokenizer.pad_token_id).long()
 
-        temps = [1e-4, None] if self.cfg.encoder.sem is not None else [None]
-        labels = ["hard", "soft"] if self.cfg.encoder.sem is not None else ["soft"]
+        if self.cfg.dino_on_sem:
+            # SEM-DINO validation: sem_logits are temperature-independent, so one pass suffices.
+            # We still use two temps for entropy logging (probs depend on temp).
+            temps = [1e-4, None] if self.cfg.encoder.sem is not None else [None]
+            labels = ["hard", "soft"] if self.cfg.encoder.sem is not None else ["soft"]
 
-        for sem_temp, label in zip(temps, labels):
-            z_student, sem_out = self.encoder(
-                input_ids=anchor_ids, attention_mask=anchor_mask, temp=sem_temp
-            )
-            student_logits = self.proto_head(z_student)
-
-            with torch.no_grad():
-                z_teacher, _ = self.teacher_encoder(
-                    input_ids=positive_ids, attention_mask=positive_mask, temp=sem_temp
+            for sem_temp, label in zip(temps, labels):
+                z_student, sem_out = self.encoder(
+                    input_ids=anchor_ids, attention_mask=anchor_mask,
+                    temp=sem_temp, return_sem_logits=True,
                 )
-                teacher_logits = self.teacher_proto_head(z_teacher)
+                with torch.no_grad():
+                    _, teacher_sem_out = self.teacher_encoder(
+                        input_ids=positive_ids, attention_mask=positive_mask,
+                        temp=sem_temp, return_sem_logits=True,
+                    )
 
-            if self.cfg.encoder.sem is not None and "probs" in sem_out:
-                ent, m_ent = sem_entropy(sem_out["probs"])
-                self.log("val/sem_entropy", ent.item(), on_epoch=True, sync_dist=True)
+                if self.cfg.encoder.sem is not None and "probs" in sem_out:
+                    ent, m_ent = sem_entropy(sem_out["probs"])
+                    self.log("val/sem_entropy", ent.item(), on_epoch=True, sync_dist=True)
+                    self.log(
+                        "val/sem_marginal_entropy", m_ent.item(), on_epoch=True, sync_dist=True
+                    )
+
+                # sem_logits are pre-softmax and don't depend on sem_temp, so
+                # val/loss_hard and val/loss_soft will be equal — log both for consistency.
+                loss = self.sem_dino_loss(sem_out["sem_logits"], teacher_sem_out["sem_logits"])
                 self.log(
-                    "val/sem_marginal_entropy", m_ent.item(), on_epoch=True, sync_dist=True
+                    f"val/loss_{label}", loss, on_step=False, on_epoch=True, sync_dist=True
                 )
+        else:
+            temps = [1e-4, None] if self.cfg.encoder.sem is not None else [None]
+            labels = ["hard", "soft"] if self.cfg.encoder.sem is not None else ["soft"]
 
-            loss = self.dino_loss(student_logits, teacher_logits)
-            self.log(
-                f"val/loss_{label}", loss, on_step=False, on_epoch=True, sync_dist=True
-            )
+            for sem_temp, label in zip(temps, labels):
+                z_student, sem_out = self.encoder(
+                    input_ids=anchor_ids, attention_mask=anchor_mask, temp=sem_temp
+                )
+                student_logits = self.proto_head(z_student)
+
+                with torch.no_grad():
+                    z_teacher, _ = self.teacher_encoder(
+                        input_ids=positive_ids, attention_mask=positive_mask, temp=sem_temp
+                    )
+                    teacher_logits = self.teacher_proto_head(z_teacher)
+
+                if self.cfg.encoder.sem is not None and "probs" in sem_out:
+                    ent, m_ent = sem_entropy(sem_out["probs"])
+                    self.log("val/sem_entropy", ent.item(), on_epoch=True, sync_dist=True)
+                    self.log(
+                        "val/sem_marginal_entropy", m_ent.item(), on_epoch=True, sync_dist=True
+                    )
+
+                loss = self.dino_loss(student_logits, teacher_logits)
+                self.log(
+                    f"val/loss_{label}", loss, on_step=False, on_epoch=True, sync_dist=True
+                )
 
         if (batch_idx == 0) and (rank_zero_only.rank == 0):
             if self.cfg.encoder.sem is not None and self.sem_usage_ema.usage is not None:
@@ -418,3 +550,19 @@ class DINOMixtureTask(L.LightningModule):
                     "val/dead_words_per_simplex", dead_words_per_simplex,
                     on_epoch=True, sync_dist=False, rank_zero_only=True,
                 )
+
+            if self.cfg.mteb_tasks:
+                mteb_scores = eval_mteb(
+                    encoder=self.encoder,
+                    tasks=self.cfg.mteb_tasks,
+                    batch_size=self.cfg.mteb_batch_size,
+                    limit=self.cfg.mteb_limit,
+                    device=str(self.device),
+                )
+                by_mode: dict[str, list[float]] = {}
+                for key, score in mteb_scores.items():
+                    mode = key.split("/")[-1]
+                    by_mode.setdefault(mode, []).append(score)
+                for mode, scores in by_mode.items():
+                    self.log(f"mteb/mean/{mode}", sum(scores) / len(scores),
+                             on_epoch=True, sync_dist=False, rank_zero_only=True)

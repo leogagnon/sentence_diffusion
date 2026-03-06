@@ -30,6 +30,8 @@ from tasks.dlc_md import DLCMDTask, DLCMDTaskConfig
 from tasks.ddpm import GaussianDiffusionTask, GaussianDiffusionTaskConfig
 from tasks.dino_mixture import DINOMixtureTask, DINOMixtureTaskConfig
 from tasks.simcse import SimCSETask, SimCSETaskConfig
+from tasks.supervised_simcse import SupervisedSimCSETask, SupervisedSimCSETaskConfig
+from tasks.distill_simcse import DistillSimCSETask, DistillSimCSETaskConfig
 
 logging.set_verbosity_error()
 for datasets_logger_name in [
@@ -75,6 +77,8 @@ class TaskConfig:
     dlc_ddpm: Optional[GaussianDiffusionTaskConfig] = None
     dino_mixture: Optional[DINOMixtureTaskConfig] = None
     simcse: Optional[SimCSETaskConfig] = None
+    supervised_simcse: Optional[SupervisedSimCSETaskConfig] = None
+    distill_simcse: Optional[DistillSimCSETaskConfig] = None
 
 
 @dataclass
@@ -236,6 +240,12 @@ def main(cfg: Optional[TrainConfig] = None, run_id: Optional[str] = None):
     elif cfg.task.simcse != None:
         task = SimCSETask(cfg.task.simcse)
         cfg.task.simcse = task.cfg
+    elif cfg.task.supervised_simcse != None:
+        task = SupervisedSimCSETask(cfg.task.supervised_simcse)
+        cfg.task.supervised_simcse = task.cfg
+    elif cfg.task.distill_simcse != None:
+        task = DistillSimCSETask(cfg.task.distill_simcse)
+        cfg.task.distill_simcse = task.cfg
     else:
         raise ValueError("No task specified in config!")
 
@@ -296,6 +306,7 @@ def main(cfg: Optional[TrainConfig] = None, run_id: Optional[str] = None):
         num_nodes=num_nodes,
         use_distributed_sampler=False
     )
+    trainer.validate(task)
     trainer.fit(
         model=task,
         ckpt_path=(

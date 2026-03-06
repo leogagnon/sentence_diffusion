@@ -76,6 +76,7 @@ class SimCSETask(L.LightningModule):
     def _encode(self, input_ids, attention_mask, **kwargs):
         return self.encoder(input_ids=input_ids, attention_mask=attention_mask, **kwargs)
 
+    @torch.autocast(device_type="cuda", enabled=False)
     def _compute_loss(self, z1, z2):
         embeddings = torch.cat([z1, z2], dim=0)
         labels = torch.arange(z1.size(0), device=z1.device, dtype=torch.long).repeat(2)
@@ -218,5 +219,5 @@ class SimCSETask(L.LightningModule):
                     mode = key.split("/")[-1]
                     by_mode.setdefault(mode, []).append(score)
                 for mode, scores in by_mode.items():
-                    self.log(f"mteb/mean/{mode}", sum(scores) / len(scores),
+                    self.log(f"val/mteb_{mode}", sum(scores) / len(scores),
                              on_epoch=True, sync_dist=False, rank_zero_only=True)

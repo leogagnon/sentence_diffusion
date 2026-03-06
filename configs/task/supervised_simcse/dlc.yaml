@@ -1,0 +1,26 @@
+batch_size: 128
+lr: 1e-5
+lr_warmup_steps: 2000
+lr_sem: 1e-3
+
+encoder:
+  model_name: FacebookAI/roberta-large
+  train_backbone: true
+  latent_length: 1
+  latent_dim: 1024
+  mlp_proj: true
+  sem:
+    _target_: model.encoder.SEMHead
+    L: 2048
+    V: 16
+    temp: 1.0
+    use_ste: false
+
+max_length: 256
+loss_temp: 0.05
+sem_noise: 0.00
+
+mteb_tasks:
+  - STSBenchmark
+
+name: supervised_simcse/dlc

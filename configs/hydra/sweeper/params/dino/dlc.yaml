@@ -1,8 +1,8 @@
-task/dino_mixture: sem
+task/dino_mixture: sem, sem_1
 model_checkpoint: base
 
 max_steps: 20000
-task.dino_mixture.encoder.sem.L: 512
+task.dino_mixture.encoder.sem.L: 2048, 128
 task.dino_mixture.sem_noise: 0.0
 task.dino_mixture.declutr_only: true, false
 
@@ -10,5 +10,5 @@ limit_val_batches: 4
 val_check_interval: 512
 strategy: ddp_find_unused_parameters_true
 
-sweep_id: dino_mixture/dlc_new_mixed
+sweep_id: dino_mixture/dlc_plz
 

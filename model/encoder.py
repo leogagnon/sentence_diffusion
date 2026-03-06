@@ -17,6 +17,8 @@ class SEMHeadConfig:
     temp: float
     input_dim: Optional[int] = None
     new_norm: bool = False
+    use_ste: bool = False
+    disable_softmax: bool = False
 
 
 class SEMHead(nn.Module):
@@ -50,16 +52,25 @@ class SEMHead(nn.Module):
         return_count=False,
         noise: float = 0.0,
         temp: Optional[float] = None,
+        return_logits: bool = False,
     ) -> dict:
 
         # Proj in DLC space and normalize
         x = self.proj_in(x)
         x = einx.rearrange("b (l v) -> b l v", x, l=self.cfg.L, v=self.cfg.V)
-        x = self.norm(x)
+        x = self.norm(x)  # [B, L, V] — post-LayerNorm, pre-softmax logits
 
         # Compute Softmax (with temperature)
         temp = self.cfg.temp if temp is None else temp
-        probs = torch.softmax(x / temp, dim=-1)
+        if self.cfg.use_ste and self.training:
+            probs_soft = torch.softmax(x / temp, dim=-1)
+            probs_hard = F.one_hot(probs_soft.argmax(-1), num_classes=self.cfg.V).float()
+            probs = probs_hard + probs_soft - probs_soft.detach()
+        else:
+            if self.cfg.disable_softmax:
+                probs = x
+            else:
+                probs = torch.softmax(x / temp, dim=-1)
 
         # Maybe add noise
         z = einx.rearrange("b l v -> b (l v)", probs)
@@ -68,6 +79,8 @@ class SEMHead(nn.Module):
 
         # Return stuff
         out_dict = {"z": z, "probs": probs}
+        if return_logits:
+            out_dict["sem_logits"] = x  # [B, L, V], for DINO loss on SEM simplices
         if return_dlc:
             out_dict.update({"dlc": self._encode(probs)})
         if return_count:
@@ -358,6 +371,7 @@ class EncoderModel(nn.Module):
         noise: float = 0.0,
         temp: Optional[float] = None,
         return_logits: bool = False,
+        return_sem_logits: bool = False,
         only_backbone: bool = False,
         skip_out_proj: bool = False,
     ):
@@ -396,6 +410,7 @@ class EncoderModel(nn.Module):
                     return_count=return_count,
                     noise=noise,
                     temp=temp,
+                    return_logits=return_sem_logits,
                 )
             )
             sem_z = out.pop("z")

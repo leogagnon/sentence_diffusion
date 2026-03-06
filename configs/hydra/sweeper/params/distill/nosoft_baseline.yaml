@@ -1,0 +1,17 @@
+task/distill_simcse: sem
+model_checkpoint: base
+
+task.distill_simcse.batch_size: 128
+task.distill_simcse.sem_noise: 0.0
+task.distill_simcse.encoder.sem.L: 2048, 128
+task.distill_simcse.encoder.sem.disable_softmax: true
+task.distill_simcse.encoder.sem.use_ste: true, false
+
+max_steps: 20000
+strategy: ddp_find_unused_parameters_true
+
+limit_val_batches: 4
+val_check_interval: 512
+
+sweep_id: distill_simcse/nosoft_baseline
+

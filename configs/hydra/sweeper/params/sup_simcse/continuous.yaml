@@ -1,0 +1,14 @@
+task/supervised_simcse: continuous
+model_checkpoint: base
+
+task.supervised_simcse.batch_size: 128
+task.supervised_simcse.loss_temp: 0.05
+
+max_steps: 20000
+
+limit_val_batches: 4
+val_check_interval: 512
+strategy: ddp_find_unused_parameters_true
+
+sweep_id: sup_simcse/continuous_clean_1
+

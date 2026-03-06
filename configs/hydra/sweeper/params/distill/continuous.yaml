@@ -1,0 +1,13 @@
+task/distill_simcse: continuous
+model_checkpoint: base
+
+task.distill_simcse.batch_size: 128
+
+max_steps: 20000
+
+limit_val_batches: 4
+val_check_interval: 512
+strategy: ddp_find_unused_parameters_true
+
+sweep_id: distill_simcse/continuous_clean
+

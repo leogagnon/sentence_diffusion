@@ -1,0 +1,21 @@
+batch_size: 128
+lr: 5e-5
+lr_warmup_steps: 2000
+
+teacher_model_name: jinaai/jina-embeddings-v5-text-small-text-matching
+teacher_max_length: 256
+
+encoder:
+  model_name: FacebookAI/roberta-large
+  train_backbone: true
+  latent_length: 1
+  latent_dim: 1024
+  mlp_proj: false
+
+max_length: 256
+sem_noise: 0.0
+
+mteb_tasks:
+  - STSBenchmark
+
+name: distill_simcse/continuous

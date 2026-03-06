@@ -10,6 +10,8 @@ defaults:
   - task/dino_mixture: null
   - task/dlc_ddpm: null
   - task/simcse: null
+  - task/supervised_simcse: null
+  - task/distill_simcse: null
   - model_checkpoint: null
   - early_stopping: null
   - hydra/sweeper/params : null

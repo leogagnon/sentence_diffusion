@@ -1,0 +1,17 @@
+task/supervised_simcse: dlc
+model_checkpoint: base
+
+task.supervised_simcse.batch_size: 128
+task.supervised_simcse.sem_noise: 0.0, 0.2
+task.supervised_simcse.encoder.sem.L: 2048
+task.supervised_simcse.encoder.train_backbone: true, false
+task.supervised_simcse.encoder.sem.use_ste: true, false
+
+max_steps: 5000
+strategy: ddp_find_unused_parameters_true
+
+limit_val_batches: 4
+val_check_interval: 512
+
+sweep_id: sup_simcse/dlc_clean_2
+
