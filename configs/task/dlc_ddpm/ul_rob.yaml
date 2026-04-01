@@ -1,0 +1,66 @@
+lr: 5e-5
+encoder_lr: 5e-6
+lr_warmup_steps: 2000
+batch_size: 32
+
+dataset:
+  name: fineweb
+  val_size: 16384
+  seed: 42
+
+encoder:
+  model_name: SONAR
+  train_backbone: true
+  latent_length: 1
+  mlp_proj: false
+  no_out_proj: true
+
+decoder:
+  name: gpt2-medium
+  cross_attention: false
+  attn_implem: sdpa
+
+model:
+  n_layers: 12
+  n_heads: 12
+  n_embd: 768
+  seq_len: 64
+  dropout: 0.05
+  cond_modulation: false
+
+eval_gen_ppl: true
+
+prefix_length: 16
+suffix_length: 64
+context_length: 112
+
+use_ema: false
+latent_noise: true
+soft_thought_noise_cond: false
+soft_prompt_len: 16
+loss: l2
+sampling_timesteps: 100
+train_schedule: cosine
+diffusion_objective: pred_v
+schedule_scale: 1.0
+sampler: ddpm
+normalize_latent: false
+encoder_post_layernorm: false
+latent_conditioning_dropout_prob: 0.0
+latent_feature_dropout_prob: 0.0
+encoder_post_l2norm: false
+num_latent_for_precomputed_stats: 30000
+diffusion_beta_warmup_steps: 5000
+finetune_encoder: true
+
+# UL (arXiv:2602.17270) links encoder output noise to the prior minimum noise.
+# In this codebase this is controlled by fixing the maximum prior logSNR at t=0.
+prior_logsnr_max: 4.0
+prior_t_min: 0.0
+prior_enforce_t_min: true
+
+# UL reports a baseline loss factor of ~1.5; mapped here to prior-vs-decoder balance.
+diffusion_beta: 1.5
+suffix_loss_weight: 1.0
+
+name: ddpm_ul_2602_like

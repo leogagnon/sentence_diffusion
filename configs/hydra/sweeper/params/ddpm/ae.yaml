@@ -2,7 +2,8 @@ task/dlc_ddpm: ae
 model_checkpoint: base
 
 task.dlc_ddpm.pretrained_ae_id: uw5t6rkg, p2d8csdo
-task.dlc_ddpm.prompt_generator_noise: true, false
+task.dlc_ddpm.latent_noise: true, false
+task.dlc_ddpm.soft_thought_noise_cond: true, false
 
 max_steps: 20000
 

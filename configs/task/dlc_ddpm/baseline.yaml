@@ -1,6 +1,6 @@
-lr: 1e-4
+lr: 5e-5
 lr_warmup_steps: 2000
-batch_size: 64
+batch_size: 32
 
 dataset:
   name: fineweb
@@ -19,7 +19,8 @@ suffix_length: 64
 
 soft_prompt_len: 0
 use_ema: false
-prompt_generator_noise: false
+latent_noise: false
+soft_thought_noise_cond: false
 loss: l2
 sampling_timesteps: 100
 train_schedule: cosine

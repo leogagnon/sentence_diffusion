@@ -179,6 +179,9 @@ class SimCSETask(L.LightningModule):
         temps = [1e-4, None] if self.cfg.encoder.sem is not None else [None]
         names = ["hard", "soft"] if self.cfg.encoder.sem is not None else ["soft"]
 
+        _hard_codes = None
+        _soft_z = None
+
         for idx, (sem_temp, label) in enumerate(zip(temps, names)):
             z1, sem_out = self._encode(
                 input_ids,
@@ -192,16 +195,31 @@ class SimCSETask(L.LightningModule):
                 ent, m_ent = sem_entropy(sem_out["probs"])
                 self.log("val/sem_entropy", ent.item(), on_epoch=True, sync_dist=True)
                 self.log("val/sem_marginal_entropy", m_ent.item(), on_epoch=True, sync_dist=True)
+                if idx == 0 and isinstance(sem_out["probs"], torch.Tensor):
+                    _hard_codes = sem_out["probs"].argmax(-1)  # (B, L)
+                    if self.trainer.num_devices > 1:
+                        _hard_codes = einx.rearrange("w b l -> (w b) l", self.all_gather(_hard_codes))
 
             if self.trainer.num_devices > 1:
                 z1 = einx.rearrange("w b d -> (w b) d", self.all_gather(z1, sync_grads=False))
                 z2 = einx.rearrange("w b d -> (w b) d", self.all_gather(z2, sync_grads=False))
 
+            if sem_temp is None:
+                _soft_z = z1.float()
+
             loss = self._compute_loss(z1, z2)
             self.log(f"val/loss_{label}", loss, on_step=False, on_epoch=True, sync_dist=True)
 
+        if _hard_codes is not None and _soft_z is not None:
+            hamming = (_hard_codes.unsqueeze(0) != _hard_codes.unsqueeze(1)).float().mean(-1)  # (B, B)
+            cos_sim = F.normalize(_soft_z, dim=-1) @ F.normalize(_soft_z, dim=-1).T  # (B, B)
+            B = _hard_codes.shape[0]
+            mask = torch.triu(torch.ones(B, B, device=_hard_codes.device, dtype=torch.bool), diagonal=1)
+            corr = torch.corrcoef(torch.stack([hamming[mask], 1.0 - cos_sim[mask]]))[0, 1]
+            self.log("val/hamming_cos_corr", corr, on_step=False, on_epoch=True, sync_dist=True)
+
         if (batch_idx == 0) and (rank_zero_only.rank == 0):
-            if self.cfg.encoder.sem is not None:
+            if (self.cfg.encoder.sem is not None) and (self.sem_usage_ema.usage is not None):
                 is_dead = self.sem_usage_ema.usage < 1e-4
                 self.log("val/dead_words_ratio", torch.sum(is_dead).item() / is_dead.numel(),
                          on_epoch=True, sync_dist=False, rank_zero_only=True)
@@ -218,6 +236,8 @@ class SimCSETask(L.LightningModule):
                 for key, score in mteb_scores.items():
                     mode = key.split("/")[-1]
                     by_mode.setdefault(mode, []).append(score)
+                    self.log(f"val/mteb/{key}", score,
+                             on_epoch=True, sync_dist=False, rank_zero_only=True)
                 for mode, scores in by_mode.items():
                     self.log(f"val/mteb_{mode}", sum(scores) / len(scores),
                              on_epoch=True, sync_dist=False, rank_zero_only=True)

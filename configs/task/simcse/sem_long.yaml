@@ -1,5 +1,5 @@
 batch_size: 64
-lr: 5e-5
+lr: 2e-5
 lr_warmup_steps: 2000
 
 encoder:
@@ -14,17 +14,19 @@ encoder:
     V: 16
     temp: 1.0
     new_norm: true
+    use_ste: false
+    disable_softmax: false
 
 dataset:
   name: fineweb
   val_size: 16384
   seed: 42
 
-dropout: 0.15
+dropout: 0.1
 min_span_length: 32
 max_span_length: 384
 loss_temp: 0.05
-sem_noise: 0.05
+sem_noise: 0.0
 
 mteb_tasks:
   - STSBenchmark

@@ -1,0 +1,40 @@
+lr: 1e-4
+lr_warmup_steps: 2000
+batch_size: 64
+
+dataset:
+  name: fineweb
+  val_size: 16384
+  seed: 42
+
+encoder:
+  model_name: SONAR
+  train_backbone: true
+  latent_length: 1
+  mlp_proj: false
+  no_out_proj: true
+
+decoder:
+  name: gpt2-medium
+  cross_attention: false
+  attn_implem: sdpa
+
+prefix_length: 16
+suffix_length: 128
+context_length: 48
+
+# Noise: prior_logsnr_max defines t_min (match stage-2 value)
+# noise_schedule=true samples t ~ Uniform[t_min, 1.0] each step
+prior_logsnr_max: 5.0
+noise_schedule: true
+train_schedule: cosine
+schedule_scale: 1.0
+finetune_encoder: true
+encoder_lr: 1e-5
+
+soft_prompt_len: 16
+noise_cond: true  # condition soft_thought_enc on noise level (useful with noise_schedule=true)
+latent_feature_dropout_prob: 0.1
+latent_conditioning_dropout_prob: 0.3
+
+name: ae/ul

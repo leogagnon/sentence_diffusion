@@ -1,0 +1,15 @@
+task/supervised_simcse: dlc
+model_checkpoint: base
+
+task.supervised_simcse.batch_size: 128
+task.supervised_simcse.loss_temp: 0.05
+task.supervised_simcse.encoder.sem.disable_softmax: true
+
+max_steps: 5000
+
+limit_val_batches: 4
+val_check_interval: 512
+strategy: ddp_find_unused_parameters_true
+
+sweep_id: sup_simcse/nosoft
+

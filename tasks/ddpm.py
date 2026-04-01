@@ -34,10 +34,13 @@ class GaussianDiffusionTaskConfig:
     lr: float
     lr_warmup_steps: int
     decoder: DecoderConfig
+    encoder_lr: Optional[float] = None
     encoder: Optional[EncoderConfig] = None
     model: Optional[DiTContinuousConfig] = None
     use_ema: bool = False
     diffusion_beta: float = 5.0
+    diffusion_beta_warmup_steps: Optional[int] = None
+    suffix_loss_weight: float = 1.0
     eval_gen_ppl: bool = True
     soft_prompt_len: int = 16
 
@@ -64,8 +67,20 @@ class GaussianDiffusionTaskConfig:
     diffusion_objective: str = "pred_v"
     schedule_scale: float = 1.0
     sampler: str = "ddpm"
+    prior_t_min: float = 0.0
+    prior_enforce_t_min: bool = True
+    prior_logsnr_max: Optional[float] = 5.0
     normalize_latent: bool = False
-    prompt_generator_noise: bool = False
+    encoder_post_layernorm: bool = False
+    encoder_post_l2norm: bool = False
+    encoder_post_l2norm_eps: float = 1e-8
+    latent_feature_dropout_prob: float = 0.1
+    latent_conditioning_dropout_prob: float = 0.0
+    latent_noise: bool = False
+    soft_thought_noise_cond: bool = False
+    finetune_encoder: bool = False
+    encoder_adapter: bool = True
+    encoder_adapter_hidden_dim: Optional[int] = None
     num_latent_for_precomputed_stats: int = 30000
 
     name: Optional[str] = None
@@ -124,7 +139,7 @@ class GaussianDiffusionTask(L.LightningModule):
             cfg.suffix_length = task.cfg.suffix_length
             cfg.context_length = task.cfg.context_length
 
-            self.encoder = task.encoder.eval().requires_grad_(False)
+            self.encoder = task.encoder
             self.encoder.out_proj = nn.Identity()
 
         elif cfg.pretrained_declutr_id is not None:
@@ -148,7 +163,7 @@ class GaussianDiffusionTask(L.LightningModule):
             assert cfg.context_length is not None
 
             # Init encoder (and remove out proj; no longer needed)
-            self.encoder = task.encoder.eval().requires_grad_(False)
+            self.encoder = task.encoder
             self.encoder.out_proj = nn.Identity()
 
         elif cfg.pretrained_dino_id is not None:
@@ -171,7 +186,7 @@ class GaussianDiffusionTask(L.LightningModule):
             assert cfg.suffix_length is not None
             assert cfg.context_length is not None
 
-            self.encoder = task.encoder.eval().requires_grad_(False)
+            self.encoder = task.encoder
             self.encoder.out_proj = nn.Identity()
 
         elif cfg.encoder is not None:
@@ -180,13 +195,42 @@ class GaussianDiffusionTask(L.LightningModule):
             assert cfg.suffix_length is not None
             assert cfg.context_length is not None
 
-            self.encoder = EncoderModel(cfg.encoder).eval().requires_grad_(False)
+            self.encoder = EncoderModel(cfg.encoder)
 
         else:
             assert cfg.prefix_length is not None
             assert cfg.suffix_length is not None
             cfg.context_length = 0
             self.encoder = None
+
+        if self.encoder is not None:
+            if cfg.finetune_encoder:
+                self.encoder.train().requires_grad_(True)
+            else:
+                self.encoder.eval().requires_grad_(False)
+
+        self.encoder_adapter = None
+        if self.encoder is not None and cfg.encoder_adapter and not cfg.finetune_encoder:
+            hidden_dim = (
+                cfg.encoder_adapter_hidden_dim
+                if cfg.encoder_adapter_hidden_dim is not None
+                else self.encoder.backbone_dim * 4
+            )
+            self.encoder_adapter = nn.Sequential(
+                nn.Linear(self.encoder.backbone_dim, hidden_dim),
+                nn.SiLU(),
+                nn.Linear(hidden_dim, self.encoder.backbone_dim),
+            )
+            # Residual adapter starts as an exact identity mapping.
+            nn.init.zeros_(self.encoder_adapter[-1].weight)
+            nn.init.zeros_(self.encoder_adapter[-1].bias)
+
+        self.encoder_post_layernorm = None
+        if self.encoder is not None and cfg.encoder_post_layernorm:
+            self.encoder_post_layernorm = nn.LayerNorm(
+                self.encoder.backbone_dim,
+                elementwise_affine=False,
+            )
 
         # Initialize Generative PPL eval model
         if cfg.eval_gen_ppl:
@@ -213,6 +257,7 @@ class GaussianDiffusionTask(L.LightningModule):
 
         # Init decoder (with cross attention dim = encoder latent dim)
         self.decoder = DecoderModel(cfg.decoder).train().requires_grad_(True)
+        self.null_soft_thought = None
 
         # Init DiT (with seq conditional dim = decoder latent dim; latent dim = encoder latent dim)
         if cfg.model is not None:
@@ -263,20 +308,26 @@ class GaussianDiffusionTask(L.LightningModule):
                 ff_glu=True,
                 ff_swish=True,
                 # Noise conditioning stuff
-                use_adaptive_rmsnorm=cfg.prompt_generator_noise,
-                use_adaptive_layerscale=cfg.prompt_generator_noise,
+                use_adaptive_rmsnorm=cfg.soft_thought_noise_cond,
+                use_adaptive_layerscale=cfg.soft_thought_noise_cond,
                 dim_condition=(
-                    self.decoder.latent_dim if cfg.prompt_generator_noise else None
+                    self.decoder.latent_dim if cfg.soft_thought_noise_cond else None
                 ),
                 adaptive_condition_mlp_expansion=(
-                    4 if cfg.prompt_generator_noise else None
+                    4 if cfg.soft_thought_noise_cond else None
                 ),
-                adaptive_condition_mlp=cfg.prompt_generator_noise,
+                adaptive_condition_mlp=cfg.soft_thought_noise_cond,
             )
-            if cfg.prompt_generator_noise:
+            if cfg.soft_thought_noise_cond:
                 self.soft_thought_noise_emb = ScaledSinusoidalEmbedding(
                     self.decoder.latent_dim
                 )
+
+            if cfg.soft_prompt_len > 0:
+                self.null_soft_thought = nn.Parameter(
+                    torch.zeros(1, cfg.soft_prompt_len, self.decoder.latent_dim)
+                )
+                nn.init.normal_(self.null_soft_thought, std=0.02)
         else:
             self.model = None
 
@@ -296,7 +347,7 @@ class GaussianDiffusionTask(L.LightningModule):
     def train(self, mode: bool = True):
         super().train(mode)
         # Make sure encoder is always in eval mode
-        if self.encoder is not None:
+        if self.encoder is not None and not self.cfg.finetune_encoder:
             self.encoder.eval()
         if self.cfg.use_ema:
             self.ema_model[0].eval()
@@ -320,36 +371,143 @@ class GaussianDiffusionTask(L.LightningModule):
 
         return x_start * (self.latent_scale.clamp(min=eps)) + self.latent_mean
 
-    def configure_optimizers(self):
-        if self.model is not None:
-            trainable_params = chain(
-                self.model.named_parameters(), self.decoder.named_parameters()
+    def _get_prior_alpha0(self, batch_size, device, dtype=None):
+        if self.cfg.prior_logsnr_max is not None:
+            alpha0 = torch.sigmoid(
+                torch.tensor(self.cfg.prior_logsnr_max, device=device, dtype=torch.float32)
+            )
+            alpha0 = alpha0.expand(batch_size)
+        else:
+            t0 = torch.full(
+                (batch_size,),
+                self._get_effective_prior_t_min(),
+                device=device,
+                dtype=torch.float32,
+            )
+            alpha0 = self.train_schedule(t0)
+
+        if dtype is not None:
+            alpha0 = alpha0.to(dtype)
+
+        return alpha0
+
+    def _get_effective_prior_t_min(self):
+        if not self.cfg.prior_enforce_t_min:
+            return 0.0
+
+        base_t_min = float(self.cfg.prior_t_min)
+        if self.cfg.prior_logsnr_max is None:
+            return base_t_min
+
+        target_alpha = torch.sigmoid(torch.tensor(self.cfg.prior_logsnr_max)).item()
+        lo, hi = 0.0, 1.0
+        for _ in range(24):
+            mid = 0.5 * (lo + hi)
+            alpha_mid = self.train_schedule(torch.tensor([mid])).item()
+            if alpha_mid >= target_alpha:
+                lo = mid
+            else:
+                hi = mid
+
+        return max(base_t_min, 0.5 * (lo + hi))
+
+    def _get_current_diffusion_beta(self) -> float:
+        base_beta = float(self.cfg.diffusion_beta)
+        if (not self.training) or self.model is None:
+            return base_beta
+
+        warmup_steps = self.cfg.diffusion_beta_warmup_steps
+        if warmup_steps is None:
+            warmup_steps = self.cfg.lr_warmup_steps
+
+        if warmup_steps is None or warmup_steps <= 0:
+            return base_beta
+
+        warmup_ratio = min(1.0, float(self.global_step) / float(warmup_steps))
+        return base_beta * warmup_ratio
+
+    def _encode_latent(self, batch):
+        if self.cfg.finetune_encoder:
+            z = self.encoder(
+                batch["input_ids_enc"],
+                attention_mask=batch["attention_mask_enc"],
+                only_backbone=True,
             )
         else:
-            trainable_params = self.decoder.named_parameters()
+            with torch.no_grad():
+                z = self.encoder(
+                    batch["input_ids_enc"],
+                    attention_mask=batch["attention_mask_enc"],
+                    only_backbone=True,
+                )
 
-        trainable_params = list(trainable_params)
+        if self.encoder_post_layernorm is not None:
+            z = self.encoder_post_layernorm(z)
 
+        if self.cfg.encoder_post_l2norm:
+            z = torch.nn.functional.normalize(
+                z,
+                p=2,
+                dim=-1,
+                eps=self.cfg.encoder_post_l2norm_eps,
+            )
+
+        if self.cfg.normalize_latent:
+            z = self.normalize_latent(z)
+
+        if self.encoder_adapter is not None:
+            z = z + self.encoder_adapter(z)
+
+        return z
+
+    def configure_optimizers(self):
+        base_lr = self.cfg.lr
+        encoder_lr = self.cfg.encoder_lr if self.cfg.encoder_lr is not None else base_lr
         no_decay = ["bias", "norm"]
-        optimizer_grouped_parameters = [
-            {
-                "params": [
-                    p
-                    for n, p in trainable_params
-                    if not any(nd in n.lower() for nd in no_decay)
-                ],
-                "weight_decay": 0.01,
-            },
-            {
-                "params": [
-                    p
-                    for n, p in trainable_params
-                    if any(nd in n.lower() for nd in no_decay)
-                ],
-                "weight_decay": 0.0,
-            },
-        ]
-        optimizer = torch.optim.AdamW(optimizer_grouped_parameters, lr=self.cfg.lr)
+        optimizer_grouped_parameters = []
+
+        def add_param_groups(named_params, group_lr):
+            named_params = [(n, p) for n, p in named_params if p.requires_grad]
+            if len(named_params) == 0:
+                return
+
+            decay_params = [
+                p
+                for n, p in named_params
+                if not any(nd in n.lower() for nd in no_decay)
+            ]
+            no_decay_params = [
+                p for n, p in named_params if any(nd in n.lower() for nd in no_decay)
+            ]
+
+            if len(decay_params) > 0:
+                optimizer_grouped_parameters.append(
+                    {
+                        "params": decay_params,
+                        "weight_decay": 0.01,
+                        "lr": group_lr,
+                    }
+                )
+            if len(no_decay_params) > 0:
+                optimizer_grouped_parameters.append(
+                    {
+                        "params": no_decay_params,
+                        "weight_decay": 0.0,
+                        "lr": group_lr,
+                    }
+                )
+
+        if self.model is not None:
+            add_param_groups(self.model.named_parameters(), base_lr)
+        add_param_groups(self.decoder.named_parameters(), base_lr)
+
+        if self.encoder_adapter is not None:
+            add_param_groups(self.encoder_adapter.named_parameters(), base_lr)
+
+        if self.cfg.finetune_encoder and self.encoder is not None:
+            add_param_groups(self.encoder.named_parameters(), encoder_lr)
+
+        optimizer = torch.optim.AdamW(optimizer_grouped_parameters, lr=base_lr)
         if self.cfg.lr_warmup_steps > 0:
             scheduler = get_cosine_schedule_with_warmup(
                 optimizer,
@@ -457,16 +615,69 @@ class GaussianDiffusionTask(L.LightningModule):
         input_ids = batch["input_ids_dec"]
         input_embeds = self.decoder.backbone.get_input_embeddings()(input_ids)
 
+        # Feature-level dropout directly on latent conditioning (before soft prompt projection).
+        if self.training and self.cfg.latent_feature_dropout_prob > 0:
+            p = self.cfg.latent_feature_dropout_prob
+            if not (0.0 <= p <= 1.0):
+                raise ValueError(f"latent_feature_dropout_prob must be in [0, 1], got {p}")
+            if z.ndim < 2:
+                raise ValueError(f"Expected latent tensor with ndim >= 2, got shape {tuple(z.shape)}")
+            mask_shape = (z.shape[0], *([1] * (z.ndim - 2)), z.shape[-1])
+            feature_keep_mask = (torch.rand(mask_shape, device=z.device) >= p).to(z.dtype)
+            z = z * feature_keep_mask
+
         # Compute noise embedding
-        if alpha is not None:
-            noise_embd = self.soft_thought_noise_emb(alpha[None] * 1000)
-            noise_embd = rearrange(noise_embd, "b d -> b 1 d")
+        if alpha is not None and self.cfg.soft_thought_noise_cond:
+            if alpha.ndim > 1:
+                alpha = alpha.view(alpha.shape[0], -1)[:, 0]
+            noise_input = rearrange(alpha * 1000, "b -> b 1")
+            noise_embd = self.soft_thought_noise_emb(noise_input)
+            if noise_embd.ndim == 2:
+                noise_embd = rearrange(noise_embd, "b d -> b 1 d")
+            elif noise_embd.ndim != 3:
+                raise ValueError(
+                    f"Unexpected noise embedding shape: {tuple(noise_embd.shape)}"
+                )
         else:
             noise_embd = None
+
+        # soft_thought_proj expects [B, D] latents.
+        if z.ndim == 3 and z.shape[1] == 1:
+            z = z[:, 0]
+        elif z.ndim != 2:
+            raise ValueError(
+                f"Expected latent shape [B, D] or [B, 1, D] before soft thought projection, got {tuple(z.shape)}"
+            )
 
         # Compute soft thoughts
         soft_thought = self.soft_thought_proj(z).to(input_embeds.dtype)
         soft_thought = self.soft_thought_enc(soft_thought, condition=noise_embd)
+
+        # Classifier-free style dropout on latent conditioning to discourage brittle reliance.
+        if self.training and self.cfg.latent_conditioning_dropout_prob > 0:
+            p = self.cfg.latent_conditioning_dropout_prob
+            if not (0.0 <= p <= 1.0):
+                raise ValueError(
+                    f"latent_conditioning_dropout_prob must be in [0, 1], got {p}"
+                )
+            dropout_mask = (
+                torch.rand((soft_thought.shape[0],), device=soft_thought.device) < p
+            )
+            if dropout_mask.any():
+                null_soft_thought = (
+                    repeat(
+                        self.null_soft_thought,
+                        "1 l d -> b l d",
+                        b=soft_thought.shape[0],
+                    ).to(soft_thought.dtype)
+                    if self.null_soft_thought is not None
+                    else torch.zeros_like(soft_thought)
+                )
+                soft_thought = torch.where(
+                    rearrange(dropout_mask, "b -> b 1 1"),
+                    null_soft_thought,
+                    soft_thought,
+                )
 
         # Replace the DLC ph tokens with the corresponding soft thoughts
         dlc_ph_mask = batch["info_mask_dec"] == InfoLabel.DLC.value
@@ -479,34 +690,30 @@ class GaussianDiffusionTask(L.LightningModule):
         Compute decoder (suffix) loss and diffusion loss.
 
         Uses self.training to determine:
-          - Training: applies prompt_generator_noise and uses self.model for diffusion loss
+                    - Training: optionally applies latent_noise and uses self.model for diffusion loss
           - Validation: uses alpha=0.95, uses EMA model (if use_ema) for diffusion loss
 
         Returns dict with full_loss, suffix_loss, diffusion_loss (None if no diffusion model).
         """
         if self.encoder is not None:
-            with torch.set_grad_enabled(self.training):
-                z = self.encoder(
-                    batch["input_ids_enc"],
-                    attention_mask=batch["attention_mask_enc"],
-                    only_backbone=True,
-                )
-                if self.cfg.normalize_latent:
-                    z = self.normalize_latent(z)
+            z = self._encode_latent(batch)
 
-            if self.cfg.prompt_generator_noise and self.training:
-                t = torch.zeros((z.size(0),), device=z.device).float().uniform_(0, 1.0)
-                alpha = time_to_alpha(t=t, alpha_schedule=cosine_schedule, scale=3.0)
-                alpha = right_pad_dims_to(z, alpha)
+            if self.cfg.latent_noise and self.training:
+                alpha_1d = self._get_prior_alpha0(
+                    batch_size=z.size(0), device=z.device, dtype=z.dtype
+                )
+                alpha = right_pad_dims_to(z, alpha_1d)
                 z_noised = alpha.sqrt() * z + (1 - alpha).sqrt() * torch.randn_like(z)
-                input_embeds = self.get_input_embeds(batch, z_noised, alpha)
+                input_embeds = self.get_input_embeds(batch, z_noised, alpha_1d)
             else:
                 input_embeds = self.get_input_embeds(
                     batch,
                     z,
                     alpha=(
-                        torch.full((z.size(0), 1), 0.95, device=z.device)
-                        if self.cfg.prompt_generator_noise
+                        self._get_prior_alpha0(
+                            batch_size=z.size(0), device=z.device, dtype=z.dtype
+                        )
+                        if self.cfg.soft_thought_noise_cond
                         else None
                     ),
                 )
@@ -534,6 +741,7 @@ class GaussianDiffusionTask(L.LightningModule):
         # Diffusion loss
         diffusion_loss = None
         if self.model is not None:
+            diffusion_beta = self._get_current_diffusion_beta()
             diffusion_model = self.model if self.training else (
                 self.ema_model[0].module if self.cfg.use_ema else self.model
             )
@@ -544,10 +752,14 @@ class GaussianDiffusionTask(L.LightningModule):
                 schedule=self.train_schedule,
                 diffusion_objective=self.cfg.diffusion_objective,
                 loss_name=self.cfg.loss,
+                t_min=self._get_effective_prior_t_min(),
             )
-            full_loss = suffix_loss + self.cfg.diffusion_beta * diffusion_loss
+            full_loss = (
+                self.cfg.suffix_loss_weight * suffix_loss
+                + diffusion_beta * diffusion_loss
+            )
         else:
-            full_loss = suffix_loss
+            full_loss = self.cfg.suffix_loss_weight * suffix_loss
 
         return {
             "full_loss": full_loss,
@@ -581,20 +793,16 @@ class GaussianDiffusionTask(L.LightningModule):
         val_model = self.ema_model[0].module if self.cfg.use_ema else self.model
 
         # Compute true z and hidden_states (needed for "sample" conditioning and "true" mode)
-        z_true = self.encoder(
-            batch["input_ids_enc"],
-            attention_mask=batch["attention_mask_enc"],
-            only_backbone=True,
-        )
-        if self.cfg.normalize_latent:
-            z_true = self.normalize_latent(z_true)
+        z_true = self._encode_latent(batch)
 
         input_embeds_true = self.get_input_embeds(
             batch,
             z_true,
             alpha=(
-                torch.full((z_true.size(0), 1), 0.95, device=z_true.device)
-                if self.cfg.prompt_generator_noise
+                self._get_prior_alpha0(
+                    batch_size=z_true.size(0), device=z_true.device, dtype=z_true.dtype
+                )
+                if self.cfg.soft_thought_noise_cond
                 else None
             ),
         )
@@ -626,8 +834,10 @@ class GaussianDiffusionTask(L.LightningModule):
             batch,
             z,
             alpha=(
-                torch.full((z.size(0),), 0.95, device=z.device)
-                if self.cfg.prompt_generator_noise
+                self._get_prior_alpha0(
+                    batch_size=z.size(0), device=z.device, dtype=z.dtype
+                )
+                if self.cfg.soft_thought_noise_cond
                 else None
             ),
         )
@@ -652,6 +862,13 @@ class GaussianDiffusionTask(L.LightningModule):
         )
 
         if losses["diffusion_loss"] is not None:
+            self.log(
+                "train/diffusion_beta",
+                self._get_current_diffusion_beta(),
+                on_epoch=False,
+                on_step=True,
+                sync_dist=True,
+            )
             self.log(
                 "train/diffusion_loss",
                 losses["diffusion_loss"],

@@ -358,6 +358,8 @@ class DeCLUTRTask(L.LightningModule):
                 for key, score in mteb_scores.items():
                     mode = key.split("/")[-1]
                     by_mode.setdefault(mode, []).append(score)
+                    self.log(f"mteb/{key}", score,
+                             on_epoch=True, sync_dist=False, rank_zero_only=True)
                 for mode, scores in by_mode.items():
                     self.log(f"mteb/mean/{mode}", sum(scores) / len(scores),
                              on_epoch=True, sync_dist=False, rank_zero_only=True)

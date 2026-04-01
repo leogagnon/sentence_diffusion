@@ -68,7 +68,7 @@ class SEMHead(nn.Module):
             probs = probs_hard + probs_soft - probs_soft.detach()
         else:
             if self.cfg.disable_softmax:
-                probs = x
+                probs = torch.relu(x)
             else:
                 probs = torch.softmax(x / temp, dim=-1)
 

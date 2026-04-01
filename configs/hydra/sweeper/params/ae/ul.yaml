@@ -1,0 +1,15 @@
+task/ae: ul_drop
+model_checkpoint: base
+
+task.ae.finetune_encoder: true, false
+task.ae.noise_schedule: true, false
+task.ae.prior_logsnr_max: 5.0, 3.0
+
+max_steps: 20000
+
+effective_batch_size: 512
+
+limit_val_batches: 8
+val_check_interval: 512
+
+sweep_id: ae/ul

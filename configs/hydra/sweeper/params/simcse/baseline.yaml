@@ -2,8 +2,7 @@ task/simcse: sem_long
 model_checkpoint: base
 
 task.simcse.batch_size: 64
-task.simcse.sem_noise: 0.0, 0.2
-task.simcse.encoder.sem.use_ste: false
+task.simcse.encoder.sem.disable_softmax: true
 
 max_steps: 10000
 strategy: ddp_find_unused_parameters_true
@@ -11,5 +10,5 @@ strategy: ddp_find_unused_parameters_true
 limit_val_batches: 4
 val_check_interval: 512
 
-sweep_id: simcse/dlc_clean_3
+sweep_id: simcse/baseline_3
 

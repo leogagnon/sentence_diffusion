@@ -25,8 +25,9 @@ val_check_interval: 128
 sweep_id: null
 precision: bf16-mixed
 limit_val_batches: 4
-strategy: ddp 
+strategy: ddp_find_unused_parameters_true #ddp 
 compile: false
 gradient_clip_val: 1.0
 num_devices: null
 workers: null
+initial_val: false

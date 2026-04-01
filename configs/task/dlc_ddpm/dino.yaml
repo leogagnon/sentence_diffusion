@@ -24,7 +24,8 @@ suffix_length: 64
 context_length: 112
 
 use_ema: true
-prompt_generator_noise: true
+latent_noise: true
+soft_thought_noise_cond: true
 loss: l2
 sampling_timesteps: 100
 train_schedule: cosine

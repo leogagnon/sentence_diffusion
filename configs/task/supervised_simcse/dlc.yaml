@@ -15,6 +15,7 @@ encoder:
     V: 16
     temp: 1.0
     use_ste: false
+    disable_softmax: false
 
 max_length: 256
 loss_temp: 0.05

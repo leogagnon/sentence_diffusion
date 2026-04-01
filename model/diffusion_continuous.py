@@ -683,6 +683,7 @@ def compute_diffusion_loss(
     cond_mask=None,
     class_id=None,
     cond_input_ids=None,
+    t_min: float = 0.0,
 ):
     bs = latent.shape[0]
     device = latent.device
@@ -695,7 +696,10 @@ def compute_diffusion_loss(
             latent.ndim == 3 and latent.shape[1] == 1
         ), "Latent must have shape (B, 1, D)"
 
-    times = torch.zeros((bs,), device=device).float().uniform_(0, 1.0)
+    if not (0.0 <= t_min < 1.0):
+        raise ValueError(f"t_min must be in [0, 1), got {t_min}")
+
+    times = torch.zeros((bs,), device=device).float().uniform_(t_min, 1.0)
     noise = torch.randn_like(latent)
 
     alpha = schedule(times)
