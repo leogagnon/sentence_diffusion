@@ -440,13 +440,14 @@ class PrefixSuffixIterable(IterableDataset):
                     if len(input_ids_enc) > len(suffix_ids_dec) * 1.3:
                         continue
                 elif self.encoder_mode == "context":
+                    context_prefix_ids = context_ids_dec[: self.context_length + self.prefix_length]
                     context_str = self.dec_tok.decode(
-                        context_ids_dec,
+                        context_prefix_ids,
                         skip_special_tokens=True,
                     )
                     context_str = ftfy.fix_text(context_str)
                     input_ids_enc = self.enc_tok.encode(context_str)
-                    if len(input_ids_enc) > len(context_ids_dec) * 1.3:
+                    if len(input_ids_enc) > len(context_prefix_ids) * 1.3:
                         continue
                 else:
                     yield out_dict

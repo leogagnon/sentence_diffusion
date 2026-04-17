@@ -1,9 +1,11 @@
-task/ae: ul_drop
+task/ae: ul, ul_drop
 model_checkpoint: base
 
-task.ae.finetune_encoder: true, false
-task.ae.noise_schedule: true, false
-task.ae.prior_logsnr_max: 5.0, 3.0
+task.ae.finetune_encoder: true
+task.ae.noise_schedule: false
+task.ae.auto_scale_schedule: true, false
+task.ae.prior_logsnr_max: 5.0
+task.ae.context_length: 112, 0
 
 max_steps: 20000
 

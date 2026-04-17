@@ -42,6 +42,9 @@ class AETaskConfig:
     noise_schedule: bool = False   # if True, sample t ~ Uniform[t_min, 1.0] each step
     train_schedule: str = "cosine"
     schedule_scale: float = 1.0
+    auto_scale_schedule: bool = False  # if True, estimate scale from latent RMS at train start
+    auto_scale_batches: int = 32       # number of batches to use for RMS estimation
+    train_schedule_tau: float = 1.0    # >1 biases sampling towards low-noise timesteps
     # Soft thought projection (maps latent -> soft prompt tokens for decoder)
     soft_prompt_len: int = 16
     noise_cond: bool = False       # if True, condition soft_thought_enc on the noise level
@@ -238,6 +241,32 @@ class AETask(L.LightningModule):
         else:
             return optimizer
 
+    def _rebuild_train_schedule(self, scale: float):
+        self.train_schedule = partial(
+            time_to_alpha,
+            alpha_schedule=get_sampling_schedule(self.cfg.train_schedule),
+            scale=scale,
+        )
+        self._t_min_cache = None  # invalidate cached t_min
+
+    def on_train_start(self):
+        if not self.cfg.auto_scale_schedule:
+            return
+        loader = self.train_dataloader()
+        sq_sum = 0.0
+        n = 0
+        with torch.no_grad():
+            for i, batch in enumerate(loader):
+                if i >= self.cfg.auto_scale_batches:
+                    break
+                batch = {k: v.to(self.device) if isinstance(v, torch.Tensor) else v for k, v in batch.items()}
+                z = self._encode_latent(batch)
+                sq_sum += z.pow(2).mean().item()
+                n += 1
+        rms = (sq_sum / n) ** 0.5
+        self._rebuild_train_schedule(scale=rms)
+        self.log("train/auto_schedule_scale", rms, rank_zero_only=True)
+
     def _get_t_min(self):
         """Binary search for t s.t. train_schedule(t) == sigmoid(prior_logsnr_max). Cached."""
         if self._t_min_cache is not None:
@@ -265,7 +294,8 @@ class AETask(L.LightningModule):
     def _sample_alpha(self, batch_size, device, dtype=None):
         """Sample alpha uniformly over [t_min, 1.0] when noise_schedule=True."""
         t_min = self._get_t_min()
-        t = t_min + (1.0 - t_min) * torch.rand(batch_size, device=device, dtype=torch.float32)
+        u = torch.rand(batch_size, device=device, dtype=torch.float32)
+        t = t_min + (1.0 - t_min) * u.pow(self.cfg.train_schedule_tau)
         alpha = self.train_schedule(t)
         if dtype is not None:
             alpha = alpha.to(dtype)

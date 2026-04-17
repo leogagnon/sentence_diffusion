@@ -684,6 +684,7 @@ def compute_diffusion_loss(
     class_id=None,
     cond_input_ids=None,
     t_min: float = 0.0,
+    train_schedule_tau: float = 1.0,
 ):
     bs = latent.shape[0]
     device = latent.device
@@ -699,7 +700,8 @@ def compute_diffusion_loss(
     if not (0.0 <= t_min < 1.0):
         raise ValueError(f"t_min must be in [0, 1), got {t_min}")
 
-    times = torch.zeros((bs,), device=device).float().uniform_(t_min, 1.0)
+    u = torch.zeros((bs,), device=device).float().uniform_(0.0, 1.0)
+    times = t_min + (1.0 - t_min) * u.pow(train_schedule_tau)
     noise = torch.randn_like(latent)
 
     alpha = schedule(times)
